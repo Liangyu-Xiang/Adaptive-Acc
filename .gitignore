@@ -32,3 +32,12 @@ skyseg.onnx.tmp
 *.onnx
 *.pdf
 *.log
+*.mp4
+*.avi
+*.mov
+*.mkv
+.env
+.env.*
+!.env.example
+*.pem
+*.key
