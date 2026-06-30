@@ -122,6 +122,52 @@ with the default `mode="balanced"` and `image_resolution=512`. For these roughly
 `mode="max_size"` to resize the longest side to 512 instead; for the same aspect
 ratio, this gives about 512x336 inputs and uses less GPU memory.
 
+## TUM-Dynamics evaluation
+
+Reproduce the paper protocol (10 randomly sampled frames per sequence,
+pairwise camera AUC@3/AUC@30, depth delta1.25/AbsRel):
+
+```bash
+conda activate 3d
+python scripts/eval_tum_dynamics_paper.py \
+  --data-root /mnt/nasdata/xly/dataset/TUM-Dynamics \
+  --checkpoint /mnt/nasdata/xly/3D/vggt-omega/pretrained_ckpts/vggt_omega_1b_512.pt \
+  --output-dir outputs/tum_dynamics_paper_reproduction
+```
+
+The paper reports 30.2/82.3 for AUC@3/AUC@30 and 97.4/0.041 for
+delta1.25/AbsRel with the 1B model. The release does not include its sampled
+frame IDs, so the script uses a fixed seed and writes the exact selection to
+`sampled_frames.json`, metrics to `metrics.json`, and raw pose errors to
+`pose_errors.npz`.
+
+For the separate 90-frame trajectory protocol (not the metrics in the paper's
+Tables 1 and 2), use `scripts/eval_tum_dynamics.py`. It reports Sim(3)-aligned
+ATE and frame-to-frame translation/rotation RPE.
+
+To run the inference-only all-Register-Attention ablation on the same split,
+use `--attention-mode register-only-zero-shot`. This changes the released
+checkpoint's 5/24 Register Attention schedule to 24/24 at inference time. It is
+not equivalent to the separately trained all-Register model discussed in the
+paper, whose checkpoint was not released. Each result includes CUDA-event model
+latency and peak GPU memory measurements.
+
+Reproduce the paper's motion-awareness visualization by clustering
+PCA-reduced intermediate patch tokens over space and time:
+
+```bash
+python scripts/visualize_motion_awareness.py \
+  --sequence rgbd_dataset_freiburg3_walking_static \
+  --layers 4 13 23 \
+  --output-dir outputs/motion_awareness_walking_static
+```
+
+The script maps each patch-token label back to its 16x16 pixel region and
+writes paper-style red overlays, all-cluster views, MP4 videos, raw patch
+labels, pixel masks, cluster statistics, and an independent red-overlay video
+for every cluster. Layer 4 is generally the cleanest motion/person response on
+this sequence.
+
 ## License
 
 See the [LICENSE](./LICENSE) file for details about the license under which
