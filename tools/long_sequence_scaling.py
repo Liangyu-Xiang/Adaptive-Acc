@@ -41,6 +41,7 @@ RESULT_FIELDS = (
     "input_transfer_time_sec", "peak_memory_allocated_gb",
     "peak_memory_reserved_gb", "num_input_frames", "image_resolution",
     "input_height", "input_width", "model_name", "checkpoint",
+    "merge_ratio",
     "depth_absrel", "depth_delta_1_25", "camera_ate",
     "rotation_error", "translation_error",
 )
@@ -73,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--association_tolerance", "--association-tolerance", type=float,
                         default=0.02)
     parser.add_argument("--image_resolution", "--image-resolution", type=int, default=512)
+    parser.add_argument("--merge_ratio", "--merge-ratio", type=float, default=0.9,
+                        help="Global-attention token merge ratio in [0, 1].")
     parser.add_argument("--resize_mode", "--resize-mode",
                         choices=("balanced", "max_size"), default="max_size")
     parser.add_argument("--depth_alignment", "--depth-alignment",
@@ -273,7 +276,7 @@ def main() -> int:
         json.dump(selections, handle, indent=2)
         handle.write("\n")
     logger.info("Loading checkpoint %s on %s", args.checkpoint, device)
-    model = load_model(args.checkpoint, device)
+    model = load_model(args.checkpoint, device, merge_ratio=args.merge_ratio)
     rows: list[dict[str, Any]] = []
 
     for sequence_name, pool in pools.items():
@@ -286,6 +289,7 @@ def main() -> int:
                 "input_transfer_time_sec": transfer_seconds, "num_input_frames": count,
                 "image_resolution": args.image_resolution, "input_height": "", "input_width": "",
                 "model_name": "VGGT-Omega-1B", "checkpoint": str(args.checkpoint),
+                "merge_ratio": args.merge_ratio,
             }
             try:
                 records, _ = uniform_sample(pool, count)

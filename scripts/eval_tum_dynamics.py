@@ -32,10 +32,9 @@ from vggt_omega.utils.load_fn import load_and_preprocess_images
 from vggt_omega.utils.pose_enc import encoding_to_camera
 
 
-DEFAULT_DATA_ROOT = Path("/mnt/nasdata/xly/dataset/TUM-Dynamics")
-DEFAULT_CHECKPOINT = Path(
-    "/mnt/nasdata/xly/3D/vggt-omega/pretrained_ckpts/vggt_omega_1b_512.pt"
-)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "TUM-Dynamics"
+DEFAULT_CHECKPOINT = REPO_ROOT / "pretrained_ckpts" / "vggt_omega_1b_512.pt"
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="CUDA device, e.g. cuda or cuda:1.")
     parser.add_argument("--image-resolution", type=int, default=512)
     parser.add_argument("--resize-mode", choices=("balanced", "max_size"), default="balanced")
+    parser.add_argument(
+        "--merge-ratio",
+        type=float,
+        default=0.9,
+        help="Global-attention token merge ratio in [0, 1].",
+    )
     parser.add_argument(
         "--window-size",
         type=int,
@@ -220,11 +225,11 @@ def tum_fields_to_matrix(fields: Sequence[str]) -> np.ndarray:
     return pose
 
 
-def load_model(checkpoint: Path, device: torch.device) -> VGGTOmega:
+def load_model(checkpoint: Path, device: torch.device, merge_ratio: float = 0.9) -> VGGTOmega:
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
     # Camera-only construction avoids allocating and running the dense depth head.
-    model = VGGTOmega(enable_depth=False)
+    model = VGGTOmega(enable_depth=False, merge_ratio=merge_ratio)
     load_kwargs = {"map_location": "cpu", "weights_only": True}
     try:
         state = torch.load(checkpoint, mmap=True, **load_kwargs)
@@ -457,7 +462,7 @@ def main() -> int:
         raise RuntimeError("VGGT-Omega inference requires an available CUDA device")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Loading checkpoint: {args.checkpoint}")
-    model = load_model(args.checkpoint, device)
+    model = load_model(args.checkpoint, device, merge_ratio=args.merge_ratio)
 
     results: list[dict[str, object]] = []
     for sequence in sequences:

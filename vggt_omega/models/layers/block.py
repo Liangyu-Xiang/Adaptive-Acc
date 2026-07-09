@@ -38,6 +38,19 @@ class SelfAttentionBlock(nn.Module):
         ffn_layer: Callable[..., nn.Module] = Mlp,
         mask_k_bias: bool = False,
         use_qk_norm: bool = False,
+        merge_ratio: float = 0.9,
+        use_adaptive_kv_anchor: bool = False,
+        adaptive_anchor_ratio: float = 0.25,
+        adaptive_anchor_total: int | None = None,
+        adaptive_anchor_min_per_frame: int = 1,
+        adaptive_anchor_tau: float = 1.0,
+        adaptive_anchor_uniform_mix: float = 0.0,
+        adaptive_anchor_strategy: str = "lifting",
+        adaptive_anchor_score_alpha_cross: float = 1.0,
+        adaptive_anchor_score_beta_intra: float = 0.2,
+        adaptive_anchor_topm_frames: int | None = 4,
+        adaptive_anchor_random_seed: int = 33,
+        adaptive_anchor_debug: bool = False,
         device=None,
     ) -> None:
         super().__init__()
@@ -54,6 +67,19 @@ class SelfAttentionBlock(nn.Module):
             # VGGT-Omega change: pass through Q/K normalization for the
             # aggregator blocks trained with q_norm/k_norm parameters.
             use_qk_norm=use_qk_norm,
+            merge_ratio=merge_ratio,
+            use_adaptive_kv_anchor=use_adaptive_kv_anchor,
+            adaptive_anchor_ratio=adaptive_anchor_ratio,
+            adaptive_anchor_total=adaptive_anchor_total,
+            adaptive_anchor_min_per_frame=adaptive_anchor_min_per_frame,
+            adaptive_anchor_tau=adaptive_anchor_tau,
+            adaptive_anchor_uniform_mix=adaptive_anchor_uniform_mix,
+            adaptive_anchor_strategy=adaptive_anchor_strategy,
+            adaptive_anchor_score_alpha_cross=adaptive_anchor_score_alpha_cross,
+            adaptive_anchor_score_beta_intra=adaptive_anchor_score_beta_intra,
+            adaptive_anchor_topm_frames=adaptive_anchor_topm_frames,
+            adaptive_anchor_random_seed=adaptive_anchor_random_seed,
+            adaptive_anchor_debug=adaptive_anchor_debug,
             device=device,
         )
         self.ls1 = LayerScale(dim, init_values=init_values, device=device) if init_values else nn.Identity()
@@ -86,7 +112,31 @@ class SelfAttentionBlock(nn.Module):
             # No batch dimension, do not index
             return sin, cos  # [heads, patches, embed_dim] or [patches, embed_dim]
 
-    def _forward(self, x: Tensor, rope=None) -> Tensor:
+    def _forward(
+        self,
+        x: Tensor,
+        rope=None,
+        global_merging=None,
+        patch_grid_size: tuple[int, int] | None = None,
+        num_special_tokens: int = 5,
+        sparse_attention: bool = False,
+        sparse_ratio: float | None = None,
+        sparse_cdf_threshold: float | None = None,
+        sparse_pool_mode: str = "avg",
+        inter_frame_only_attention: bool = False,
+        use_adaptive_kv_anchor: bool | None = None,
+        adaptive_anchor_ratio: float | None = None,
+        adaptive_anchor_total: int | None = None,
+        adaptive_anchor_min_per_frame: int | None = None,
+        adaptive_anchor_tau: float | None = None,
+        adaptive_anchor_uniform_mix: float | None = None,
+        adaptive_anchor_strategy: str | None = None,
+        adaptive_anchor_score_alpha_cross: float | None = None,
+        adaptive_anchor_score_beta_intra: float | None = None,
+        adaptive_anchor_topm_frames: int | None = None,
+        adaptive_anchor_random_seed: int | None = None,
+        adaptive_anchor_debug: bool | None = None,
+    ) -> Tensor:
         """
         This is the reference implementation for a single tensor, matching what is done below for a list.
         We call the list op on [x] instead of this function.
@@ -100,7 +150,30 @@ class SelfAttentionBlock(nn.Module):
 
             x_subset_1 = x[indices_1]
             rope_subset = self._maybe_index_rope(rope, indices_1)
-            residual_1 = self.attn(self.norm1(x_subset_1), rope=rope_subset)
+            residual_1 = self.attn(
+                self.norm1(x_subset_1),
+                rope=rope_subset,
+                global_merging=global_merging,
+                patch_grid_size=patch_grid_size,
+                num_special_tokens=num_special_tokens,
+                sparse_attention=sparse_attention,
+                sparse_ratio=sparse_ratio,
+                sparse_cdf_threshold=sparse_cdf_threshold,
+                sparse_pool_mode=sparse_pool_mode,
+                inter_frame_only_attention=inter_frame_only_attention,
+                use_adaptive_kv_anchor=use_adaptive_kv_anchor,
+                adaptive_anchor_ratio=adaptive_anchor_ratio,
+                adaptive_anchor_total=adaptive_anchor_total,
+                adaptive_anchor_min_per_frame=adaptive_anchor_min_per_frame,
+                adaptive_anchor_tau=adaptive_anchor_tau,
+                adaptive_anchor_uniform_mix=adaptive_anchor_uniform_mix,
+                adaptive_anchor_strategy=adaptive_anchor_strategy,
+                adaptive_anchor_score_alpha_cross=adaptive_anchor_score_alpha_cross,
+                adaptive_anchor_score_beta_intra=adaptive_anchor_score_beta_intra,
+                adaptive_anchor_topm_frames=adaptive_anchor_topm_frames,
+                adaptive_anchor_random_seed=adaptive_anchor_random_seed,
+                adaptive_anchor_debug=adaptive_anchor_debug,
+            )
 
             x_attn = torch.index_add(
                 x,
@@ -123,7 +196,32 @@ class SelfAttentionBlock(nn.Module):
                 alpha=residual_scale_factor,
             )
         else:
-            x_attn = x + self.ls1(self.attn(self.norm1(x), rope=rope))
+            x_attn = x + self.ls1(
+                self.attn(
+                    self.norm1(x),
+                    rope=rope,
+                    global_merging=global_merging,
+                    patch_grid_size=patch_grid_size,
+                    num_special_tokens=num_special_tokens,
+                    sparse_attention=sparse_attention,
+                    sparse_ratio=sparse_ratio,
+                    sparse_cdf_threshold=sparse_cdf_threshold,
+                    sparse_pool_mode=sparse_pool_mode,
+                    inter_frame_only_attention=inter_frame_only_attention,
+                    use_adaptive_kv_anchor=use_adaptive_kv_anchor,
+                    adaptive_anchor_ratio=adaptive_anchor_ratio,
+                    adaptive_anchor_total=adaptive_anchor_total,
+                    adaptive_anchor_min_per_frame=adaptive_anchor_min_per_frame,
+                    adaptive_anchor_tau=adaptive_anchor_tau,
+                    adaptive_anchor_uniform_mix=adaptive_anchor_uniform_mix,
+                    adaptive_anchor_strategy=adaptive_anchor_strategy,
+                    adaptive_anchor_score_alpha_cross=adaptive_anchor_score_alpha_cross,
+                    adaptive_anchor_score_beta_intra=adaptive_anchor_score_beta_intra,
+                    adaptive_anchor_topm_frames=adaptive_anchor_topm_frames,
+                    adaptive_anchor_random_seed=adaptive_anchor_random_seed,
+                    adaptive_anchor_debug=adaptive_anchor_debug,
+                )
+            )
             x_ffn = x_attn + self.ls2(self.mlp(self.norm2(x_attn)))
 
         return x_ffn
@@ -202,8 +300,62 @@ class SelfAttentionBlock(nn.Module):
 
         return x_ffn
 
-    def forward(self, x_or_x_list, rope_or_rope_list=None) -> List[Tensor]:
+    def forward(
+        self,
+        x_or_x_list,
+        rope_or_rope_list=None,
+        global_merging=None,
+        patch_grid_size: tuple[int, int] | None = None,
+        num_special_tokens: int = 5,
+        sparse_attention: bool = False,
+        sparse_ratio: float | None = None,
+        sparse_cdf_threshold: float | None = None,
+        sparse_pool_mode: str = "avg",
+        inter_frame_only_attention: bool = False,
+        use_adaptive_kv_anchor: bool | None = None,
+        adaptive_anchor_ratio: float | None = None,
+        adaptive_anchor_total: int | None = None,
+        adaptive_anchor_min_per_frame: int | None = None,
+        adaptive_anchor_tau: float | None = None,
+        adaptive_anchor_uniform_mix: float | None = None,
+        adaptive_anchor_strategy: str | None = None,
+        adaptive_anchor_score_alpha_cross: float | None = None,
+        adaptive_anchor_score_beta_intra: float | None = None,
+        adaptive_anchor_topm_frames: int | None = None,
+        adaptive_anchor_random_seed: int | None = None,
+        adaptive_anchor_debug: bool | None = None,
+    ) -> List[Tensor]:
         if isinstance(x_or_x_list, Tensor):
+            adaptive_enabled = (
+                self.attn.use_adaptive_kv_anchor
+                if use_adaptive_kv_anchor is None
+                else use_adaptive_kv_anchor
+            )
+            if global_merging is not None or sparse_attention or inter_frame_only_attention or adaptive_enabled:
+                return self._forward(
+                    x_or_x_list,
+                    rope=rope_or_rope_list,
+                    global_merging=global_merging,
+                    patch_grid_size=patch_grid_size,
+                    num_special_tokens=num_special_tokens,
+                    sparse_attention=sparse_attention,
+                    sparse_ratio=sparse_ratio,
+                    sparse_cdf_threshold=sparse_cdf_threshold,
+                    sparse_pool_mode=sparse_pool_mode,
+                    inter_frame_only_attention=inter_frame_only_attention,
+                    use_adaptive_kv_anchor=use_adaptive_kv_anchor,
+                    adaptive_anchor_ratio=adaptive_anchor_ratio,
+                    adaptive_anchor_total=adaptive_anchor_total,
+                    adaptive_anchor_min_per_frame=adaptive_anchor_min_per_frame,
+                    adaptive_anchor_tau=adaptive_anchor_tau,
+                    adaptive_anchor_uniform_mix=adaptive_anchor_uniform_mix,
+                    adaptive_anchor_strategy=adaptive_anchor_strategy,
+                    adaptive_anchor_score_alpha_cross=adaptive_anchor_score_alpha_cross,
+                    adaptive_anchor_score_beta_intra=adaptive_anchor_score_beta_intra,
+                    adaptive_anchor_topm_frames=adaptive_anchor_topm_frames,
+                    adaptive_anchor_random_seed=adaptive_anchor_random_seed,
+                    adaptive_anchor_debug=adaptive_anchor_debug,
+                )
             # for reference:
             # return self._forward(x_or_x_list, rope=rope_or_rope_list)
             # in order to match implementations we call the list op:

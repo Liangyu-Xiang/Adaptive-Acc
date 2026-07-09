@@ -22,13 +22,13 @@ from vggt_omega.utils.load_fn import load_and_preprocess_images
 from vggt_omega.utils.pose_enc import encoding_to_camera
 
 
-def load_model(checkpoint_path: str) -> VGGTOmega:
+def load_model(checkpoint_path: str, merge_ratio: float = 0.9) -> VGGTOmega:
     if not torch.cuda.is_available():
         raise gr.Error("CUDA is required to run VGGT-Omega.")
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    model = VGGTOmega().eval()
+    model = VGGTOmega(merge_ratio=merge_ratio).eval()
     state_dict = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(state_dict)
     return model.to("cuda")
@@ -549,6 +549,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="VGGT-Omega Gradio demo")
     parser.add_argument("--checkpoint", required=True, help="Local VGGT-Omega checkpoint path.")
     parser.add_argument("--image-resolution", type=int, default=512, help="Input image resolution. Default: 512.")
+    parser.add_argument(
+        "--merge-ratio",
+        type=float,
+        default=0.9,
+        help="Global-attention token merge ratio in [0, 1].",
+    )
     parser.add_argument("--server-name", default="0.0.0.0")
     parser.add_argument("--server-port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
@@ -558,7 +564,7 @@ def parse_args():
 def main():
     args = parse_args()
     print(f"Loading checkpoint from {args.checkpoint}")
-    model = load_model(args.checkpoint)
+    model = load_model(args.checkpoint, merge_ratio=args.merge_ratio)
     demo = build_ui(model, args.image_resolution)
     demo.queue(max_size=20).launch(
         server_name=args.server_name,

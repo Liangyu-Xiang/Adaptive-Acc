@@ -130,10 +130,13 @@ pairwise camera AUC@3/AUC@30, depth delta1.25/AbsRel):
 ```bash
 conda activate 3d
 python scripts/eval_tum_dynamics_paper.py \
-  --data-root /mnt/nasdata/xly/dataset/TUM-Dynamics \
-  --checkpoint /mnt/nasdata/xly/3D/vggt-omega/pretrained_ckpts/vggt_omega_1b_512.pt \
   --output-dir outputs/tum_dynamics_paper_reproduction
 ```
+
+By default, the evaluation scripts read the dataset from `data/TUM-Dynamics`
+and the checkpoint from `pretrained_ckpts/vggt_omega_1b_512.pt`. These paths are
+intended to be local symlinks because datasets and checkpoints are not tracked
+by Git.
 
 The paper reports 30.2/82.3 for AUC@3/AUC@30 and 97.4/0.041 for
 delta1.25/AbsRel with the 1B model. The release does not include its sampled
@@ -145,12 +148,14 @@ For the separate 90-frame trajectory protocol (not the metrics in the paper's
 Tables 1 and 2), use `scripts/eval_tum_dynamics.py`. It reports Sim(3)-aligned
 ATE and frame-to-frame translation/rotation RPE.
 
-To run the inference-only all-Register-Attention ablation on the same split,
+To run the inference-only shallow Register-Attention ablation on the same split,
 use `--attention-mode register-only-zero-shot`. This changes the released
-checkpoint's 5/24 Register Attention schedule to 24/24 at inference time. It is
-not equivalent to the separately trained all-Register model discussed in the
-paper, whose checkpoint was not released. Each result includes CUDA-event model
-latency and peak GPU memory measurements.
+checkpoint so layers 0-8 use Register Attention while layers 9-23 keep global
+inter-frame attention. Pass `--register-only-global-layers none` to recover the
+older all-register inference-time ablation. It is not equivalent to the
+separately trained all-Register model discussed in the paper, whose checkpoint
+was not released. Each result includes CUDA-event model latency and peak GPU
+memory measurements.
 
 Reproduce the paper's motion-awareness visualization by clustering
 PCA-reduced intermediate patch tokens over space and time:
