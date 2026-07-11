@@ -30,9 +30,16 @@ from .utils import cat_keep_shapes, uncat_with_shapes
 
 
 ADAPTIVE_ANCHOR_STRATEGIES = {
+    "all_frame_intra",
     "lifting",
     "frame_pair_gated",
     "hybrid",
+    "random_frame_intra",
+    "register_gated_intra",
+    "register_gated_intra_query",
+    "temporal_neighbor_intra",
+    "oracle_frame_intra",
+    "quota_intra_proxy",
     "register_intra",
     "fixed_grid",
     "intra_only",
@@ -104,6 +111,25 @@ class SelfAttention(nn.Module):
         adaptive_anchor_strategy: str = "lifting",
         adaptive_anchor_score_alpha_cross: float = 1.0,
         adaptive_anchor_score_beta_intra: float = 0.2,
+        adaptive_anchor_score_mode: str = "intra",
+        adaptive_anchor_proxy_quota_ratio: float = 0.0,
+        adaptive_anchor_intra_source: str = "cached_frame_qk",
+        adaptive_anchor_frame_budget_mode: str = "hybrid",
+        adaptive_anchor_frame_budget_top_frac: float = 0.1,
+        adaptive_anchor_frame_budget_lambda_intra: float = 0.7,
+        adaptive_anchor_frame_budget_lambda_reg: float = 0.3,
+        adaptive_anchor_frame_budget_reg_topm: int = 4,
+        adaptive_anchor_reg_patch_topk_ratio: float = 0.1,
+        adaptive_anchor_reg_patch_topk_min: int = 8,
+        adaptive_anchor_reg_patch_topk_max: int = 64,
+        adaptive_anchor_reg_patch_conf_power: float = 1.0,
+        adaptive_anchor_reg_patch_min_conf: float = 0.05,
+        adaptive_anchor_query_conditioned_eta: float = 0.1,
+        adaptive_anchor_gated_anchor_ratio_per_key_frame: float = 0.1,
+        adaptive_anchor_gated_min_per_key_frame: int = 4,
+        adaptive_anchor_gated_max_per_key_frame: int = 64,
+        adaptive_anchor_always_include_self_frame: bool = True,
+        adaptive_anchor_profile: bool = False,
         adaptive_anchor_topm_frames: int | None = 4,
         adaptive_anchor_random_seed: int = 33,
         adaptive_anchor_debug: bool = False,
@@ -124,9 +150,31 @@ class SelfAttention(nn.Module):
         self.adaptive_anchor_strategy = adaptive_anchor_strategy
         self.adaptive_anchor_score_alpha_cross = float(adaptive_anchor_score_alpha_cross)
         self.adaptive_anchor_score_beta_intra = float(adaptive_anchor_score_beta_intra)
+        self.adaptive_anchor_score_mode = adaptive_anchor_score_mode
+        self.adaptive_anchor_proxy_quota_ratio = float(adaptive_anchor_proxy_quota_ratio)
+        self.adaptive_anchor_intra_source = adaptive_anchor_intra_source
+        self.adaptive_anchor_frame_budget_mode = adaptive_anchor_frame_budget_mode
+        self.adaptive_anchor_frame_budget_top_frac = float(adaptive_anchor_frame_budget_top_frac)
+        self.adaptive_anchor_frame_budget_lambda_intra = float(adaptive_anchor_frame_budget_lambda_intra)
+        self.adaptive_anchor_frame_budget_lambda_reg = float(adaptive_anchor_frame_budget_lambda_reg)
+        self.adaptive_anchor_frame_budget_reg_topm = int(adaptive_anchor_frame_budget_reg_topm)
+        self.adaptive_anchor_reg_patch_topk_ratio = float(adaptive_anchor_reg_patch_topk_ratio)
+        self.adaptive_anchor_reg_patch_topk_min = int(adaptive_anchor_reg_patch_topk_min)
+        self.adaptive_anchor_reg_patch_topk_max = int(adaptive_anchor_reg_patch_topk_max)
+        self.adaptive_anchor_reg_patch_conf_power = float(adaptive_anchor_reg_patch_conf_power)
+        self.adaptive_anchor_reg_patch_min_conf = float(adaptive_anchor_reg_patch_min_conf)
+        self.adaptive_anchor_query_conditioned_eta = float(adaptive_anchor_query_conditioned_eta)
+        self.adaptive_anchor_gated_anchor_ratio_per_key_frame = float(
+            adaptive_anchor_gated_anchor_ratio_per_key_frame
+        )
+        self.adaptive_anchor_gated_min_per_key_frame = int(adaptive_anchor_gated_min_per_key_frame)
+        self.adaptive_anchor_gated_max_per_key_frame = int(adaptive_anchor_gated_max_per_key_frame)
+        self.adaptive_anchor_always_include_self_frame = bool(adaptive_anchor_always_include_self_frame)
+        self.adaptive_anchor_profile = bool(adaptive_anchor_profile)
         self.adaptive_anchor_topm_frames = adaptive_anchor_topm_frames
         self.adaptive_anchor_random_seed = int(adaptive_anchor_random_seed)
         self.adaptive_anchor_debug = adaptive_anchor_debug
+        self.precomputed_intra_scores = None
         self.last_adaptive_anchor_debug = None
         self.last_adaptive_anchor_kv_tokens = None
         self.last_adaptive_anchor_patch_tokens = None
@@ -189,6 +237,25 @@ class SelfAttention(nn.Module):
         adaptive_anchor_strategy: str | None = None,
         adaptive_anchor_score_alpha_cross: float | None = None,
         adaptive_anchor_score_beta_intra: float | None = None,
+        adaptive_anchor_score_mode: str | None = None,
+        adaptive_anchor_proxy_quota_ratio: float | None = None,
+        adaptive_anchor_intra_source: str | None = None,
+        adaptive_anchor_frame_budget_mode: str | None = None,
+        adaptive_anchor_frame_budget_top_frac: float | None = None,
+        adaptive_anchor_frame_budget_lambda_intra: float | None = None,
+        adaptive_anchor_frame_budget_lambda_reg: float | None = None,
+        adaptive_anchor_frame_budget_reg_topm: int | None = None,
+        adaptive_anchor_reg_patch_topk_ratio: float | None = None,
+        adaptive_anchor_reg_patch_topk_min: int | None = None,
+        adaptive_anchor_reg_patch_topk_max: int | None = None,
+        adaptive_anchor_reg_patch_conf_power: float | None = None,
+        adaptive_anchor_reg_patch_min_conf: float | None = None,
+        adaptive_anchor_query_conditioned_eta: float | None = None,
+        adaptive_anchor_gated_anchor_ratio_per_key_frame: float | None = None,
+        adaptive_anchor_gated_min_per_key_frame: int | None = None,
+        adaptive_anchor_gated_max_per_key_frame: int | None = None,
+        adaptive_anchor_always_include_self_frame: bool | None = None,
+        adaptive_anchor_profile: bool | None = None,
         adaptive_anchor_topm_frames: int | None = None,
         adaptive_anchor_random_seed: int | None = None,
         adaptive_anchor_debug: bool | None = None,
@@ -217,6 +284,25 @@ class SelfAttention(nn.Module):
             adaptive_anchor_strategy=adaptive_anchor_strategy,
             adaptive_anchor_score_alpha_cross=adaptive_anchor_score_alpha_cross,
             adaptive_anchor_score_beta_intra=adaptive_anchor_score_beta_intra,
+            adaptive_anchor_score_mode=adaptive_anchor_score_mode,
+            adaptive_anchor_proxy_quota_ratio=adaptive_anchor_proxy_quota_ratio,
+            adaptive_anchor_intra_source=adaptive_anchor_intra_source,
+            adaptive_anchor_frame_budget_mode=adaptive_anchor_frame_budget_mode,
+            adaptive_anchor_frame_budget_top_frac=adaptive_anchor_frame_budget_top_frac,
+            adaptive_anchor_frame_budget_lambda_intra=adaptive_anchor_frame_budget_lambda_intra,
+            adaptive_anchor_frame_budget_lambda_reg=adaptive_anchor_frame_budget_lambda_reg,
+            adaptive_anchor_frame_budget_reg_topm=adaptive_anchor_frame_budget_reg_topm,
+            adaptive_anchor_reg_patch_topk_ratio=adaptive_anchor_reg_patch_topk_ratio,
+            adaptive_anchor_reg_patch_topk_min=adaptive_anchor_reg_patch_topk_min,
+            adaptive_anchor_reg_patch_topk_max=adaptive_anchor_reg_patch_topk_max,
+            adaptive_anchor_reg_patch_conf_power=adaptive_anchor_reg_patch_conf_power,
+            adaptive_anchor_reg_patch_min_conf=adaptive_anchor_reg_patch_min_conf,
+            adaptive_anchor_query_conditioned_eta=adaptive_anchor_query_conditioned_eta,
+            adaptive_anchor_gated_anchor_ratio_per_key_frame=adaptive_anchor_gated_anchor_ratio_per_key_frame,
+            adaptive_anchor_gated_min_per_key_frame=adaptive_anchor_gated_min_per_key_frame,
+            adaptive_anchor_gated_max_per_key_frame=adaptive_anchor_gated_max_per_key_frame,
+            adaptive_anchor_always_include_self_frame=adaptive_anchor_always_include_self_frame,
+            adaptive_anchor_profile=adaptive_anchor_profile,
             adaptive_anchor_topm_frames=adaptive_anchor_topm_frames,
             adaptive_anchor_random_seed=adaptive_anchor_random_seed,
             adaptive_anchor_debug=adaptive_anchor_debug,
@@ -260,6 +346,25 @@ class SelfAttention(nn.Module):
         adaptive_anchor_strategy: str | None = None,
         adaptive_anchor_score_alpha_cross: float | None = None,
         adaptive_anchor_score_beta_intra: float | None = None,
+        adaptive_anchor_score_mode: str | None = None,
+        adaptive_anchor_proxy_quota_ratio: float | None = None,
+        adaptive_anchor_intra_source: str | None = None,
+        adaptive_anchor_frame_budget_mode: str | None = None,
+        adaptive_anchor_frame_budget_top_frac: float | None = None,
+        adaptive_anchor_frame_budget_lambda_intra: float | None = None,
+        adaptive_anchor_frame_budget_lambda_reg: float | None = None,
+        adaptive_anchor_frame_budget_reg_topm: int | None = None,
+        adaptive_anchor_reg_patch_topk_ratio: float | None = None,
+        adaptive_anchor_reg_patch_topk_min: int | None = None,
+        adaptive_anchor_reg_patch_topk_max: int | None = None,
+        adaptive_anchor_reg_patch_conf_power: float | None = None,
+        adaptive_anchor_reg_patch_min_conf: float | None = None,
+        adaptive_anchor_query_conditioned_eta: float | None = None,
+        adaptive_anchor_gated_anchor_ratio_per_key_frame: float | None = None,
+        adaptive_anchor_gated_min_per_key_frame: int | None = None,
+        adaptive_anchor_gated_max_per_key_frame: int | None = None,
+        adaptive_anchor_always_include_self_frame: bool | None = None,
+        adaptive_anchor_profile: bool | None = None,
         adaptive_anchor_topm_frames: int | None = None,
         adaptive_anchor_random_seed: int | None = None,
         adaptive_anchor_debug: bool | None = None,
@@ -331,6 +436,101 @@ class SelfAttention(nn.Module):
                     self.adaptive_anchor_score_beta_intra
                     if adaptive_anchor_score_beta_intra is None
                     else adaptive_anchor_score_beta_intra
+                ),
+                adaptive_anchor_score_mode=(
+                    self.adaptive_anchor_score_mode
+                    if adaptive_anchor_score_mode is None
+                    else adaptive_anchor_score_mode
+                ),
+                adaptive_anchor_proxy_quota_ratio=(
+                    self.adaptive_anchor_proxy_quota_ratio
+                    if adaptive_anchor_proxy_quota_ratio is None
+                    else adaptive_anchor_proxy_quota_ratio
+                ),
+                adaptive_anchor_intra_source=(
+                    self.adaptive_anchor_intra_source
+                    if adaptive_anchor_intra_source is None
+                    else adaptive_anchor_intra_source
+                ),
+                adaptive_anchor_frame_budget_mode=(
+                    self.adaptive_anchor_frame_budget_mode
+                    if adaptive_anchor_frame_budget_mode is None
+                    else adaptive_anchor_frame_budget_mode
+                ),
+                adaptive_anchor_frame_budget_top_frac=(
+                    self.adaptive_anchor_frame_budget_top_frac
+                    if adaptive_anchor_frame_budget_top_frac is None
+                    else adaptive_anchor_frame_budget_top_frac
+                ),
+                adaptive_anchor_frame_budget_lambda_intra=(
+                    self.adaptive_anchor_frame_budget_lambda_intra
+                    if adaptive_anchor_frame_budget_lambda_intra is None
+                    else adaptive_anchor_frame_budget_lambda_intra
+                ),
+                adaptive_anchor_frame_budget_lambda_reg=(
+                    self.adaptive_anchor_frame_budget_lambda_reg
+                    if adaptive_anchor_frame_budget_lambda_reg is None
+                    else adaptive_anchor_frame_budget_lambda_reg
+                ),
+                adaptive_anchor_frame_budget_reg_topm=(
+                    self.adaptive_anchor_frame_budget_reg_topm
+                    if adaptive_anchor_frame_budget_reg_topm is None
+                    else adaptive_anchor_frame_budget_reg_topm
+                ),
+                adaptive_anchor_reg_patch_topk_ratio=(
+                    self.adaptive_anchor_reg_patch_topk_ratio
+                    if adaptive_anchor_reg_patch_topk_ratio is None
+                    else adaptive_anchor_reg_patch_topk_ratio
+                ),
+                adaptive_anchor_reg_patch_topk_min=(
+                    self.adaptive_anchor_reg_patch_topk_min
+                    if adaptive_anchor_reg_patch_topk_min is None
+                    else adaptive_anchor_reg_patch_topk_min
+                ),
+                adaptive_anchor_reg_patch_topk_max=(
+                    self.adaptive_anchor_reg_patch_topk_max
+                    if adaptive_anchor_reg_patch_topk_max is None
+                    else adaptive_anchor_reg_patch_topk_max
+                ),
+                adaptive_anchor_reg_patch_conf_power=(
+                    self.adaptive_anchor_reg_patch_conf_power
+                    if adaptive_anchor_reg_patch_conf_power is None
+                    else adaptive_anchor_reg_patch_conf_power
+                ),
+                adaptive_anchor_reg_patch_min_conf=(
+                    self.adaptive_anchor_reg_patch_min_conf
+                    if adaptive_anchor_reg_patch_min_conf is None
+                    else adaptive_anchor_reg_patch_min_conf
+                ),
+                adaptive_anchor_query_conditioned_eta=(
+                    self.adaptive_anchor_query_conditioned_eta
+                    if adaptive_anchor_query_conditioned_eta is None
+                    else adaptive_anchor_query_conditioned_eta
+                ),
+                adaptive_anchor_gated_anchor_ratio_per_key_frame=(
+                    self.adaptive_anchor_gated_anchor_ratio_per_key_frame
+                    if adaptive_anchor_gated_anchor_ratio_per_key_frame is None
+                    else adaptive_anchor_gated_anchor_ratio_per_key_frame
+                ),
+                adaptive_anchor_gated_min_per_key_frame=(
+                    self.adaptive_anchor_gated_min_per_key_frame
+                    if adaptive_anchor_gated_min_per_key_frame is None
+                    else adaptive_anchor_gated_min_per_key_frame
+                ),
+                adaptive_anchor_gated_max_per_key_frame=(
+                    self.adaptive_anchor_gated_max_per_key_frame
+                    if adaptive_anchor_gated_max_per_key_frame is None
+                    else adaptive_anchor_gated_max_per_key_frame
+                ),
+                adaptive_anchor_always_include_self_frame=(
+                    self.adaptive_anchor_always_include_self_frame
+                    if adaptive_anchor_always_include_self_frame is None
+                    else adaptive_anchor_always_include_self_frame
+                ),
+                adaptive_anchor_profile=(
+                    self.adaptive_anchor_profile
+                    if adaptive_anchor_profile is None
+                    else adaptive_anchor_profile
                 ),
                 adaptive_anchor_topm_frames=(
                     self.adaptive_anchor_topm_frames
@@ -464,6 +664,25 @@ class SelfAttention(nn.Module):
         adaptive_anchor_strategy: str,
         adaptive_anchor_score_alpha_cross: float,
         adaptive_anchor_score_beta_intra: float,
+        adaptive_anchor_score_mode: str,
+        adaptive_anchor_proxy_quota_ratio: float,
+        adaptive_anchor_intra_source: str,
+        adaptive_anchor_frame_budget_mode: str,
+        adaptive_anchor_frame_budget_top_frac: float,
+        adaptive_anchor_frame_budget_lambda_intra: float,
+        adaptive_anchor_frame_budget_lambda_reg: float,
+        adaptive_anchor_frame_budget_reg_topm: int,
+        adaptive_anchor_reg_patch_topk_ratio: float,
+        adaptive_anchor_reg_patch_topk_min: int,
+        adaptive_anchor_reg_patch_topk_max: int,
+        adaptive_anchor_reg_patch_conf_power: float,
+        adaptive_anchor_reg_patch_min_conf: float,
+        adaptive_anchor_query_conditioned_eta: float,
+        adaptive_anchor_gated_anchor_ratio_per_key_frame: float,
+        adaptive_anchor_gated_min_per_key_frame: int,
+        adaptive_anchor_gated_max_per_key_frame: int,
+        adaptive_anchor_always_include_self_frame: bool,
+        adaptive_anchor_profile: bool,
         adaptive_anchor_topm_frames: int | None,
         adaptive_anchor_random_seed: int,
         adaptive_anchor_debug: bool,
@@ -503,7 +722,18 @@ class SelfAttention(nn.Module):
 
         batch_size = q.shape[0]
         num_frames = original_num_tokens // tokens_per_frame
-        if strategy in {"lifting", "frame_pair_gated", "hybrid"}:
+        if strategy in {
+            "all_frame_intra",
+            "lifting",
+            "frame_pair_gated",
+            "hybrid",
+            "random_frame_intra",
+            "register_gated_intra",
+            "register_gated_intra_query",
+            "temporal_neighbor_intra",
+            "oracle_frame_intra",
+            "quota_intra_proxy",
+        }:
             x, debug_payload = register_mediated_anchor_attention(
                 q=q,
                 k=k,
@@ -516,10 +746,31 @@ class SelfAttention(nn.Module):
                 anchor_tau=adaptive_anchor_tau,
                 anchor_uniform_mix=adaptive_anchor_uniform_mix,
                 anchor_mode=strategy,
+                score_mode=adaptive_anchor_score_mode,
+                proxy_quota_ratio=adaptive_anchor_proxy_quota_ratio,
+                intra_source=adaptive_anchor_intra_source,
+                precomputed_intra_scores=self.precomputed_intra_scores,
+                frame_budget_mode=adaptive_anchor_frame_budget_mode,
+                frame_budget_top_frac=adaptive_anchor_frame_budget_top_frac,
+                frame_budget_lambda_intra=adaptive_anchor_frame_budget_lambda_intra,
+                frame_budget_lambda_reg=adaptive_anchor_frame_budget_lambda_reg,
+                frame_budget_reg_topm=adaptive_anchor_frame_budget_reg_topm,
+                reg_patch_topk_ratio=adaptive_anchor_reg_patch_topk_ratio,
+                reg_patch_topk_min=adaptive_anchor_reg_patch_topk_min,
+                reg_patch_topk_max=adaptive_anchor_reg_patch_topk_max,
+                reg_patch_conf_power=adaptive_anchor_reg_patch_conf_power,
+                reg_patch_min_conf=adaptive_anchor_reg_patch_min_conf,
+                query_conditioned_eta=adaptive_anchor_query_conditioned_eta,
+                gated_anchor_ratio_per_key_frame=adaptive_anchor_gated_anchor_ratio_per_key_frame,
+                gated_min_per_key_frame=adaptive_anchor_gated_min_per_key_frame,
+                gated_max_per_key_frame=adaptive_anchor_gated_max_per_key_frame,
+                always_include_self_frame=adaptive_anchor_always_include_self_frame,
                 alpha_cross=adaptive_anchor_score_alpha_cross,
                 beta_intra=adaptive_anchor_score_beta_intra,
                 topm_frames=adaptive_anchor_topm_frames,
+                random_seed=adaptive_anchor_random_seed,
                 scale=self.scale,
+                profile=adaptive_anchor_profile,
                 debug=adaptive_anchor_debug,
             )
             self.last_adaptive_anchor_kv_tokens = int(debug_payload["kv_token_count"])

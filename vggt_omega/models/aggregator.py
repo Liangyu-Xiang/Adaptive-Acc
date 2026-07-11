@@ -52,6 +52,25 @@ class Aggregator(nn.Module):
         adaptive_anchor_strategy: str = "lifting",
         adaptive_anchor_score_alpha_cross: float = 1.0,
         adaptive_anchor_score_beta_intra: float = 0.2,
+        adaptive_anchor_score_mode: str = "intra",
+        adaptive_anchor_proxy_quota_ratio: float = 0.0,
+        adaptive_anchor_intra_source: str = "cached_frame_qk",
+        adaptive_anchor_frame_budget_mode: str = "hybrid",
+        adaptive_anchor_frame_budget_top_frac: float = 0.1,
+        adaptive_anchor_frame_budget_lambda_intra: float = 0.7,
+        adaptive_anchor_frame_budget_lambda_reg: float = 0.3,
+        adaptive_anchor_frame_budget_reg_topm: int = 4,
+        adaptive_anchor_reg_patch_topk_ratio: float = 0.1,
+        adaptive_anchor_reg_patch_topk_min: int = 8,
+        adaptive_anchor_reg_patch_topk_max: int = 64,
+        adaptive_anchor_reg_patch_conf_power: float = 1.0,
+        adaptive_anchor_reg_patch_min_conf: float = 0.05,
+        adaptive_anchor_query_conditioned_eta: float = 0.1,
+        adaptive_anchor_gated_anchor_ratio_per_key_frame: float = 0.1,
+        adaptive_anchor_gated_min_per_key_frame: int = 4,
+        adaptive_anchor_gated_max_per_key_frame: int = 64,
+        adaptive_anchor_always_include_self_frame: bool = True,
+        adaptive_anchor_profile: bool = False,
         adaptive_anchor_topm_frames: int | None = 4,
         adaptive_anchor_random_seed: int = 33,
         adaptive_anchor_debug: bool = False,
@@ -137,11 +156,33 @@ class Aggregator(nn.Module):
         self.adaptive_anchor_strategy = adaptive_anchor_strategy
         self.adaptive_anchor_score_alpha_cross = float(adaptive_anchor_score_alpha_cross)
         self.adaptive_anchor_score_beta_intra = float(adaptive_anchor_score_beta_intra)
+        self.adaptive_anchor_score_mode = adaptive_anchor_score_mode
+        self.adaptive_anchor_proxy_quota_ratio = float(adaptive_anchor_proxy_quota_ratio)
+        self.adaptive_anchor_intra_source = adaptive_anchor_intra_source
+        self.adaptive_anchor_frame_budget_mode = adaptive_anchor_frame_budget_mode
+        self.adaptive_anchor_frame_budget_top_frac = float(adaptive_anchor_frame_budget_top_frac)
+        self.adaptive_anchor_frame_budget_lambda_intra = float(adaptive_anchor_frame_budget_lambda_intra)
+        self.adaptive_anchor_frame_budget_lambda_reg = float(adaptive_anchor_frame_budget_lambda_reg)
+        self.adaptive_anchor_frame_budget_reg_topm = int(adaptive_anchor_frame_budget_reg_topm)
+        self.adaptive_anchor_reg_patch_topk_ratio = float(adaptive_anchor_reg_patch_topk_ratio)
+        self.adaptive_anchor_reg_patch_topk_min = int(adaptive_anchor_reg_patch_topk_min)
+        self.adaptive_anchor_reg_patch_topk_max = int(adaptive_anchor_reg_patch_topk_max)
+        self.adaptive_anchor_reg_patch_conf_power = float(adaptive_anchor_reg_patch_conf_power)
+        self.adaptive_anchor_reg_patch_min_conf = float(adaptive_anchor_reg_patch_min_conf)
+        self.adaptive_anchor_query_conditioned_eta = float(adaptive_anchor_query_conditioned_eta)
+        self.adaptive_anchor_gated_anchor_ratio_per_key_frame = float(
+            adaptive_anchor_gated_anchor_ratio_per_key_frame
+        )
+        self.adaptive_anchor_gated_min_per_key_frame = int(adaptive_anchor_gated_min_per_key_frame)
+        self.adaptive_anchor_gated_max_per_key_frame = int(adaptive_anchor_gated_max_per_key_frame)
+        self.adaptive_anchor_always_include_self_frame = bool(adaptive_anchor_always_include_self_frame)
+        self.adaptive_anchor_profile = bool(adaptive_anchor_profile)
         self.adaptive_anchor_topm_frames = adaptive_anchor_topm_frames
         self.adaptive_anchor_random_seed = int(adaptive_anchor_random_seed)
         self.adaptive_anchor_debug = adaptive_anchor_debug
         self.adaptive_anchor_debug_dir = Path(adaptive_anchor_debug_dir)
         self._adaptive_anchor_debug_step = 0
+        self._adaptive_intra_scores: dict[int, torch.Tensor] = {}
         self.camera_token = nn.Parameter(torch.empty(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.empty(1, 2, num_register_tokens, embed_dim))
         self.patch_token_start = 1 + num_register_tokens
@@ -169,6 +210,25 @@ class Aggregator(nn.Module):
             strategy=adaptive_anchor_strategy,
             score_alpha_cross=adaptive_anchor_score_alpha_cross,
             score_beta_intra=adaptive_anchor_score_beta_intra,
+            score_mode=adaptive_anchor_score_mode,
+            proxy_quota_ratio=adaptive_anchor_proxy_quota_ratio,
+            intra_source=adaptive_anchor_intra_source,
+            frame_budget_mode=adaptive_anchor_frame_budget_mode,
+            frame_budget_top_frac=adaptive_anchor_frame_budget_top_frac,
+            frame_budget_lambda_intra=adaptive_anchor_frame_budget_lambda_intra,
+            frame_budget_lambda_reg=adaptive_anchor_frame_budget_lambda_reg,
+            frame_budget_reg_topm=adaptive_anchor_frame_budget_reg_topm,
+            reg_patch_topk_ratio=adaptive_anchor_reg_patch_topk_ratio,
+            reg_patch_topk_min=adaptive_anchor_reg_patch_topk_min,
+            reg_patch_topk_max=adaptive_anchor_reg_patch_topk_max,
+            reg_patch_conf_power=adaptive_anchor_reg_patch_conf_power,
+            reg_patch_min_conf=adaptive_anchor_reg_patch_min_conf,
+            query_conditioned_eta=adaptive_anchor_query_conditioned_eta,
+            gated_anchor_ratio_per_key_frame=adaptive_anchor_gated_anchor_ratio_per_key_frame,
+            gated_min_per_key_frame=adaptive_anchor_gated_min_per_key_frame,
+            gated_max_per_key_frame=adaptive_anchor_gated_max_per_key_frame,
+            always_include_self_frame=adaptive_anchor_always_include_self_frame,
+            profile=adaptive_anchor_profile,
             topm_frames=adaptive_anchor_topm_frames,
             random_seed=adaptive_anchor_random_seed,
             debug=adaptive_anchor_debug,
@@ -263,6 +323,25 @@ class Aggregator(nn.Module):
         strategy: str = "lifting",
         score_alpha_cross: float = 1.0,
         score_beta_intra: float = 0.2,
+        score_mode: str = "intra",
+        proxy_quota_ratio: float = 0.0,
+        intra_source: str = "cached_frame_qk",
+        frame_budget_mode: str = "hybrid",
+        frame_budget_top_frac: float = 0.1,
+        frame_budget_lambda_intra: float = 0.7,
+        frame_budget_lambda_reg: float = 0.3,
+        frame_budget_reg_topm: int = 4,
+        reg_patch_topk_ratio: float = 0.1,
+        reg_patch_topk_min: int = 8,
+        reg_patch_topk_max: int = 64,
+        reg_patch_conf_power: float = 1.0,
+        reg_patch_min_conf: float = 0.05,
+        query_conditioned_eta: float = 0.1,
+        gated_anchor_ratio_per_key_frame: float = 0.1,
+        gated_min_per_key_frame: int = 4,
+        gated_max_per_key_frame: int = 64,
+        always_include_self_frame: bool = True,
+        profile: bool = False,
         topm_frames: int | None = 4,
         random_seed: int = 33,
         debug: bool = False,
@@ -279,9 +358,16 @@ class Aggregator(nn.Module):
         if not 0.0 <= uniform_mix <= 1.0:
             raise ValueError(f"adaptive_anchor_uniform_mix must be in [0, 1], got {uniform_mix}")
         valid_strategies = {
+            "all_frame_intra",
             "lifting",
             "frame_pair_gated",
             "hybrid",
+            "random_frame_intra",
+            "register_gated_intra",
+            "register_gated_intra_query",
+            "temporal_neighbor_intra",
+            "oracle_frame_intra",
+            "quota_intra_proxy",
             "register_intra",
             "fixed_grid",
             "intra_only",
@@ -295,6 +381,62 @@ class Aggregator(nn.Module):
             raise ValueError(f"adaptive_anchor_strategy must be one of {sorted(valid_strategies)}, got {strategy!r}")
         if topm_frames is not None and topm_frames <= 0:
             topm_frames = None
+        if score_mode.replace("-", "_").lower() not in {"intra", "proxy", "linear_fusion", "quota_union"}:
+            raise ValueError(
+                "adaptive_anchor_score_mode must be one of "
+                "['intra', 'proxy', 'linear_fusion', 'quota_union']"
+            )
+        if not 0.0 <= proxy_quota_ratio <= 1.0:
+            raise ValueError(f"adaptive_anchor_proxy_quota_ratio must be in [0, 1], got {proxy_quota_ratio}")
+        if intra_source not in {"current_inter_qk", "cached_frame_qk"}:
+            raise ValueError(
+                "adaptive_anchor_intra_source must be one of "
+                "['current_inter_qk', 'cached_frame_qk']"
+            )
+        if frame_budget_mode not in {"uniform", "intra_concentration", "register_importance", "hybrid"}:
+            raise ValueError(
+                "adaptive_anchor_frame_budget_mode must be one of "
+                "['uniform', 'intra_concentration', 'register_importance', 'hybrid']"
+            )
+        if not 0.0 < frame_budget_top_frac <= 1.0:
+            raise ValueError(
+                f"adaptive_anchor_frame_budget_top_frac must be in (0, 1], got {frame_budget_top_frac}"
+            )
+        if frame_budget_reg_topm <= 0:
+            raise ValueError(
+                f"adaptive_anchor_frame_budget_reg_topm must be positive, got {frame_budget_reg_topm}"
+            )
+        if not 0.0 <= reg_patch_topk_ratio <= 1.0:
+            raise ValueError(f"adaptive_anchor_reg_patch_topk_ratio must be in [0, 1], got {reg_patch_topk_ratio}")
+        if reg_patch_topk_min <= 0:
+            raise ValueError(f"adaptive_anchor_reg_patch_topk_min must be positive, got {reg_patch_topk_min}")
+        if reg_patch_topk_max <= 0:
+            raise ValueError(f"adaptive_anchor_reg_patch_topk_max must be positive, got {reg_patch_topk_max}")
+        if reg_patch_topk_max < reg_patch_topk_min:
+            raise ValueError(
+                "adaptive_anchor_reg_patch_topk_max must be >= adaptive_anchor_reg_patch_topk_min"
+            )
+        if reg_patch_conf_power < 0.0:
+            raise ValueError(
+                f"adaptive_anchor_reg_patch_conf_power must be non-negative, got {reg_patch_conf_power}"
+            )
+        if reg_patch_min_conf < 0.0:
+            raise ValueError(
+                f"adaptive_anchor_reg_patch_min_conf must be non-negative, got {reg_patch_min_conf}"
+            )
+        if gated_anchor_ratio_per_key_frame < 0.0:
+            raise ValueError(
+                "adaptive_anchor_gated_anchor_ratio_per_key_frame must be non-negative, "
+                f"got {gated_anchor_ratio_per_key_frame}"
+            )
+        if gated_min_per_key_frame < 0:
+            raise ValueError(
+                f"adaptive_anchor_gated_min_per_key_frame must be non-negative, got {gated_min_per_key_frame}"
+            )
+        if gated_max_per_key_frame <= 0:
+            raise ValueError(
+                f"adaptive_anchor_gated_max_per_key_frame must be positive, got {gated_max_per_key_frame}"
+            )
 
         layer_set = self._parse_adaptive_anchor_layer_spec(layers)
         if enabled and layer_set:
@@ -328,6 +470,25 @@ class Aggregator(nn.Module):
         self.adaptive_anchor_strategy = strategy
         self.adaptive_anchor_score_alpha_cross = float(score_alpha_cross)
         self.adaptive_anchor_score_beta_intra = float(score_beta_intra)
+        self.adaptive_anchor_score_mode = score_mode.replace("-", "_").lower()
+        self.adaptive_anchor_proxy_quota_ratio = float(proxy_quota_ratio)
+        self.adaptive_anchor_intra_source = intra_source
+        self.adaptive_anchor_frame_budget_mode = frame_budget_mode
+        self.adaptive_anchor_frame_budget_top_frac = float(frame_budget_top_frac)
+        self.adaptive_anchor_frame_budget_lambda_intra = float(frame_budget_lambda_intra)
+        self.adaptive_anchor_frame_budget_lambda_reg = float(frame_budget_lambda_reg)
+        self.adaptive_anchor_frame_budget_reg_topm = int(frame_budget_reg_topm)
+        self.adaptive_anchor_reg_patch_topk_ratio = float(reg_patch_topk_ratio)
+        self.adaptive_anchor_reg_patch_topk_min = int(reg_patch_topk_min)
+        self.adaptive_anchor_reg_patch_topk_max = int(reg_patch_topk_max)
+        self.adaptive_anchor_reg_patch_conf_power = float(reg_patch_conf_power)
+        self.adaptive_anchor_reg_patch_min_conf = float(reg_patch_min_conf)
+        self.adaptive_anchor_query_conditioned_eta = float(query_conditioned_eta)
+        self.adaptive_anchor_gated_anchor_ratio_per_key_frame = float(gated_anchor_ratio_per_key_frame)
+        self.adaptive_anchor_gated_min_per_key_frame = int(gated_min_per_key_frame)
+        self.adaptive_anchor_gated_max_per_key_frame = int(gated_max_per_key_frame)
+        self.adaptive_anchor_always_include_self_frame = bool(always_include_self_frame)
+        self.adaptive_anchor_profile = bool(profile)
         self.adaptive_anchor_topm_frames = None if topm_frames is None else int(topm_frames)
         self.adaptive_anchor_random_seed = int(random_seed)
         self.adaptive_anchor_debug = bool(debug)
@@ -422,6 +583,7 @@ class Aggregator(nn.Module):
 
         outputs = []
         self._register_patch_selection.clear()
+        self._adaptive_intra_scores.clear()
         for block_idx in range(self.depth):
             tokens, frame_tokens = self._run_frame_block(
                 tokens,
@@ -460,6 +622,14 @@ class Aggregator(nn.Module):
         rope_sincos: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = tokens.view(batch_size * num_frames, num_tokens, embed_dim)
+        self._maybe_store_adaptive_intra_scores(
+            tokens=tokens,
+            batch_size=batch_size,
+            num_frames=num_frames,
+            num_tokens=num_tokens,
+            block_idx=block_idx,
+            rope_sincos=rope_sincos,
+        )
         self._maybe_store_register_patch_selection(
             tokens,
             batch_size,
@@ -470,6 +640,52 @@ class Aggregator(nn.Module):
         )
         tokens = self.frame_blocks[block_idx](tokens, rope_sincos)
         return tokens, tokens.view(batch_size, num_frames, num_tokens, embed_dim)
+
+    def _maybe_store_adaptive_intra_scores(
+        self,
+        tokens: torch.Tensor,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        block_idx: int,
+        rope_sincos: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        if not self.use_adaptive_kv_anchor:
+            return
+        if self.adaptive_anchor_intra_source != "cached_frame_qk":
+            return
+        if block_idx not in self.adaptive_anchor_layers:
+            return
+
+        patch_count = num_tokens - self.patch_token_start
+        if patch_count <= 0:
+            return
+
+        block = self.frame_blocks[block_idx]
+        normalized = block.norm1(tokens)
+        batch_frames, _, hidden = normalized.shape
+        num_heads = block.attn.num_heads
+        head_dim = hidden // num_heads
+        qkv = block.attn.qkv(normalized).reshape(batch_frames, num_tokens, 3, num_heads, head_dim)
+        q, k, _ = torch.unbind(qkv, dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        if block.attn.use_qk_norm:
+            q = block.attn.q_norm(q)
+            k = block.attn.k_norm(k)
+        q, k = block.attn.apply_rope(q, k, rope_sincos)
+
+        q_patch = q[:, :, self.patch_token_start :].float()
+        k_patch = k[:, :, self.patch_token_start :].float()
+        col_mass = torch.empty(batch_frames, patch_count, device=tokens.device, dtype=torch.float32)
+        denom = max(batch_size * num_frames * num_heads * patch_count * patch_count, 1)
+        frame_chunk = max(1, min(batch_frames, 8_000_000 // denom))
+        for start in range(0, batch_frames, frame_chunk):
+            end = min(start + frame_chunk, batch_frames)
+            logits = torch.matmul(q_patch[start:end], k_patch[start:end].transpose(-2, -1)) * block.attn.scale
+            intra = logits.softmax(dim=-1)
+            col_mass[start:end] = intra.sum(dim=-2).mean(dim=1)
+        self._adaptive_intra_scores[block_idx] = col_mass.view(batch_size, num_frames, patch_count)
 
     def _maybe_store_register_patch_selection(
         self,
@@ -546,6 +762,7 @@ class Aggregator(nn.Module):
         if attention_type == "global":
             tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
             self.inter_frame_blocks[block_idx].attn.merge_random_seed = self.merge_random_seed
+            self.inter_frame_blocks[block_idx].attn.precomputed_intra_scores = self._adaptive_intra_scores.get(block_idx)
             inter_frame_only_attention = block_idx in self.inter_frame_only_layers
             adaptive_kv_anchor = self.use_adaptive_kv_anchor and block_idx in self.adaptive_anchor_layers
             if adaptive_kv_anchor:
@@ -589,10 +806,30 @@ class Aggregator(nn.Module):
                 adaptive_anchor_strategy=self.adaptive_anchor_strategy,
                 adaptive_anchor_score_alpha_cross=self.adaptive_anchor_score_alpha_cross,
                 adaptive_anchor_score_beta_intra=self.adaptive_anchor_score_beta_intra,
+                adaptive_anchor_score_mode=self.adaptive_anchor_score_mode,
+                adaptive_anchor_proxy_quota_ratio=self.adaptive_anchor_proxy_quota_ratio,
+                adaptive_anchor_intra_source=self.adaptive_anchor_intra_source,
+                adaptive_anchor_frame_budget_mode=self.adaptive_anchor_frame_budget_mode,
+                adaptive_anchor_frame_budget_top_frac=self.adaptive_anchor_frame_budget_top_frac,
+                adaptive_anchor_frame_budget_lambda_intra=self.adaptive_anchor_frame_budget_lambda_intra,
+                adaptive_anchor_frame_budget_lambda_reg=self.adaptive_anchor_frame_budget_lambda_reg,
+                adaptive_anchor_frame_budget_reg_topm=self.adaptive_anchor_frame_budget_reg_topm,
+                adaptive_anchor_reg_patch_topk_ratio=self.adaptive_anchor_reg_patch_topk_ratio,
+                adaptive_anchor_reg_patch_topk_min=self.adaptive_anchor_reg_patch_topk_min,
+                adaptive_anchor_reg_patch_topk_max=self.adaptive_anchor_reg_patch_topk_max,
+                adaptive_anchor_reg_patch_conf_power=self.adaptive_anchor_reg_patch_conf_power,
+                adaptive_anchor_reg_patch_min_conf=self.adaptive_anchor_reg_patch_min_conf,
+                adaptive_anchor_query_conditioned_eta=self.adaptive_anchor_query_conditioned_eta,
+                adaptive_anchor_gated_anchor_ratio_per_key_frame=self.adaptive_anchor_gated_anchor_ratio_per_key_frame,
+                adaptive_anchor_gated_min_per_key_frame=self.adaptive_anchor_gated_min_per_key_frame,
+                adaptive_anchor_gated_max_per_key_frame=self.adaptive_anchor_gated_max_per_key_frame,
+                adaptive_anchor_always_include_self_frame=self.adaptive_anchor_always_include_self_frame,
+                adaptive_anchor_profile=self.adaptive_anchor_profile,
                 adaptive_anchor_topm_frames=self.adaptive_anchor_topm_frames,
                 adaptive_anchor_random_seed=self.adaptive_anchor_random_seed,
                 adaptive_anchor_debug=self.adaptive_anchor_debug,
             )
+            self.inter_frame_blocks[block_idx].attn.precomputed_intra_scores = None
             if adaptive_kv_anchor:
                 self._maybe_save_adaptive_anchor_debug(block_idx)
             return tokens.view(batch_size, num_frames, num_tokens, embed_dim)

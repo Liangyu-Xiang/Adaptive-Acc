@@ -230,7 +230,7 @@ def parse_args() -> argparse.Namespace:
         "--anchor_tau",
         dest="adaptive_anchor_tau",
         type=float,
-        default=1.0,
+        default=0.5,
         help="Temperature for adaptive anchor score weighting.",
     )
     parser.add_argument(
@@ -239,16 +239,37 @@ def parse_args() -> argparse.Namespace:
         "--anchor_uniform_mix",
         dest="adaptive_anchor_uniform_mix",
         type=float,
-        default=0.2,
+        default=0.05,
         help="Uniform mixing coefficient for adaptive anchor allocation.",
     )
     parser.add_argument(
         "--adaptive-anchor-mode",
+        "--adaptive-anchor-strategy",
         "--anchor-mode",
+        "--anchor-strategy",
         "--anchor_mode",
+        "--anchor_strategy",
         dest="adaptive_anchor_strategy",
-        choices=("lifting", "frame_pair_gated", "hybrid", "register_intra", "fixed_grid", "intra_only", "proxy", "proxy_intra", "oracle", "random"),
-        default="lifting",
+        choices=(
+            "all_frame_intra",
+            "lifting",
+            "frame_pair_gated",
+            "hybrid",
+            "random_frame_intra",
+            "register_gated_intra",
+            "register_gated_intra_query",
+            "temporal_neighbor_intra",
+            "oracle_frame_intra",
+            "quota_intra_proxy",
+            "register_intra",
+            "fixed_grid",
+            "intra_only",
+            "proxy",
+            "proxy_intra",
+            "oracle",
+            "random",
+        ),
+        default="register_gated_intra",
         help="Adaptive K/V anchor mode. register-mediated modes are lifting, frame_pair_gated, and hybrid.",
     )
     parser.add_argument(
@@ -268,6 +289,183 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="Weight for intra-frame structural patch score.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-score-mode",
+        "--anchor-score-mode",
+        "--anchor_score_mode",
+        dest="adaptive_anchor_score_mode",
+        choices=("intra", "proxy", "linear_fusion", "quota_union"),
+        default="intra",
+        help="Patch-anchor score mode for register-mediated adaptive anchors.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-proxy-quota-ratio",
+        "--anchor-proxy-quota-ratio",
+        "--anchor_proxy_quota_ratio",
+        dest="adaptive_anchor_proxy_quota_ratio",
+        type=float,
+        default=0.0,
+        help="Proxy quota ratio used by quota_union / quota_intra_proxy.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-intra-source",
+        "--anchor-intra-source",
+        "--anchor_intra_source",
+        dest="adaptive_anchor_intra_source",
+        choices=("current_inter_qk", "cached_frame_qk"),
+        default="cached_frame_qk",
+        help="Source of intra-frame attention statistics for adaptive anchors.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-frame-budget-mode",
+        "--anchor-frame-budget-mode",
+        "--anchor_frame_budget_mode",
+        dest="adaptive_anchor_frame_budget_mode",
+        choices=("uniform", "intra_concentration", "register_importance", "hybrid"),
+        default="hybrid",
+        help="Frame-level budget allocation mode for adaptive anchors.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-frame-budget-top-frac",
+        "--anchor-frame-budget-top-frac",
+        "--anchor_frame_budget_top_frac",
+        dest="adaptive_anchor_frame_budget_top_frac",
+        type=float,
+        default=0.1,
+        help="Top fraction used by intra_concentration frame-budget scoring.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-frame-budget-lambda-intra",
+        "--anchor-frame-budget-lambda-intra",
+        "--anchor_frame_budget_lambda_intra",
+        dest="adaptive_anchor_frame_budget_lambda_intra",
+        type=float,
+        default=0.7,
+        help="Hybrid frame-budget weight for intra concentration.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-frame-budget-lambda-reg",
+        "--anchor-frame-budget-lambda-reg",
+        "--anchor_frame_budget_lambda_reg",
+        dest="adaptive_anchor_frame_budget_lambda_reg",
+        type=float,
+        default=0.3,
+        help="Hybrid frame-budget weight for register importance.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-frame-budget-reg-topm",
+        "--anchor-frame-budget-reg-topm",
+        "--anchor_frame_budget_reg_topm",
+        dest="adaptive_anchor_frame_budget_reg_topm",
+        type=int,
+        default=4,
+        help="Top-M frame-pair strengths used by register_importance frame budgeting.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-reg-patch-topk-ratio",
+        "--anchor-reg-patch-topk-ratio",
+        "--anchor_reg_patch_topk_ratio",
+        dest="adaptive_anchor_reg_patch_topk_ratio",
+        type=float,
+        default=0.1,
+        help="Top-k sparsification ratio for register-to-patch affinity.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-reg-patch-topk-min",
+        "--anchor-reg-patch-topk-min",
+        "--anchor_reg_patch_topk_min",
+        dest="adaptive_anchor_reg_patch_topk_min",
+        type=int,
+        default=8,
+        help="Minimum top-k for register-to-patch affinity sparsification.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-reg-patch-topk-max",
+        "--anchor-reg-patch-topk-max",
+        "--anchor_reg_patch_topk_max",
+        dest="adaptive_anchor_reg_patch_topk_max",
+        type=int,
+        default=64,
+        help="Maximum top-k for register-to-patch affinity sparsification.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-reg-patch-conf-power",
+        "--anchor-reg-patch-conf-power",
+        "--anchor_reg_patch_conf_power",
+        dest="adaptive_anchor_reg_patch_conf_power",
+        type=float,
+        default=1.0,
+        help="Confidence exponent for register-to-patch affinity reweighting.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-reg-patch-min-conf",
+        "--anchor-reg-patch-min-conf",
+        "--anchor_reg_patch_min_conf",
+        dest="adaptive_anchor_reg_patch_min_conf",
+        type=float,
+        default=0.05,
+        help="Minimum confidence for register-to-patch affinity contribution.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-query-conditioned-eta",
+        "--anchor-query-conditioned-eta",
+        "--anchor_query_conditioned_eta",
+        dest="adaptive_anchor_query_conditioned_eta",
+        type=float,
+        default=0.1,
+        help="Query-conditioned modulation weight for register_gated_intra_query.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-gated-anchor-ratio-per-key-frame",
+        "--anchor-gated-anchor-ratio-per-key-frame",
+        "--anchor_gated_anchor_ratio_per_key_frame",
+        dest="adaptive_anchor_gated_anchor_ratio_per_key_frame",
+        type=float,
+        default=0.1,
+        help="Patch-anchor ratio retained per selected key frame in gated modes.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-gated-min-per-key-frame",
+        "--anchor-gated-min-per-key-frame",
+        "--anchor_gated_min_per_key_frame",
+        dest="adaptive_anchor_gated_min_per_key_frame",
+        type=int,
+        default=4,
+        help="Minimum number of anchors retained per selected key frame in gated modes.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-gated-max-per-key-frame",
+        "--anchor-gated-max-per-key-frame",
+        "--anchor_gated_max_per_key_frame",
+        dest="adaptive_anchor_gated_max_per_key_frame",
+        type=int,
+        default=64,
+        help="Maximum number of anchors retained per selected key frame in gated modes.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-no-self-frame",
+        dest="adaptive_anchor_always_include_self_frame",
+        action="store_false",
+        help="Do not force the query frame itself into gated key-frame neighborhoods.",
+    )
+    parser.set_defaults(adaptive_anchor_always_include_self_frame=True)
+    parser.add_argument(
+        "--adaptive-anchor-random-seed",
+        "--anchor-random-seed",
+        "--anchor_random_seed",
+        dest="adaptive_anchor_random_seed",
+        type=int,
+        default=33,
+        help="Random seed for adaptive random anchor/frame baselines.",
+    )
+    parser.add_argument(
+        "--adaptive-anchor-profile",
+        "--anchor-profile",
+        "--anchor_profile",
+        dest="adaptive_anchor_profile",
+        action="store_true",
+        help="Record runtime profile for adaptive anchor scoring/selection/attention.",
     )
     parser.add_argument(
         "--adaptive-anchor-topm-frames",
@@ -422,7 +620,27 @@ def load_model(
     adaptive_anchor_strategy: str,
     adaptive_anchor_score_alpha_cross: float,
     adaptive_anchor_score_beta_intra: float,
+    adaptive_anchor_score_mode: str,
+    adaptive_anchor_proxy_quota_ratio: float,
+    adaptive_anchor_intra_source: str,
+    adaptive_anchor_frame_budget_mode: str,
+    adaptive_anchor_frame_budget_top_frac: float,
+    adaptive_anchor_frame_budget_lambda_intra: float,
+    adaptive_anchor_frame_budget_lambda_reg: float,
+    adaptive_anchor_frame_budget_reg_topm: int,
+    adaptive_anchor_reg_patch_topk_ratio: float,
+    adaptive_anchor_reg_patch_topk_min: int,
+    adaptive_anchor_reg_patch_topk_max: int,
+    adaptive_anchor_reg_patch_conf_power: float,
+    adaptive_anchor_reg_patch_min_conf: float,
+    adaptive_anchor_query_conditioned_eta: float,
+    adaptive_anchor_gated_anchor_ratio_per_key_frame: float,
+    adaptive_anchor_gated_min_per_key_frame: int,
+    adaptive_anchor_gated_max_per_key_frame: int,
+    adaptive_anchor_always_include_self_frame: bool,
+    adaptive_anchor_profile: bool,
     adaptive_anchor_topm_frames: int | None,
+    adaptive_anchor_random_seed: int,
     adaptive_anchor_debug: bool,
     adaptive_anchor_debug_dir: Path,
 ) -> VGGTOmega:
@@ -448,7 +666,27 @@ def load_model(
         "adaptive_anchor_strategy": adaptive_anchor_strategy,
         "adaptive_anchor_score_alpha_cross": adaptive_anchor_score_alpha_cross,
         "adaptive_anchor_score_beta_intra": adaptive_anchor_score_beta_intra,
+        "adaptive_anchor_score_mode": adaptive_anchor_score_mode,
+        "adaptive_anchor_proxy_quota_ratio": adaptive_anchor_proxy_quota_ratio,
+        "adaptive_anchor_intra_source": adaptive_anchor_intra_source,
+        "adaptive_anchor_frame_budget_mode": adaptive_anchor_frame_budget_mode,
+        "adaptive_anchor_frame_budget_top_frac": adaptive_anchor_frame_budget_top_frac,
+        "adaptive_anchor_frame_budget_lambda_intra": adaptive_anchor_frame_budget_lambda_intra,
+        "adaptive_anchor_frame_budget_lambda_reg": adaptive_anchor_frame_budget_lambda_reg,
+        "adaptive_anchor_frame_budget_reg_topm": adaptive_anchor_frame_budget_reg_topm,
+        "adaptive_anchor_reg_patch_topk_ratio": adaptive_anchor_reg_patch_topk_ratio,
+        "adaptive_anchor_reg_patch_topk_min": adaptive_anchor_reg_patch_topk_min,
+        "adaptive_anchor_reg_patch_topk_max": adaptive_anchor_reg_patch_topk_max,
+        "adaptive_anchor_reg_patch_conf_power": adaptive_anchor_reg_patch_conf_power,
+        "adaptive_anchor_reg_patch_min_conf": adaptive_anchor_reg_patch_min_conf,
+        "adaptive_anchor_query_conditioned_eta": adaptive_anchor_query_conditioned_eta,
+        "adaptive_anchor_gated_anchor_ratio_per_key_frame": adaptive_anchor_gated_anchor_ratio_per_key_frame,
+        "adaptive_anchor_gated_min_per_key_frame": adaptive_anchor_gated_min_per_key_frame,
+        "adaptive_anchor_gated_max_per_key_frame": adaptive_anchor_gated_max_per_key_frame,
+        "adaptive_anchor_always_include_self_frame": adaptive_anchor_always_include_self_frame,
+        "adaptive_anchor_profile": adaptive_anchor_profile,
         "adaptive_anchor_topm_frames": adaptive_anchor_topm_frames,
+        "adaptive_anchor_random_seed": adaptive_anchor_random_seed,
         "adaptive_anchor_debug": adaptive_anchor_debug,
         "adaptive_anchor_debug_dir": adaptive_anchor_debug_dir,
     }
@@ -606,6 +844,30 @@ def main() -> int:
         raise ValueError("--adaptive-anchor-tau must be positive")
     if not 0.0 <= args.adaptive_anchor_uniform_mix <= 1.0:
         raise ValueError("--adaptive-anchor-uniform-mix must be in [0, 1]")
+    if not 0.0 <= args.adaptive_anchor_proxy_quota_ratio <= 1.0:
+        raise ValueError("--adaptive-anchor-proxy-quota-ratio must be in [0, 1]")
+    if not 0.0 < args.adaptive_anchor_frame_budget_top_frac <= 1.0:
+        raise ValueError("--adaptive-anchor-frame-budget-top-frac must be in (0, 1]")
+    if args.adaptive_anchor_frame_budget_reg_topm <= 0:
+        raise ValueError("--adaptive-anchor-frame-budget-reg-topm must be positive")
+    if not 0.0 <= args.adaptive_anchor_reg_patch_topk_ratio <= 1.0:
+        raise ValueError("--adaptive-anchor-reg-patch-topk-ratio must be in [0, 1]")
+    if args.adaptive_anchor_reg_patch_topk_min <= 0:
+        raise ValueError("--adaptive-anchor-reg-patch-topk-min must be positive")
+    if args.adaptive_anchor_reg_patch_topk_max <= 0:
+        raise ValueError("--adaptive-anchor-reg-patch-topk-max must be positive")
+    if args.adaptive_anchor_reg_patch_topk_max < args.adaptive_anchor_reg_patch_topk_min:
+        raise ValueError("--adaptive-anchor-reg-patch-topk-max must be >= --adaptive-anchor-reg-patch-topk-min")
+    if args.adaptive_anchor_reg_patch_conf_power < 0.0:
+        raise ValueError("--adaptive-anchor-reg-patch-conf-power must be non-negative")
+    if args.adaptive_anchor_reg_patch_min_conf < 0.0:
+        raise ValueError("--adaptive-anchor-reg-patch-min-conf must be non-negative")
+    if args.adaptive_anchor_gated_anchor_ratio_per_key_frame < 0.0:
+        raise ValueError("--adaptive-anchor-gated-anchor-ratio-per-key-frame must be non-negative")
+    if args.adaptive_anchor_gated_min_per_key_frame < 0:
+        raise ValueError("--adaptive-anchor-gated-min-per-key-frame must be non-negative")
+    if args.adaptive_anchor_gated_max_per_key_frame <= 0:
+        raise ValueError("--adaptive-anchor-gated-max-per-key-frame must be positive")
     if args.adaptive_anchor_topm_frames is not None and args.adaptive_anchor_topm_frames <= 0:
         args.adaptive_anchor_topm_frames = None
     if args.use_adaptive_kv_anchor and args.merge_ratio != 0.0:
@@ -694,7 +956,27 @@ def main() -> int:
         args.adaptive_anchor_strategy,
         args.adaptive_anchor_score_alpha_cross,
         args.adaptive_anchor_score_beta_intra,
+        args.adaptive_anchor_score_mode,
+        args.adaptive_anchor_proxy_quota_ratio,
+        args.adaptive_anchor_intra_source,
+        args.adaptive_anchor_frame_budget_mode,
+        args.adaptive_anchor_frame_budget_top_frac,
+        args.adaptive_anchor_frame_budget_lambda_intra,
+        args.adaptive_anchor_frame_budget_lambda_reg,
+        args.adaptive_anchor_frame_budget_reg_topm,
+        args.adaptive_anchor_reg_patch_topk_ratio,
+        args.adaptive_anchor_reg_patch_topk_min,
+        args.adaptive_anchor_reg_patch_topk_max,
+        args.adaptive_anchor_reg_patch_conf_power,
+        args.adaptive_anchor_reg_patch_min_conf,
+        args.adaptive_anchor_query_conditioned_eta,
+        args.adaptive_anchor_gated_anchor_ratio_per_key_frame,
+        args.adaptive_anchor_gated_min_per_key_frame,
+        args.adaptive_anchor_gated_max_per_key_frame,
+        args.adaptive_anchor_always_include_self_frame,
+        args.adaptive_anchor_profile,
         args.adaptive_anchor_topm_frames,
+        args.adaptive_anchor_random_seed,
         args.adaptive_anchor_debug,
         args.adaptive_anchor_debug_dir,
     )
@@ -759,7 +1041,13 @@ def main() -> int:
             f"mode={args.adaptive_anchor_strategy}, "
             f"alpha_cross={args.adaptive_anchor_score_alpha_cross}, "
             f"beta_intra={args.adaptive_anchor_score_beta_intra}, "
+            f"score_mode={args.adaptive_anchor_score_mode}, "
+            f"intra_source={args.adaptive_anchor_intra_source}, "
+            f"frame_budget={args.adaptive_anchor_frame_budget_mode}, "
+            f"proxy_quota={args.adaptive_anchor_proxy_quota_ratio}, "
             f"topm_frames={args.adaptive_anchor_topm_frames}, "
+            f"random_seed={args.adaptive_anchor_random_seed}, "
+            f"profile={args.adaptive_anchor_profile}, "
             f"debug={args.adaptive_anchor_debug}, "
             f"debug_dir={args.adaptive_anchor_debug_dir}"
         )
@@ -892,7 +1180,27 @@ def main() -> int:
             "adaptive_anchor_strategy": args.adaptive_anchor_strategy,
             "adaptive_anchor_score_alpha_cross": args.adaptive_anchor_score_alpha_cross,
             "adaptive_anchor_score_beta_intra": args.adaptive_anchor_score_beta_intra,
+            "adaptive_anchor_score_mode": args.adaptive_anchor_score_mode,
+            "adaptive_anchor_proxy_quota_ratio": args.adaptive_anchor_proxy_quota_ratio,
+            "adaptive_anchor_intra_source": args.adaptive_anchor_intra_source,
+            "adaptive_anchor_frame_budget_mode": args.adaptive_anchor_frame_budget_mode,
+            "adaptive_anchor_frame_budget_top_frac": args.adaptive_anchor_frame_budget_top_frac,
+            "adaptive_anchor_frame_budget_lambda_intra": args.adaptive_anchor_frame_budget_lambda_intra,
+            "adaptive_anchor_frame_budget_lambda_reg": args.adaptive_anchor_frame_budget_lambda_reg,
+            "adaptive_anchor_frame_budget_reg_topm": args.adaptive_anchor_frame_budget_reg_topm,
+            "adaptive_anchor_reg_patch_topk_ratio": args.adaptive_anchor_reg_patch_topk_ratio,
+            "adaptive_anchor_reg_patch_topk_min": args.adaptive_anchor_reg_patch_topk_min,
+            "adaptive_anchor_reg_patch_topk_max": args.adaptive_anchor_reg_patch_topk_max,
+            "adaptive_anchor_reg_patch_conf_power": args.adaptive_anchor_reg_patch_conf_power,
+            "adaptive_anchor_reg_patch_min_conf": args.adaptive_anchor_reg_patch_min_conf,
+            "adaptive_anchor_query_conditioned_eta": args.adaptive_anchor_query_conditioned_eta,
+            "adaptive_anchor_gated_anchor_ratio_per_key_frame": args.adaptive_anchor_gated_anchor_ratio_per_key_frame,
+            "adaptive_anchor_gated_min_per_key_frame": args.adaptive_anchor_gated_min_per_key_frame,
+            "adaptive_anchor_gated_max_per_key_frame": args.adaptive_anchor_gated_max_per_key_frame,
+            "adaptive_anchor_always_include_self_frame": args.adaptive_anchor_always_include_self_frame,
+            "adaptive_anchor_profile": args.adaptive_anchor_profile,
             "adaptive_anchor_topm_frames": args.adaptive_anchor_topm_frames,
+            "adaptive_anchor_random_seed": args.adaptive_anchor_random_seed,
             "adaptive_anchor_debug": args.adaptive_anchor_debug,
             "adaptive_anchor_debug_dir": str(args.adaptive_anchor_debug_dir),
             "attention_mode": args.attention_mode,
