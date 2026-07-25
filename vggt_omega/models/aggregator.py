@@ -11,6 +11,13 @@ import torch.nn as nn
 
 from vggt_omega.models.layers import Mlp, RopePositionEmbedding, SelfAttentionBlock
 from vggt_omega.models.layers.vision_transformer import DinoVisionTransformer
+from vggt_omega.models.progressive_attention import (
+    ProgressiveAttentionConfig,
+    ProgressiveMaskState,
+    progressive_attention_block,
+    progressive_config_from_dict,
+    resolve_progressive_schedule,
+)
 
 
 _RESNET_MEAN = [0.485, 0.456, 0.406]
@@ -41,6 +48,7 @@ class Aggregator(nn.Module):
         sparse_ratio: float | None = None,
         sparse_cdf_threshold: float | None = None,
         sparse_pool_mode: str = "avg",
+        progressive_attention: ProgressiveAttentionConfig | dict | None = None,
         inter_frame_only_layers: tuple[int, ...] = (),
         use_adaptive_kv_anchor: bool = False,
         adaptive_anchor_layers: str | int | tuple[int, ...] | list[int] = "none",
@@ -145,6 +153,11 @@ class Aggregator(nn.Module):
         self.sparse_ratio = sparse_ratio
         self.sparse_cdf_threshold = sparse_cdf_threshold
         self.sparse_pool_mode = sparse_pool_mode
+        self.progressive_attention_config = ProgressiveAttentionConfig()
+        self.progressive_layer_schedule = {}
+        self._progressive_stage_states: dict[int, ProgressiveMaskState] = {}
+        self.last_progressive_attention_stats: dict[int, dict[str, object]] = {}
+        self.last_progressive_sample_indices: dict[int, torch.Tensor] = {}
         self.inter_frame_only_layers: set[int] = set()
         self.use_adaptive_kv_anchor = False
         self.adaptive_anchor_layers: set[int] = set()
@@ -234,6 +247,7 @@ class Aggregator(nn.Module):
             debug=adaptive_anchor_debug,
             debug_dir=adaptive_anchor_debug_dir,
         )
+        self.set_progressive_attention(progressive_attention)
 
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
             self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
@@ -283,6 +297,98 @@ class Aggregator(nn.Module):
         self.sparse_ratio = sparse_ratio
         self.sparse_cdf_threshold = sparse_cdf_threshold
         self.sparse_pool_mode = sparse_pool_mode
+
+    def set_progressive_attention(
+        self,
+        config: ProgressiveAttentionConfig | dict | None,
+    ) -> None:
+        resolved = progressive_config_from_dict(config)
+        incompatible = []
+        if resolved.enabled and self._merge_is_enabled(
+            self.global_merging,
+            self.merging,
+            self.merge_ratio,
+        ):
+            incompatible.append("token merging")
+        if resolved.enabled and self.sparse_attention:
+            incompatible.append("per-layer sparse attention")
+        if (
+            resolved.enabled
+            and self.use_adaptive_kv_anchor
+            and self.adaptive_anchor_layers
+        ):
+            incompatible.append("adaptive K/V anchors")
+        if resolved.enabled and self.inter_frame_only_layers:
+            incompatible.append("inter-frame-only attention")
+        if incompatible:
+            raise ValueError(
+                "Progressive attention is mutually exclusive with "
+                + ", ".join(incompatible)
+            )
+        self.progressive_attention_config = resolved
+        self.progressive_layer_schedule = (
+            resolve_progressive_schedule(
+                depth=self.depth,
+                inter_frame_attention_types=self.inter_frame_attention_types,
+                config=resolved,
+            )
+            if resolved.enabled
+            else {}
+        )
+        self._progressive_stage_states.clear()
+        self.last_progressive_attention_stats.clear()
+        self.last_progressive_sample_indices.clear()
+
+    def progressive_attention_metadata(self) -> dict[str, object]:
+        config = self.progressive_attention_config
+        return {
+            "enabled": config.enabled,
+            "semantics": "exact_token_pair_reference_v2",
+            "stage_ranges": [list(stage) for stage in config.stage_ranges],
+            "enabled_stages": list(config.enabled_stages),
+            "scope_schedule": list(config.scope_schedule),
+            "reset_at_stage_boundary": config.reset_at_stage_boundary,
+            "final_scope_mode": config.final_scope_mode,
+            "require_stage_final_full": config.require_stage_final_full,
+            "mask_enabled": config.mask_enabled,
+            "profile_components": config.profile_components,
+            "sampling": {
+                "type": config.sampling_type,
+                "random_seed": config.sampling_random_seed,
+                "resample_each_stage": config.sampling_resample_each_stage,
+                "sample_tokens_before_qkv": True,
+                "patch_tokens_only": True,
+            },
+            "mask": {
+                "head_aggregation": "mean",
+                "self_weight": config.self_weight,
+                "row_weight": config.row_weight,
+                "column_weight": config.column_weight,
+                "local_weight": config.local_weight,
+                "query_neighbor_radius": config.query_neighbor_radius,
+                "key_neighbor_radius": config.key_neighbor_radius,
+                "row_keep_ratio": config.row_keep_ratio,
+                "column_keep_ratio": config.column_keep_ratio,
+                "min_pairs_per_query": config.min_pairs_per_query,
+                "dilation_query": config.dilation_query,
+                "dilation_key": config.dilation_key,
+                "representation": config.mask_representation,
+                "query_chunk_size": config.mask_query_chunk_size,
+                "max_reference_pair_elements": (
+                    config.max_reference_pair_elements
+                ),
+            },
+            "layer_schedule": {
+                str(layer): {
+                    "stage_index": spec.stage_index,
+                    "stage_name": spec.stage_name,
+                    "stage_global_position": spec.global_position,
+                    "stage_global_count": spec.global_count,
+                    "scope": spec.scope,
+                }
+                for layer, spec in self.progressive_layer_schedule.items()
+            },
+        }
 
     def set_merge_random_seed(self, seed: int) -> None:
         self.merge_random_seed = int(seed)
@@ -584,6 +690,9 @@ class Aggregator(nn.Module):
         outputs = []
         self._register_patch_selection.clear()
         self._adaptive_intra_scores.clear()
+        self._progressive_stage_states.clear()
+        self.last_progressive_attention_stats.clear()
+        self.last_progressive_sample_indices.clear()
         for block_idx in range(self.depth):
             tokens, frame_tokens = self._run_frame_block(
                 tokens,
@@ -746,6 +855,119 @@ class Aggregator(nn.Module):
         patch_scores = probabilities[..., patch_token_start:].mean(dim=(1, 2))
         return patch_scores.to(dtype=tokens.dtype)
 
+    def _run_progressive_attention_block(
+        self,
+        tokens: torch.Tensor,
+        *,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        embed_dim: int,
+        block_idx: int,
+        patch_grid_size: tuple[int, int],
+    ) -> torch.Tensor:
+        config = self.progressive_attention_config
+        spec = self.progressive_layer_schedule[block_idx]
+        if spec.is_stage_first:
+            self._progressive_stage_states.pop(spec.stage_index, None)
+        previous_state = (
+            self._progressive_stage_states.get(spec.stage_index)
+            if config.mask_enabled
+            else None
+        )
+        flat_tokens = tokens.reshape(
+            batch_size,
+            num_frames * num_tokens,
+            embed_dim,
+        )
+        if spec.scope == "full" and config.final_scope_mode == "dense":
+            flat_tokens = self.inter_frame_blocks[block_idx](flat_tokens, None)
+            full_patch_tokens = num_frames * (
+                num_tokens - self.patch_token_start
+            )
+            total_tokens = num_frames * num_tokens
+            self.last_progressive_attention_stats[block_idx] = {
+                "stage_index": spec.stage_index,
+                "stage_name": spec.stage_name,
+                "layer_index": block_idx,
+                "stage_global_position": spec.global_position,
+                "stage_global_count": spec.global_count,
+                "scope": "full",
+                "sampled_patch_tokens": full_patch_tokens,
+                "special_tokens": num_frames * self.patch_token_start,
+                "qkv_projection_tokens": total_tokens,
+                "full_patch_tokens": full_patch_tokens,
+                "patch_sampling_ratio": 1.0,
+                "sample_before_qkv": True,
+                "mask_inherited": False,
+                "mask_generated": False,
+                "attention_backend": "original_dense_sdpa",
+                "logical_attention_pairs_per_batch": (
+                    total_tokens * total_tokens
+                ),
+                "evaluated_attention_pairs_per_batch": (
+                    total_tokens * total_tokens
+                ),
+                "patch_attention_pairs_per_batch": (
+                    full_patch_tokens * full_patch_tokens
+                ),
+                "patch_attention_pair_retention_vs_full": 1.0,
+            }
+            self._progressive_stage_states.pop(spec.stage_index, None)
+            return flat_tokens.view(
+                batch_size,
+                num_frames,
+                num_tokens,
+                embed_dim,
+            )
+
+        if (
+            spec.scope == "full"
+            and config.final_scope_mode == "inherited_sparse"
+            and previous_state is None
+        ):
+            raise RuntimeError(
+                f"Progressive full sparse layer {block_idx} has no inherited mask"
+            )
+        result = progressive_attention_block(
+            self.inter_frame_blocks[block_idx],
+            flat_tokens,
+            num_frames=num_frames,
+            tokens_per_frame=num_tokens,
+            num_special_tokens=self.patch_token_start,
+            patch_grid_size=patch_grid_size,
+            layer_spec=spec,
+            config=config,
+            previous_state=previous_state,
+            build_next_mask=bool(
+                config.mask_enabled and not spec.is_stage_last
+            ),
+        )
+        if spec.is_stage_last:
+            self._progressive_stage_states.pop(spec.stage_index, None)
+        elif result.next_state is not None:
+            self._progressive_stage_states[spec.stage_index] = result.next_state
+        full_patch_tokens = num_frames * (
+            num_tokens - self.patch_token_start
+        )
+        patch_pairs = int(
+            result.stats.get("patch_attention_pairs_per_batch", 0)
+        )
+        result.stats["patch_attention_pair_retention_vs_full"] = (
+            patch_pairs / max(full_patch_tokens * full_patch_tokens, 1)
+        )
+        self.last_progressive_attention_stats[block_idx] = result.stats
+        if result.sample_coordinates is not None:
+            self.last_progressive_sample_indices[block_idx] = (
+                result.sample_coordinates
+            )
+        return result.output.view(
+            batch_size,
+            num_frames,
+            num_tokens,
+            embed_dim,
+        )
+
     def _run_inter_frame_attention_block(
         self,
         tokens: torch.Tensor,
@@ -760,6 +982,20 @@ class Aggregator(nn.Module):
         tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type == "global":
+            progressive_spec = self.progressive_layer_schedule.get(block_idx)
+            if (
+                self.progressive_attention_config.enabled
+                and progressive_spec is not None
+            ):
+                return self._run_progressive_attention_block(
+                    tokens,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    num_tokens=num_tokens,
+                    embed_dim=embed_dim,
+                    block_idx=block_idx,
+                    patch_grid_size=patch_grid_size,
+                )
             tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
             self.inter_frame_blocks[block_idx].attn.merge_random_seed = self.merge_random_seed
             self.inter_frame_blocks[block_idx].attn.precomputed_intra_scores = self._adaptive_intra_scores.get(block_idx)

@@ -1,0 +1,31 @@
+{
+  "enabled": true,
+  "scope_schedule": [32, 64, "full"],
+  "final_scope_mode": "dense",
+  "mask_enabled": true,
+  "profile_components": true,
+  "sampling": {
+    "type": "nested_random_balanced",
+    "random_seed": 0,
+    "resample_each_stage": true,
+    "sample_tokens_before_qkv": true,
+    "patch_tokens_only": true
+  },
+  "mask": {
+    "representation": "dense_token_pair_reference",
+    "query_chunk_size": 128,
+    "max_reference_pair_elements": 5000000000,
+    "head_aggregation": "mean",
+    "self_weight": 0.25,
+    "row_weight": 0.25,
+    "column_weight": 0.25,
+    "local_weight": 0.25,
+    "query_neighbor_radius": 1,
+    "key_neighbor_radius": 1,
+    "row_keep_ratio": 0.25,
+    "column_keep_ratio": 0.05,
+    "min_pairs_per_query": 4,
+    "dilation_query": 1,
+    "dilation_key": 1
+  }
+}

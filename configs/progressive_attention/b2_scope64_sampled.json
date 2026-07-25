@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "stage_ranges": [[0, 9], [10, 16], [17, 23]],
+  "enabled_stages": ["early", "middle", "late"],
+  "scope_schedule": [64],
+  "reset_at_stage_boundary": true,
+  "final_scope_mode": "sampled",
+  "require_stage_final_full": false,
+  "mask_enabled": false,
+  "profile_components": true,
+  "sampling": {
+    "type": "nested_random_balanced",
+    "random_seed": 0,
+    "resample_each_stage": true,
+    "sample_tokens_before_qkv": true,
+    "patch_tokens_only": true
+  },
+  "special_tokens": {
+    "keep_camera_tokens": true,
+    "keep_register_tokens": true
+  },
+  "debug": {
+    "save_sample_indices": true,
+    "save_mask_statistics": true
+  }
+}

@@ -35,6 +35,7 @@ class VGGTOmega(nn.Module):
         sparse_ratio: float | None = None,
         sparse_cdf_threshold: float | None = None,
         sparse_pool_mode: str = "avg",
+        progressive_attention: dict | None = None,
         inter_frame_only_layers: tuple[int, ...] = (),
         use_adaptive_kv_anchor: bool = False,
         adaptive_anchor_layers: str | int | tuple[int, ...] | list[int] = "none",
@@ -89,6 +90,7 @@ class VGGTOmega(nn.Module):
             sparse_ratio=sparse_ratio,
             sparse_cdf_threshold=sparse_cdf_threshold,
             sparse_pool_mode=sparse_pool_mode,
+            progressive_attention=progressive_attention,
             inter_frame_only_layers=inter_frame_only_layers,
             use_adaptive_kv_anchor=use_adaptive_kv_anchor,
             adaptive_anchor_layers=adaptive_anchor_layers,
@@ -145,6 +147,9 @@ class VGGTOmega(nn.Module):
             sparse_cdf_threshold=sparse_cdf_threshold,
             sparse_pool_mode=sparse_pool_mode,
         )
+
+    def set_progressive_attention(self, config: dict | None) -> None:
+        self.aggregator.set_progressive_attention(config)
 
     def set_inter_frame_only_layers(self, layers: tuple[int, ...] | list[int]) -> None:
         self.aggregator.set_inter_frame_only_layers(layers)
