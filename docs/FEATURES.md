@@ -5,6 +5,34 @@
 `progressive_attention` implements the exact token-pair semantic reference for
 progressively refined global attention.
 
+### Adaptive pair-scope reference
+
+Set `algorithm: adaptive_pair_scope` to run independent two-level routing
+inside selected global layers. The implementation:
+
+1. projects the complete original token sequence to Q/K/V exactly once;
+2. selects deterministic uniform patch anchors in frame-major order;
+3. forms midpoint-bounded Query and Key scopes whose Cartesian product exactly
+   partitions the original patch Q-K matrix;
+4. scores the coarse anchor grid and refines only active parent rectangles;
+5. evaluates independent local child products without mixing anchors from
+   different parents;
+6. compiles selected leaf rectangles into reusable Query-slab Key-row mask
+   templates;
+7. applies the exact patch mask with query-chunked SDPA while keeping all
+   camera/register interactions dense.
+
+The configuration is:
+
+```text
+configs/progressive_attention/adaptive_pair_scope_reference.json
+```
+
+This is a masked-dense correctness reference, not a sparse acceleration
+kernel. The 300-frame all-sequence evaluation measured 0.18× speedup on
+7Scenes and 0.19× on TUM-Dynamics, with substantial camera-accuracy loss.
+Full tables and failure history are recorded in `implementation_report.md`.
+
 ### Model structure
 
 VGGT-Omega has 24 zero-based layers. In the default alternating execution

@@ -9,6 +9,9 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from vggt_omega.models.adaptive_pair_scope_attention import (
+    adaptive_pair_scope_attention_block,
+)
 from vggt_omega.models.layers import Mlp, RopePositionEmbedding, SelfAttentionBlock
 from vggt_omega.models.layers.vision_transformer import DinoVisionTransformer
 from vggt_omega.models.progressive_attention import (
@@ -158,6 +161,10 @@ class Aggregator(nn.Module):
         self._progressive_stage_states: dict[int, ProgressiveMaskState] = {}
         self.last_progressive_attention_stats: dict[int, dict[str, object]] = {}
         self.last_progressive_sample_indices: dict[int, torch.Tensor] = {}
+        self.last_adaptive_pair_scope_debug: dict[
+            int,
+            dict[str, object],
+        ] = {}
         self.inter_frame_only_layers: set[int] = set()
         self.use_adaptive_kv_anchor = False
         self.adaptive_anchor_layers: set[int] = set()
@@ -326,6 +333,32 @@ class Aggregator(nn.Module):
                 + ", ".join(incompatible)
             )
         self.progressive_attention_config = resolved
+        if (
+            resolved.enabled
+            and resolved.algorithm == "adaptive_pair_scope"
+        ):
+            adaptive = resolved.adaptive_pair_scope_config
+            assert adaptive is not None
+            invalid = sorted(
+                layer
+                for layer in adaptive.enabled_layers
+                if layer < 0 or layer >= self.depth
+            )
+            if invalid:
+                raise ValueError(
+                    "adaptive pair-scope enabled_layers out of range "
+                    f"0..{self.depth - 1}: {invalid}"
+                )
+            non_global = sorted(
+                layer
+                for layer in adaptive.enabled_layers
+                if self.inter_frame_attention_types[layer] != "global"
+            )
+            if non_global:
+                raise ValueError(
+                    "adaptive pair-scope can only run on global inter-frame "
+                    f"layers; non-global layers: {non_global}"
+                )
         self.progressive_layer_schedule = (
             resolve_progressive_schedule(
                 depth=self.depth,
@@ -333,16 +366,47 @@ class Aggregator(nn.Module):
                 config=resolved,
             )
             if resolved.enabled
+            and resolved.algorithm == "legacy_token_scope"
             else {}
         )
         self._progressive_stage_states.clear()
         self.last_progressive_attention_stats.clear()
         self.last_progressive_sample_indices.clear()
+        self.last_adaptive_pair_scope_debug.clear()
 
     def progressive_attention_metadata(self) -> dict[str, object]:
         config = self.progressive_attention_config
+        if config.algorithm == "adaptive_pair_scope":
+            adaptive = config.adaptive_pair_scope_config
+            if adaptive is None:
+                raise RuntimeError(
+                    "adaptive pair-scope metadata lacks configuration"
+                )
+            return {
+                "enabled": config.enabled,
+                "algorithm": config.algorithm,
+                "semantics": (
+                    "within_layer_adaptive_pair_scope_reference_v1"
+                ),
+                "enabled_layers": list(adaptive.enabled_layers),
+                "coarse_num_anchors": adaptive.coarse_num_anchors,
+                "coarse_stride": adaptive.coarse_stride,
+                "routing_score_mode": adaptive.routing_score_mode,
+                "coarse_selection_mode": (
+                    adaptive.coarse_selection_mode
+                ),
+                "coarse_keep_ratio": adaptive.coarse_keep_ratio,
+                "fine_selection_mode": adaptive.fine_selection_mode,
+                "fine_keep_ratio": adaptive.fine_keep_ratio,
+                "refine_factor": adaptive.refine_factor,
+                "query_chunk_size": adaptive.query_chunk_size,
+                "attention_backend": adaptive.backend_type,
+                "efficient_sparse_kernel": False,
+                "cross_layer_scope_inheritance": False,
+            }
         return {
             "enabled": config.enabled,
+            "algorithm": config.algorithm,
             "semantics": "exact_token_pair_reference_v2",
             "stage_ranges": [list(stage) for stage in config.stage_ranges],
             "enabled_stages": list(config.enabled_stages),
@@ -693,6 +757,7 @@ class Aggregator(nn.Module):
         self._progressive_stage_states.clear()
         self.last_progressive_attention_stats.clear()
         self.last_progressive_sample_indices.clear()
+        self.last_adaptive_pair_scope_debug.clear()
         for block_idx in range(self.depth):
             tokens, frame_tokens = self._run_frame_block(
                 tokens,
@@ -855,6 +920,61 @@ class Aggregator(nn.Module):
         patch_scores = probabilities[..., patch_token_start:].mean(dim=(1, 2))
         return patch_scores.to(dtype=tokens.dtype)
 
+    def _run_adaptive_pair_scope_attention_block(
+        self,
+        tokens: torch.Tensor,
+        *,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        embed_dim: int,
+        block_idx: int,
+        patch_grid_size: tuple[int, int],
+    ) -> torch.Tensor:
+        """Run complete two-level routing inside one global attention layer."""
+
+        adaptive = (
+            self.progressive_attention_config.adaptive_pair_scope_config
+        )
+        if adaptive is None:
+            raise RuntimeError(
+                "adaptive pair-scope layer lacks adaptive configuration"
+            )
+        flat_tokens = tokens.reshape(
+            batch_size,
+            num_frames * num_tokens,
+            embed_dim,
+        )
+        result = adaptive_pair_scope_attention_block(
+            self.inter_frame_blocks[block_idx],
+            flat_tokens,
+            num_frames=num_frames,
+            tokens_per_frame=num_tokens,
+            num_special_tokens=self.patch_token_start,
+            patch_grid_size=patch_grid_size,
+            layer_index=block_idx,
+            config=adaptive,
+        )
+        full_patch_tokens = num_frames * (
+            num_tokens - self.patch_token_start
+        )
+        logical_patch_pairs = int(
+            result.stats.get("final_logical_patch_pairs", 0)
+        )
+        result.stats["patch_attention_pair_retention_vs_full"] = (
+            logical_patch_pairs
+            / max(full_patch_tokens * full_patch_tokens, 1)
+        )
+        self.last_progressive_attention_stats[block_idx] = result.stats
+        if result.debug:
+            self.last_adaptive_pair_scope_debug[block_idx] = result.debug
+        return result.output.view(
+            batch_size,
+            num_frames,
+            num_tokens,
+            embed_dim,
+        )
+
     def _run_progressive_attention_block(
         self,
         tokens: torch.Tensor,
@@ -982,9 +1102,28 @@ class Aggregator(nn.Module):
         tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type == "global":
+            progressive_config = self.progressive_attention_config
+            if (
+                progressive_config.enabled
+                and progressive_config.algorithm
+                == "adaptive_pair_scope"
+            ):
+                adaptive = progressive_config.adaptive_pair_scope_config
+                assert adaptive is not None
+                if block_idx in adaptive.enabled_layers:
+                    return self._run_adaptive_pair_scope_attention_block(
+                        tokens,
+                        batch_size=batch_size,
+                        num_frames=num_frames,
+                        num_tokens=num_tokens,
+                        embed_dim=embed_dim,
+                        block_idx=block_idx,
+                        patch_grid_size=patch_grid_size,
+                    )
             progressive_spec = self.progressive_layer_schedule.get(block_idx)
             if (
-                self.progressive_attention_config.enabled
+                progressive_config.enabled
+                and progressive_config.algorithm == "legacy_token_scope"
                 and progressive_spec is not None
             ):
                 return self._run_progressive_attention_block(

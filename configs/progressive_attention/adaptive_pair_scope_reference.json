@@ -1,0 +1,35 @@
+{
+  "enabled": true,
+  "algorithm": "adaptive_pair_scope",
+  "enabled_layers": [10, 11, 12, 13, 15, 16],
+  "coarse_sampling": {
+    "type": "uniform_flat",
+    "num_anchors": 128
+  },
+  "routing": {
+    "score_mode": "mean_head_sampled_probability",
+    "coarse_selection_mode": "row_topk_ratio",
+    "coarse_keep_ratio": 0.25,
+    "refine_factor": 2,
+    "fine_selection_mode": "row_topk_ratio",
+    "fine_keep_ratio": 0.25,
+    "min_active_key_scopes_per_query_scope": 1
+  },
+  "special_tokens": {
+    "keep_camera_tokens": true,
+    "keep_register_tokens": true,
+    "dense_special_queries": true,
+    "dense_special_keys": true
+  },
+  "backend": {
+    "type": "query_chunked_dense_mask_reference",
+    "query_chunk_size": 128
+  },
+  "debug": {
+    "save_anchor_indices": true,
+    "save_pair_scopes": true,
+    "save_mask_statistics": true,
+    "save_materialized_full_mask": false,
+    "profile_components": true
+  }
+}

@@ -26,6 +26,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from vggt_omega.models.adaptive_pair_scope_attention import (
+    AdaptivePairScopeConfig,
+    adaptive_pair_scope_config_from_dict,
+    validate_adaptive_pair_scope_config,
+)
+
 if TYPE_CHECKING:
     from vggt_omega.models.layers.block import SelfAttentionBlock
 
@@ -36,6 +42,8 @@ Scope = int | str
 @dataclass(frozen=True)
 class ProgressiveAttentionConfig:
     enabled: bool = False
+    algorithm: str = "legacy_token_scope"
+    adaptive_pair_scope_config: AdaptivePairScopeConfig | None = None
     stage_ranges: tuple[tuple[int, int], ...] = ((0, 9), (10, 16), (17, 23))
     enabled_stages: tuple[str, ...] = ("early", "middle", "late")
     scope_schedule: tuple[Scope, ...] = (32, 64, "full")
@@ -150,6 +158,25 @@ def progressive_config_from_dict(
         result = config
     elif isinstance(config, dict):
         payload = dict(config)
+        algorithm = str(
+            payload.pop("algorithm", "legacy_token_scope")
+        ).strip().lower()
+        if algorithm == "adaptive_pair_scope":
+            enabled = bool(payload.pop("enabled", False))
+            adaptive_config = adaptive_pair_scope_config_from_dict(payload)
+            result = ProgressiveAttentionConfig(
+                enabled=enabled,
+                algorithm=algorithm,
+                adaptive_pair_scope_config=adaptive_config,
+            )
+            _validate_config(result)
+            return result
+        if algorithm != "legacy_token_scope":
+            raise ValueError(
+                "progressive_attention.algorithm must be "
+                "'legacy_token_scope' or 'adaptive_pair_scope', got "
+                f"{algorithm!r}"
+            )
         sampling = dict(payload.pop("sampling", {}) or {})
         special_tokens = dict(payload.pop("special_tokens", {}) or {})
         mask = dict(payload.pop("mask", {}) or {})
@@ -223,7 +250,10 @@ def progressive_config_from_dict(
             payload["scope_schedule"] = tuple(
                 _normalize_scope(scope) for scope in payload["scope_schedule"]
             )
-        result = ProgressiveAttentionConfig(**payload)
+        result = ProgressiveAttentionConfig(
+            algorithm=algorithm,
+            **payload,
+        )
     else:
         raise TypeError(
             "progressive_attention must be a mapping, "
@@ -246,6 +276,27 @@ def _normalize_scope(scope: Any) -> Scope:
 
 
 def _validate_config(config: ProgressiveAttentionConfig) -> None:
+    if config.algorithm not in {
+        "legacy_token_scope",
+        "adaptive_pair_scope",
+    }:
+        raise ValueError(
+            "progressive attention algorithm must be "
+            "'legacy_token_scope' or 'adaptive_pair_scope'"
+        )
+    if config.algorithm == "adaptive_pair_scope":
+        if config.adaptive_pair_scope_config is None:
+            raise ValueError(
+                "adaptive_pair_scope requires adaptive configuration"
+            )
+        validate_adaptive_pair_scope_config(
+            config.adaptive_pair_scope_config
+        )
+        return
+    if config.adaptive_pair_scope_config is not None:
+        raise ValueError(
+            "legacy_token_scope must not carry adaptive pair-scope config"
+        )
     if not config.scope_schedule:
         raise ValueError("progressive scope_schedule must not be empty")
     for scope in config.scope_schedule:
@@ -339,6 +390,11 @@ def resolve_progressive_schedule(
     inter_frame_attention_types: list[str] | tuple[str, ...],
     config: ProgressiveAttentionConfig,
 ) -> dict[int, ProgressiveLayerSpec]:
+    if config.algorithm != "legacy_token_scope":
+        raise ValueError(
+            "cross-layer progressive schedule is only defined for "
+            "legacy_token_scope"
+        )
     if len(inter_frame_attention_types) != depth:
         raise ValueError(
             "inter-frame attention schedule length does not match depth: "
