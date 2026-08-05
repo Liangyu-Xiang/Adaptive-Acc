@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 from pathlib import Path
+import time
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -21,10 +23,59 @@ from vggt_omega.models.progressive_attention import (
     progressive_config_from_dict,
     resolve_progressive_schedule,
 )
+from vggt_omega.utils.reference_frame import resolve_first_frame_token_indices
 
 
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
+
+
+@dataclass(frozen=True)
+class FrameFusionSegment:
+    start: int
+    end: int
+    medoid: int
+    cost: float
+    mean_distance: float
+    max_distance: float
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start + 1
+
+
+@dataclass(frozen=True)
+class FrameFusionPair:
+    frame_a: int
+    frame_b: int
+    similarity: float
+
+
+@dataclass(frozen=True)
+class FrameFusionGroup:
+    anchor: int
+    members: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class FrameFusionBatchPlan:
+    pairs: tuple[FrameFusionPair, ...]
+    source_frames: torch.Tensor
+    target_frames: torch.Tensor
+    attention_indices: torch.Tensor
+    unique_candidate_count: int
+    requested_pair_count: int
+    groups: tuple[FrameFusionGroup, ...] = ()
+    target_keep_patch_indices: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class TemporalRepresentativeBatchPlan:
+    """Fixed temporal representative mapping for one batch element."""
+
+    position_to_representative: torch.Tensor
+    representative_source_indices: torch.Tensor
+    representative_weights: torch.Tensor
 
 
 class Aggregator(nn.Module):
@@ -44,6 +95,7 @@ class Aggregator(nn.Module):
         merging: int | None = 0,
         merge_ratio: float = 0.9,
         merge_random_seed: int = 33,
+        first_frame_token_indices: tuple[int, ...] | list[int] | str = (0,),
         register_patch_inter_frame_mode: str = "none",
         register_patch_inter_frame_percent: float = 0.0,
         register_patch_inter_frame_seed: int = 33,
@@ -86,6 +138,20 @@ class Aggregator(nn.Module):
         adaptive_anchor_random_seed: int = 33,
         adaptive_anchor_debug: bool = False,
         adaptive_anchor_debug_dir: str | Path = "outputs/debug_register_mediated_anchor",
+        frame_fusion_mode: str = "none",
+        frame_fusion_k: int | None = None,
+        frame_fusion_max_group_size: int = 5,
+        frame_fusion_beta: float = 1.0,
+        frame_fusion_start_layer: int = -1,
+        frame_fusion_pair_percent: float = 25.0,
+        frame_fusion_pool_size: int = 2,
+        frame_fusion_group_similarity_threshold: float = 0.0,
+        frame_fusion_target_keep_policy: str = "none",
+        frame_fusion_target_keep_grid_size: int = 4,
+        frame_fusion_target_keep_percent: float = 0.0,
+        frame_fusion_target_keep_threshold: float = 0.0,
+        frame_fusion_target_keep_seed: int = 33,
+        frame_fusion_recompute_each_global: bool = False,
     ) -> None:
         super().__init__()
 
@@ -149,6 +215,7 @@ class Aggregator(nn.Module):
         self.merging = merging
         self.merge_ratio = merge_ratio
         self.merge_random_seed = merge_random_seed
+        self.first_frame_token_indices = first_frame_token_indices
         self.register_patch_inter_frame_mode = "none"
         self.register_patch_inter_frame_percent = 0.0
         self.register_patch_inter_frame_seed = register_patch_inter_frame_seed
@@ -203,6 +270,25 @@ class Aggregator(nn.Module):
         self.adaptive_anchor_debug_dir = Path(adaptive_anchor_debug_dir)
         self._adaptive_anchor_debug_step = 0
         self._adaptive_intra_scores: dict[int, torch.Tensor] = {}
+        self.frame_fusion_mode = "none"
+        self.frame_fusion_k: int | None = None
+        self.frame_fusion_max_group_size = int(frame_fusion_max_group_size)
+        self.frame_fusion_beta = float(frame_fusion_beta)
+        self.frame_fusion_start_layer = int(frame_fusion_start_layer)
+        self.frame_fusion_pair_percent = float(frame_fusion_pair_percent)
+        self.frame_fusion_pool_size = int(frame_fusion_pool_size)
+        self.frame_fusion_group_similarity_threshold = float(frame_fusion_group_similarity_threshold)
+        self.frame_fusion_target_keep_policy = "none"
+        self.frame_fusion_target_keep_grid_size = int(frame_fusion_target_keep_grid_size)
+        self.frame_fusion_target_keep_percent = float(frame_fusion_target_keep_percent)
+        self.frame_fusion_target_keep_threshold = float(frame_fusion_target_keep_threshold)
+        self.frame_fusion_target_keep_seed = int(frame_fusion_target_keep_seed)
+        self.frame_fusion_recompute_each_global = bool(frame_fusion_recompute_each_global)
+        self.last_frame_fusion_debug: dict[str, object] = {}
+        self._frame_fusion_debug_layers: list[dict[str, object]] = []
+        self.layer_token_swap_layer: int | None = None
+        self.layer_token_swap_kind = "none"
+        self.layer_token_swap_pairs: tuple[tuple[int, int], ...] = ()
         self.camera_token = nn.Parameter(torch.empty(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.empty(1, 2, num_register_tokens, embed_dim))
         self.patch_token_start = 1 + num_register_tokens
@@ -255,6 +341,22 @@ class Aggregator(nn.Module):
             debug_dir=adaptive_anchor_debug_dir,
         )
         self.set_progressive_attention(progressive_attention)
+        self.set_frame_fusion(
+            mode=frame_fusion_mode,
+            num_groups=frame_fusion_k,
+            max_group_size=frame_fusion_max_group_size,
+            beta=frame_fusion_beta,
+            start_layer=frame_fusion_start_layer,
+            pair_percent=frame_fusion_pair_percent,
+            pool_size=frame_fusion_pool_size,
+            group_similarity_threshold=frame_fusion_group_similarity_threshold,
+            target_keep_policy=frame_fusion_target_keep_policy,
+            target_keep_grid_size=frame_fusion_target_keep_grid_size,
+            target_keep_percent=frame_fusion_target_keep_percent,
+            target_keep_threshold=frame_fusion_target_keep_threshold,
+            target_keep_seed=frame_fusion_target_keep_seed,
+            recompute_each_global=frame_fusion_recompute_each_global,
+        )
 
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
             self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
@@ -265,6 +367,9 @@ class Aggregator(nn.Module):
     def _merge_is_enabled(global_merging: bool, merging: int | None, merge_ratio: float) -> bool:
         return global_merging and merging is not None and merge_ratio > 0.0
 
+    def _frame_fusion_enabled(self) -> bool:
+        return self.frame_fusion_mode != "none"
+
     def init_weights(self) -> None:
         nn.init.normal_(self.camera_token, std=1e-3)
         nn.init.normal_(self.register_token, std=1e-3)
@@ -274,6 +379,8 @@ class Aggregator(nn.Module):
             raise ValueError(f"merge_ratio must be between 0.0 and 1.0, got {merge_ratio}")
         if self.sparse_attention and merge_ratio > 0.0:
             raise ValueError("Sparse attention and token merging are mutually exclusive")
+        if self._frame_fusion_enabled() and self._merge_is_enabled(self.global_merging, self.merging, merge_ratio):
+            raise ValueError("Frame fusion requires merge_ratio=0 or disabled token merging")
         if (
             self.use_adaptive_kv_anchor
             and self.adaptive_anchor_layers
@@ -298,6 +405,8 @@ class Aggregator(nn.Module):
             raise ValueError("Sparse attention and token merging are mutually exclusive")
         if enabled and self.use_adaptive_kv_anchor and self.adaptive_anchor_layers:
             raise ValueError("Sparse attention and adaptive K/V anchors are mutually exclusive")
+        if enabled and self._frame_fusion_enabled():
+            raise ValueError("Sparse attention and frame fusion are mutually exclusive")
         if sparse_pool_mode not in {"avg", "max"}:
             raise ValueError(f"sparse_pool_mode must be 'avg' or 'max', got {sparse_pool_mode!r}")
         self.sparse_attention = enabled
@@ -327,6 +436,8 @@ class Aggregator(nn.Module):
             incompatible.append("adaptive K/V anchors")
         if resolved.enabled and self.inter_frame_only_layers:
             incompatible.append("inter-frame-only attention")
+        if resolved.enabled and self._frame_fusion_enabled():
+            incompatible.append("frame fusion")
         if incompatible:
             raise ValueError(
                 "Progressive attention is mutually exclusive with "
@@ -373,6 +484,154 @@ class Aggregator(nn.Module):
         self.last_progressive_attention_stats.clear()
         self.last_progressive_sample_indices.clear()
         self.last_adaptive_pair_scope_debug.clear()
+
+    def set_frame_fusion(
+        self,
+        *,
+        mode: str = "none",
+        num_groups: int | None = None,
+        max_group_size: int = 5,
+        beta: float = 1.0,
+        start_layer: int = -1,
+        pair_percent: float = 25.0,
+        pool_size: int = 2,
+        group_similarity_threshold: float = 0.0,
+        target_keep_policy: str = "none",
+        target_keep_grid_size: int = 4,
+        target_keep_percent: float = 0.0,
+        target_keep_threshold: float = 0.0,
+        target_keep_seed: int = 33,
+        recompute_each_global: bool = False,
+    ) -> None:
+        mode = mode.replace("_", "-")
+        valid_modes = {
+            "none",
+            "dp-medoid",
+            "pair-top-percent",
+            "group-top-percent",
+            "sequential-group",
+            "sequential-group-average",
+            "temporal-representative",
+        }
+        if mode not in valid_modes:
+            raise ValueError(f"frame_fusion_mode must be one of {sorted(valid_modes)}, got {mode!r}")
+        max_group_size = int(max_group_size)
+        if max_group_size <= 0:
+            raise ValueError(f"frame_fusion_max_group_size must be positive, got {max_group_size}")
+        beta = float(beta)
+        if beta < 0.0:
+            raise ValueError(f"frame_fusion_beta must be non-negative, got {beta}")
+        start_layer = int(start_layer)
+        if start_layer < -1 or start_layer >= self.depth:
+            raise ValueError(
+                f"frame_fusion_start_layer must be -1 or in 0..{self.depth - 1}, got {start_layer}"
+            )
+        pair_percent = float(pair_percent)
+        if not 0.0 < pair_percent <= 100.0:
+            raise ValueError(
+                f"frame_fusion_pair_percent must be in (0, 100], got {pair_percent}"
+            )
+        pool_size = int(pool_size)
+        if pool_size <= 0:
+            raise ValueError(f"frame_fusion_pool_size must be positive, got {pool_size}")
+        group_similarity_threshold = float(group_similarity_threshold)
+        if not -1.0 <= group_similarity_threshold <= 1.0:
+            raise ValueError(
+                "frame_fusion_group_similarity_threshold must be in [-1, 1], "
+                f"got {group_similarity_threshold}"
+            )
+        target_keep_policy = target_keep_policy.replace("_", "-")
+        valid_target_keep_policies = {"none", "random-grid", "least-similar", "similarity-threshold"}
+        if target_keep_policy not in valid_target_keep_policies:
+            raise ValueError(
+                "frame_fusion_target_keep_policy must be one of "
+                f"{sorted(valid_target_keep_policies)}, got {target_keep_policy!r}"
+            )
+        target_keep_grid_size = int(target_keep_grid_size)
+        if target_keep_grid_size <= 0:
+            raise ValueError(
+                f"frame_fusion_target_keep_grid_size must be positive, got {target_keep_grid_size}"
+            )
+        target_keep_percent = float(target_keep_percent)
+        if not 0.0 <= target_keep_percent <= 100.0:
+            raise ValueError(
+                f"frame_fusion_target_keep_percent must be in [0, 100], got {target_keep_percent}"
+            )
+        target_keep_threshold = float(target_keep_threshold)
+        if not -1.0 <= target_keep_threshold <= 1.0:
+            raise ValueError(
+                "frame_fusion_target_keep_threshold must be a cosine threshold in "
+                f"[-1, 1], got {target_keep_threshold}"
+            )
+        target_keep_seed = int(target_keep_seed)
+        recompute_each_global = bool(recompute_each_global)
+        if mode == "dp-medoid":
+            if num_groups is None:
+                raise ValueError("frame_fusion_k is required when frame_fusion_mode='dp-medoid'")
+            num_groups = int(num_groups)
+            if num_groups <= 0:
+                raise ValueError(f"frame_fusion_k must be positive, got {num_groups}")
+            if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio):
+                raise ValueError("frame fusion requires merge_ratio=0 or disabled token merging")
+            if self.sparse_attention:
+                raise ValueError("frame fusion and sparse attention are mutually exclusive")
+            if self.progressive_attention_config.enabled:
+                raise ValueError("frame fusion and progressive attention are mutually exclusive")
+            if self.inter_frame_only_layers:
+                raise ValueError("frame fusion and inter-frame-only attention are mutually exclusive")
+            if self.use_adaptive_kv_anchor and self.adaptive_anchor_layers:
+                raise ValueError("frame fusion and adaptive K/V anchors are mutually exclusive")
+            if target_keep_policy != "none":
+                raise ValueError("target patch retention is only supported for pair-top-percent frame fusion")
+            if recompute_each_global:
+                raise ValueError("per-global recomputation is only supported for pair-top-percent frame fusion")
+        elif mode in {
+            "pair-top-percent",
+            "group-top-percent",
+            "sequential-group",
+            "sequential-group-average",
+            "temporal-representative",
+        }:
+            num_groups = None
+            if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio):
+                raise ValueError("frame fusion requires merge_ratio=0 or disabled token merging")
+            if self.sparse_attention:
+                raise ValueError("frame fusion and sparse attention are mutually exclusive")
+            if self.progressive_attention_config.enabled:
+                raise ValueError("frame fusion and progressive attention are mutually exclusive")
+            if self.inter_frame_only_layers:
+                raise ValueError("frame fusion and inter-frame-only attention are mutually exclusive")
+            if self.use_adaptive_kv_anchor and self.adaptive_anchor_layers:
+                raise ValueError("frame fusion and adaptive K/V anchors are mutually exclusive")
+            if target_keep_policy == "least-similar" and target_keep_percent <= 0.0:
+                raise ValueError(
+                    "frame_fusion_target_keep_percent must be positive for least-similar retention"
+                )
+            if recompute_each_global and mode != "pair-top-percent":
+                raise ValueError(
+                    "per-global recomputation is only supported for pair-top-percent frame fusion"
+                )
+        else:
+            num_groups = None
+            target_keep_policy = "none"
+            recompute_each_global = False
+
+        self.frame_fusion_mode = mode
+        self.frame_fusion_k = num_groups
+        self.frame_fusion_max_group_size = max_group_size
+        self.frame_fusion_beta = beta
+        self.frame_fusion_start_layer = start_layer
+        self.frame_fusion_pair_percent = pair_percent
+        self.frame_fusion_pool_size = pool_size
+        self.frame_fusion_group_similarity_threshold = group_similarity_threshold
+        self.frame_fusion_target_keep_policy = target_keep_policy
+        self.frame_fusion_target_keep_grid_size = target_keep_grid_size
+        self.frame_fusion_target_keep_percent = target_keep_percent
+        self.frame_fusion_target_keep_threshold = target_keep_threshold
+        self.frame_fusion_target_keep_seed = target_keep_seed
+        self.frame_fusion_recompute_each_global = recompute_each_global
+        self.last_frame_fusion_debug.clear()
+        self._frame_fusion_debug_layers.clear()
 
     def progressive_attention_metadata(self) -> dict[str, object]:
         config = self.progressive_attention_config
@@ -479,6 +738,8 @@ class Aggregator(nn.Module):
                     "inter-frame-only attention and adaptive K/V anchors are mutually exclusive; "
                     f"overlapping layers: {overlap}"
                 )
+        if layer_set and self._frame_fusion_enabled():
+            raise ValueError("inter-frame-only attention and frame fusion are mutually exclusive")
         self.inter_frame_only_layers = layer_set
 
     def set_adaptive_kv_anchor(
@@ -624,6 +885,8 @@ class Aggregator(nn.Module):
                 )
             if self.sparse_attention:
                 raise ValueError("Adaptive K/V anchors and sparse attention are mutually exclusive")
+            if self._frame_fusion_enabled():
+                raise ValueError("Adaptive K/V anchors and frame fusion are mutually exclusive")
             if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio):
                 raise ValueError(
                     "Adaptive K/V anchors and token merging are mutually exclusive; "
@@ -722,19 +985,76 @@ class Aggregator(nn.Module):
         if seed is not None:
             self.register_patch_inter_frame_seed = seed
 
+    def set_layer_token_swap(
+        self,
+        layer: int | None,
+        kind: str = "none",
+        pairs: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
+    ) -> None:
+        """Configure an experimental frame-token swap after one aggregator layer."""
+
+        valid_kinds = {"none", "patch", "special", "whole"}
+        if kind not in valid_kinds:
+            raise ValueError(f"token swap kind must be one of {sorted(valid_kinds)}, got {kind!r}")
+        if layer is None or kind == "none":
+            self.layer_token_swap_layer = None
+            self.layer_token_swap_kind = "none"
+            self.layer_token_swap_pairs = ()
+            return
+
+        layer = int(layer)
+        if layer < 0 or layer >= self.depth:
+            raise ValueError(f"token swap layer must be in [0, {self.depth - 1}], got {layer}")
+
+        normalized_pairs: list[tuple[int, int]] = []
+        used_frames: set[int] = set()
+        for first, second in pairs:
+            first = int(first)
+            second = int(second)
+            if first < 0 or second < 0:
+                raise ValueError(f"token swap frame indices must be non-negative, got {(first, second)}")
+            if first == second:
+                raise ValueError(f"token swap pair cannot use the same frame twice: {(first, second)}")
+            if first in used_frames or second in used_frames:
+                raise ValueError("token swap pairs must be non-overlapping for a simultaneous swap")
+            used_frames.add(first)
+            used_frames.add(second)
+            normalized_pairs.append((first, second))
+        if not normalized_pairs:
+            raise ValueError("token swap requires at least one frame pair")
+
+        self.layer_token_swap_layer = layer
+        self.layer_token_swap_kind = kind
+        self.layer_token_swap_pairs = tuple(normalized_pairs)
+
     def forward(
         self,
         images: torch.Tensor,
     ) -> tuple[list[torch.Tensor | None], int]:
         batch_size, num_frames, num_channels, height, width = images.shape
+        original_num_frames = num_frames
         if num_channels != 3:
             raise ValueError(f"Expected 3 input channels, got {num_channels}")
 
         images = (images - self._resnet_mean) / self._resnet_std
         images = images.view(batch_size * num_frames, num_channels, height, width)
 
-        camera_token = slice_expand_and_flatten(self.camera_token, batch_size, num_frames)
-        register_token = slice_expand_and_flatten(self.register_token, batch_size, num_frames)
+        first_frame_token_indices = resolve_first_frame_token_indices(
+            self.first_frame_token_indices,
+            num_frames,
+        )
+        camera_token = slice_expand_and_flatten(
+            self.camera_token,
+            batch_size,
+            num_frames,
+            first_frame_token_indices=first_frame_token_indices,
+        )
+        register_token = slice_expand_and_flatten(
+            self.register_token,
+            batch_size,
+            num_frames,
+            first_frame_token_indices=first_frame_token_indices,
+        )
 
         patch_tokens = self.patch_embed(images)
         if isinstance(patch_tokens, dict):
@@ -758,6 +1078,52 @@ class Aggregator(nn.Module):
         self.last_progressive_attention_stats.clear()
         self.last_progressive_sample_indices.clear()
         self.last_adaptive_pair_scope_debug.clear()
+        self.last_frame_fusion_debug.clear()
+        self._frame_fusion_debug_layers.clear()
+
+        tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
+        frame_fusion_restore_index: torch.Tensor | None = None
+        frame_fusion_pair_plans: list[FrameFusionBatchPlan] | None = None
+        temporal_representative_plans: list[TemporalRepresentativeBatchPlan] | None = None
+        frame_fusion_applied = False
+        recompute_pair_plans_each_global = (
+            self.frame_fusion_mode in {
+                "pair-top-percent",
+                "group-top-percent",
+                "sequential-group",
+                "sequential-group-average",
+            }
+            and self.frame_fusion_recompute_each_global
+        )
+        if self.frame_fusion_mode == "dp-medoid" and self.frame_fusion_start_layer == -1:
+            tokens, frame_fusion_restore_index = self._apply_frame_fusion(tokens, source_layer=-1)
+            num_frames = tokens.shape[1]
+            frame_fusion_applied = True
+        elif (
+            self.frame_fusion_mode in {
+                "pair-top-percent",
+                "group-top-percent",
+                "sequential-group",
+                "sequential-group-average",
+            }
+            and self.frame_fusion_start_layer == -1
+            and not recompute_pair_plans_each_global
+        ):
+            frame_fusion_pair_plans = self._build_frame_fusion_pair_plans(
+                tokens,
+                patch_grid_size=patch_grid_size,
+                source_layer=-1,
+            )
+        elif (
+            self.frame_fusion_mode == "temporal-representative"
+            and self.frame_fusion_start_layer == -1
+        ):
+            temporal_representative_plans = self._build_temporal_representative_plans(
+                tokens,
+                source_layer=-1,
+            )
+        tokens = tokens.view(batch_size * num_frames, num_tokens, embed_dim)
+
         for block_idx in range(self.depth):
             tokens, frame_tokens = self._run_frame_block(
                 tokens,
@@ -768,6 +1134,46 @@ class Aggregator(nn.Module):
                 block_idx,
                 frame_rope,
             )
+            current_pair_plans = frame_fusion_pair_plans
+            current_temporal_plans = temporal_representative_plans
+            if recompute_pair_plans_each_global:
+                current_pair_plans = None
+                first_recompute_layer = max(self.frame_fusion_start_layer, 0)
+                if (
+                    block_idx >= first_recompute_layer
+                    and self.inter_frame_attention_types[block_idx] == "global"
+                ):
+                    current_pair_plans = self._build_frame_fusion_pair_plans(
+                        frame_tokens,
+                        patch_grid_size=patch_grid_size,
+                        source_layer=block_idx,
+                    )
+            elif (
+                self.frame_fusion_mode in {
+                    "pair-top-percent",
+                    "group-top-percent",
+                    "sequential-group",
+                    "sequential-group-average",
+                }
+                and frame_fusion_pair_plans is None
+                and self.frame_fusion_start_layer == block_idx
+            ):
+                frame_fusion_pair_plans = self._build_frame_fusion_pair_plans(
+                    frame_tokens,
+                    patch_grid_size=patch_grid_size,
+                    source_layer=block_idx,
+                )
+                current_pair_plans = frame_fusion_pair_plans
+            elif (
+                self.frame_fusion_mode == "temporal-representative"
+                and temporal_representative_plans is None
+                and self.frame_fusion_start_layer == block_idx
+            ):
+                temporal_representative_plans = self._build_temporal_representative_plans(
+                    frame_tokens,
+                    source_layer=block_idx,
+                )
+                current_temporal_plans = temporal_representative_plans
             tokens = self._run_inter_frame_attention_block(
                 tokens,
                 batch_size,
@@ -777,13 +1183,964 @@ class Aggregator(nn.Module):
                 block_idx,
                 self.inter_frame_attention_types[block_idx],
                 patch_grid_size,
+                frame_fusion_pair_plans=current_pair_plans,
+                temporal_representative_plans=current_temporal_plans,
             )
+            layer_token_swap_active = (
+                self.layer_token_swap_layer == block_idx
+                and self.layer_token_swap_kind != "none"
+            )
+            if layer_token_swap_active:
+                tokens = self._apply_layer_token_swap(
+                    tokens,
+                    kind=self.layer_token_swap_kind,
+                    pairs=self.layer_token_swap_pairs,
+                )
             if block_idx in self.cached_layer_indices:
-                outputs.append(torch.cat([frame_tokens, tokens], dim=-1))
+                if layer_token_swap_active:
+                    frame_tokens = self._apply_layer_token_swap(
+                        frame_tokens,
+                        kind=self.layer_token_swap_kind,
+                        pairs=self.layer_token_swap_pairs,
+                    )
+                cached_tokens = torch.cat([frame_tokens, tokens], dim=-1)
+                if frame_fusion_applied:
+                    if frame_fusion_restore_index is None:
+                        raise RuntimeError("frame fusion restore index is missing")
+                    cached_tokens = self._restore_frame_fused_tokens(
+                        cached_tokens,
+                        frame_fusion_restore_index,
+                        original_num_frames,
+                    )
+                outputs.append(cached_tokens)
             else:
                 outputs.append(None)
 
+            if (
+                self.frame_fusion_mode == "dp-medoid"
+                and not frame_fusion_applied
+                and self.frame_fusion_start_layer == block_idx
+            ):
+                tokens, frame_fusion_restore_index = self._apply_frame_fusion(tokens, source_layer=block_idx)
+                num_frames = tokens.shape[1]
+                frame_fusion_applied = True
+
         return outputs, self.patch_token_start
+
+    def _apply_layer_token_swap(
+        self,
+        tokens: torch.Tensor,
+        *,
+        kind: str,
+        pairs: tuple[tuple[int, int], ...],
+    ) -> torch.Tensor:
+        if tokens.ndim != 4:
+            raise ValueError(f"token swap expects [batch, frames, tokens, channels], got {tuple(tokens.shape)}")
+        if kind not in {"patch", "special", "whole"}:
+            raise ValueError(f"unknown token swap kind: {kind!r}")
+        if not pairs:
+            return tokens
+
+        _, num_frames, num_tokens, _ = tokens.shape
+        first_indices = torch.tensor([first for first, _ in pairs], device=tokens.device, dtype=torch.long)
+        second_indices = torch.tensor([second for _, second in pairs], device=tokens.device, dtype=torch.long)
+        max_pair_index = int(torch.maximum(first_indices.max(), second_indices.max()).item())
+        if max_pair_index >= num_frames:
+            raise ValueError(
+                "token swap pair index is out of range for current frame count: "
+                f"num_frames={num_frames}, max_pair_index={max_pair_index}"
+            )
+
+        if kind == "patch":
+            if self.patch_token_start >= num_tokens:
+                raise ValueError("patch token swap requested but no patch tokens are present")
+            token_slice = slice(self.patch_token_start, None)
+        elif kind == "special":
+            token_slice = slice(0, self.patch_token_start)
+        else:
+            token_slice = slice(None)
+
+        swapped = tokens.clone()
+        first_values = swapped[:, first_indices, token_slice].clone()
+        second_values = swapped[:, second_indices, token_slice].clone()
+        swapped[:, first_indices, token_slice] = second_values
+        swapped[:, second_indices, token_slice] = first_values
+        return swapped
+
+    def _apply_frame_fusion(
+        self,
+        tokens: torch.Tensor,
+        *,
+        source_layer: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.frame_fusion_mode != "dp-medoid":
+            raise RuntimeError(f"Unsupported frame fusion mode: {self.frame_fusion_mode}")
+        if self.frame_fusion_k is None:
+            raise RuntimeError("frame_fusion_k is required for frame fusion")
+
+        batch_size, num_frames, num_tokens, embed_dim = tokens.shape
+        if batch_size != 1:
+            raise ValueError("frame fusion currently supports batch_size=1")
+        if self.frame_fusion_k > num_frames:
+            raise ValueError(
+                f"frame_fusion_k ({self.frame_fusion_k}) must be <= num_frames ({num_frames})"
+            )
+        if num_frames > self.frame_fusion_k * self.frame_fusion_max_group_size:
+            raise ValueError(
+                "frame fusion has no feasible partition: "
+                f"num_frames={num_frames}, K={self.frame_fusion_k}, "
+                f"M={self.frame_fusion_max_group_size}"
+            )
+
+        partition_started = time.perf_counter()
+        frame_representations = tokens.float().mean(dim=2)
+        normalized = torch.nn.functional.normalize(frame_representations[0], p=2, dim=-1)
+        similarity = torch.matmul(normalized, normalized.T).clamp(-1.0, 1.0)
+        distance = (1.0 - similarity).clamp_min(0.0)
+        segments = compute_frame_fusion_partition(
+            distance.detach().cpu(),
+            num_groups=self.frame_fusion_k,
+            max_group_size=self.frame_fusion_max_group_size,
+            beta=self.frame_fusion_beta,
+        )
+        partition_seconds = time.perf_counter() - partition_started
+
+        fusion_started = time.perf_counter()
+        fused_tokens: list[torch.Tensor] = []
+        restore_indices = torch.empty(num_frames, device=tokens.device, dtype=torch.long)
+        debug_segments: list[dict[str, object]] = []
+        for segment_index, segment in enumerate(segments):
+            frame_indices = torch.arange(segment.start, segment.end + 1, device=tokens.device)
+            local_similarity = similarity.index_select(0, frame_indices)[:, segment.medoid]
+            weights = _normalize_similarity_weights(local_similarity).to(dtype=tokens.dtype)
+            local_tokens = tokens.index_select(1, frame_indices)
+            fused = (local_tokens * weights.view(1, -1, 1, 1)).sum(dim=1)
+            fused_tokens.append(fused)
+            restore_indices[segment.start : segment.end + 1] = segment_index
+            debug_segments.append(
+                {
+                    "segment_index": segment_index,
+                    "start": segment.start,
+                    "end": segment.end,
+                    "length": segment.length,
+                    "medoid": segment.medoid,
+                    "cost": segment.cost,
+                    "mean_distance": segment.mean_distance,
+                    "max_distance": segment.max_distance,
+                    "similarities_to_medoid": [float(value) for value in local_similarity.detach().cpu().tolist()],
+                    "normalized_weights": [float(value) for value in weights.detach().float().cpu().tolist()],
+                }
+            )
+
+        fused = torch.stack(fused_tokens, dim=1).contiguous()
+        fusion_seconds = time.perf_counter() - fusion_started
+        self.last_frame_fusion_debug = {
+            "mode": self.frame_fusion_mode,
+            "source_layer": source_layer,
+            "num_frames": num_frames,
+            "num_fused_frames": fused.shape[1],
+            "tokens_per_frame": num_tokens,
+            "embed_dim": embed_dim,
+            "num_groups": self.frame_fusion_k,
+            "max_group_size": self.frame_fusion_max_group_size,
+            "beta": self.frame_fusion_beta,
+            "distance": "1 - cosine_similarity",
+            "fusion_weight": "nonnegative_cosine_similarity_normalized_within_segment",
+            "partition_seconds": partition_seconds,
+            "fusion_seconds": fusion_seconds,
+            "segments": debug_segments,
+        }
+        return fused, restore_indices
+
+    @staticmethod
+    def _restore_frame_fused_tokens(
+        tokens: torch.Tensor,
+        restore_indices: torch.Tensor,
+        original_num_frames: int,
+    ) -> torch.Tensor:
+        if restore_indices.numel() != original_num_frames:
+            raise ValueError(
+                f"restore index length {restore_indices.numel()} does not match original frames {original_num_frames}"
+            )
+        return tokens.index_select(1, restore_indices.to(device=tokens.device))
+
+    def _build_frame_fusion_pair_plans(
+        self,
+        tokens: torch.Tensor,
+        *,
+        patch_grid_size: tuple[int, int],
+        source_layer: int,
+    ) -> list[FrameFusionBatchPlan]:
+        started = time.perf_counter()
+        batch_size, num_frames, num_tokens, embed_dim = tokens.shape
+        patch_tokens = tokens[:, :, self.patch_token_start :]
+        patch_count = patch_tokens.shape[2]
+        frame_representations = pooled_frame_representations(
+            patch_tokens,
+            patch_grid_size=patch_grid_size,
+            pool_size=self.frame_fusion_pool_size,
+        )
+        normalized = torch.nn.functional.normalize(frame_representations.float(), p=2, dim=-1)
+
+        plans: list[FrameFusionBatchPlan] = []
+        debug_batches: list[dict[str, object]] = []
+        for batch_index in range(batch_size):
+            partition_groups: tuple[FrameFusionGroup, ...]
+            comparison_pairs: list[FrameFusionPair] = []
+            comparison_groups: list[FrameFusionGroup] = []
+            if self.frame_fusion_mode in {"sequential-group", "sequential-group-average"}:
+                partition_groups = tuple(
+                    _sequential_frame_fusion_groups(
+                        normalized[batch_index],
+                        similarity_threshold=self.frame_fusion_group_similarity_threshold,
+                        max_group_size=self.frame_fusion_max_group_size,
+                        first_frame=1,
+                    )
+                )
+                selected_pairs = []
+                unique_candidate_count = 0
+                requested_pair_count = 0
+            else:
+                selected_pairs, unique_candidate_count, requested_pair_count = (
+                    select_frame_fusion_pairs_from_normalized_representations(
+                        normalized[batch_index],
+                        pair_percent=self.frame_fusion_pair_percent,
+                        exclude_frames=(0,),
+                        disjoint=self.frame_fusion_mode != "group-top-percent",
+                    )
+                )
+                if self.frame_fusion_mode == "group-top-percent":
+                    partition_groups = tuple(_connected_frame_fusion_groups(selected_pairs))
+                else:
+                    partition_groups = tuple(
+                        FrameFusionGroup(
+                            anchor=pair.frame_a,
+                            members=(pair.frame_a, pair.frame_b),
+                        )
+                        for pair in selected_pairs
+                    )
+            if self.frame_fusion_mode == "group-top-percent":
+                comparison_pairs, _, _ = select_frame_fusion_pairs_from_normalized_representations(
+                    normalized[batch_index],
+                    pair_percent=self.frame_fusion_pair_percent,
+                    exclude_frames=(0,),
+                    disjoint=True,
+                )
+                comparison_groups = [
+                    FrameFusionGroup(anchor=pair.frame_a, members=(pair.frame_a, pair.frame_b))
+                    for pair in comparison_pairs
+                ]
+            groups = tuple(group for group in partition_groups if len(group.members) > 1)
+            fusion_pairs = _anchor_target_frame_fusion_pairs(
+                groups,
+                normalized[batch_index],
+            )
+            if self.frame_fusion_mode in {"sequential-group", "sequential-group-average"}:
+                selected_pairs = list(fusion_pairs)
+                unique_candidate_count = len(fusion_pairs)
+                requested_pair_count = len(fusion_pairs)
+            source_frames = torch.tensor(
+                [pair.frame_a for pair in fusion_pairs], device=tokens.device,
+                dtype=torch.long,
+            )
+            target_frames = torch.tensor(
+                [pair.frame_b for pair in fusion_pairs], device=tokens.device,
+                dtype=torch.long,
+            )
+            if self.frame_fusion_mode == "sequential-group-average":
+                target_keep_patch_indices = (
+                    self._select_frame_fusion_group_shared_keep_patch_indices(
+                        patch_tokens[batch_index],
+                        groups,
+                        threshold=self.frame_fusion_target_keep_threshold,
+                    )
+                )
+            else:
+                target_keep_patch_indices = self._select_frame_fusion_target_keep_patch_indices(
+                    patch_tokens[batch_index],
+                    fusion_pairs,
+                    patch_grid_size=patch_grid_size,
+                    source_layer=source_layer,
+                    batch_index=batch_index,
+                )
+            target_keep_counts = _frame_fusion_target_keep_patch_counts(
+                target_keep_patch_indices,
+                num_pairs=len(fusion_pairs),
+                patch_count=patch_count,
+                device=tokens.device,
+            )
+            target_keep_total = int(target_keep_counts.sum().item())
+            target_keep_mean = (
+                float(target_keep_counts.float().mean().item())
+                if target_keep_counts.numel() > 0
+                else 0.0
+            )
+            target_keep_min = (
+                int(target_keep_counts.min().item())
+                if target_keep_counts.numel() > 0
+                else 0
+            )
+            target_keep_max = (
+                int(target_keep_counts.max().item())
+                if target_keep_counts.numel() > 0
+                else 0
+            )
+            attention_indices = frame_fusion_attention_indices(
+                num_frames=num_frames,
+                tokens_per_frame=num_tokens,
+                num_special_tokens=self.patch_token_start,
+                source_frames=source_frames,
+                target_frames=target_frames,
+                target_keep_patch_indices=target_keep_patch_indices,
+                device=tokens.device,
+            )
+            plans.append(
+                FrameFusionBatchPlan(
+                    pairs=tuple(selected_pairs),
+                    groups=groups,
+                    source_frames=source_frames,
+                    target_frames=target_frames,
+                    attention_indices=attention_indices,
+                    unique_candidate_count=unique_candidate_count,
+                    requested_pair_count=requested_pair_count,
+                    target_keep_patch_indices=target_keep_patch_indices,
+                )
+            )
+            debug_batches.append(
+                {
+                    "batch_index": batch_index,
+                    "unique_candidate_pairs": unique_candidate_count,
+                    "requested_pairs": requested_pair_count,
+                    "selected_pairs": len(selected_pairs),
+                    "effective_anchor_target_relations": len(fusion_pairs),
+                    "selected_groups": len(groups),
+                    "group_size_min": min((len(group.members) for group in groups), default=0),
+                    "group_size_max": max((len(group.members) for group in groups), default=0),
+                    "group_size_mean": (
+                        sum(len(group.members) for group in groups) / len(groups)
+                        if groups else 0.0
+                    ),
+                    "groups": [
+                        {"anchor": group.anchor, "members": list(group.members)}
+                        for group in groups
+                    ],
+                    "full_partition": [
+                        {"anchor": group.anchor, "members": list(group.members)}
+                        for group in partition_groups
+                    ],
+                    "full_partition_groups": len(partition_groups),
+                    "singleton_partition_groups": sum(
+                        len(group.members) == 1 for group in partition_groups
+                    ),
+                    "original_pair_partition": (
+                        _frame_fusion_partition_summary(comparison_pairs, comparison_groups)
+                        if self.frame_fusion_mode == "group-top-percent"
+                        else None
+                    ),
+                    "group_partition": _frame_fusion_partition_summary(selected_pairs, list(groups)),
+                    "attention_tokens": int(attention_indices.numel()),
+                    "target_keep_patch_tokens_per_pair": target_keep_mean,
+                    "target_keep_patch_tokens_min": target_keep_min,
+                    "target_keep_patch_tokens_max": target_keep_max,
+                    "target_keep_patch_tokens_total": target_keep_total,
+                    "target_keep_patch_tokens_per_relation": [
+                        int(value) for value in target_keep_counts.detach().cpu().tolist()
+                    ],
+                    "anchor_target_relations": [
+                        {
+                            "anchor": pair.frame_a,
+                            "target": pair.frame_b,
+                            "frame_similarity": pair.similarity,
+                        }
+                        for pair in fusion_pairs
+                    ],
+                    "pairs": [
+                        {
+                            "frame_a": pair.frame_a,
+                            "frame_b": pair.frame_b,
+                            "similarity": pair.similarity,
+                        }
+                        for pair in selected_pairs
+                    ],
+                }
+            )
+
+        selection_seconds = time.perf_counter() - started
+        total_patch_tokens = num_frames * patch_count
+        retained_by_plan = []
+        for plan in plans:
+            target_keep_total = int(
+                _frame_fusion_target_keep_patch_counts(
+                    plan.target_keep_patch_indices,
+                    num_pairs=int(plan.target_frames.numel()),
+                    patch_count=patch_count,
+                    device=tokens.device,
+                )
+                .sum()
+                .item()
+            )
+            retained_by_plan.append(
+                total_patch_tokens - int(plan.target_frames.numel()) * patch_count + target_keep_total
+            )
+        retained_patch_tokens = max(retained_by_plan, default=total_patch_tokens)
+        recompute_each_global = getattr(self, "frame_fusion_recompute_each_global", False)
+        debug = {
+            "mode": self.frame_fusion_mode,
+            "source_layer": source_layer,
+            "num_frames": num_frames,
+            "tokens_per_frame": num_tokens,
+            "patch_tokens_per_frame": patch_count,
+            "embed_dim": embed_dim,
+            "pair_percent": self.frame_fusion_pair_percent,
+            "pool_size": self.frame_fusion_pool_size,
+            "group_similarity_threshold": getattr(
+                self, "frame_fusion_group_similarity_threshold", 0.0
+            ),
+            "target_keep_policy": self.frame_fusion_target_keep_policy,
+            "target_keep_grid_size": self.frame_fusion_target_keep_grid_size,
+            "target_keep_percent": self.frame_fusion_target_keep_percent,
+            "target_keep_threshold": getattr(self, "frame_fusion_target_keep_threshold", 0.0),
+            "target_keep_seed": self.frame_fusion_target_keep_seed,
+            "recompute_each_global": recompute_each_global,
+            "pooling": "avg_pool2d_kernel_stride_pool_size_over_patch_grid",
+            "candidate_pairs": "nearest_neighbor_unique_undirected_frame_pairs",
+            "overlap_policy": (
+                "sequential_all_members_threshold_partition"
+                if self.frame_fusion_mode in {
+                    "sequential-group",
+                    "sequential-group-average",
+                }
+                else "connected_components_without_frame_overlap_dedup"
+                if self.frame_fusion_mode == "group-top-percent"
+                else "greedy_similarity_ordered_disjoint_pairs"
+            ),
+            "excluded_frames": [0],
+            "similarity": "cosine_similarity_of_pooled_patch_tokens_nearest_neighbor_dedup",
+            "selection_seconds": selection_seconds,
+            "full_patch_tokens": total_patch_tokens,
+            "retained_patch_tokens": retained_patch_tokens,
+            "patch_token_retention_vs_full": retained_patch_tokens / max(total_patch_tokens, 1),
+            "batches": debug_batches,
+        }
+        if recompute_each_global:
+            if not hasattr(self, "_frame_fusion_debug_layers"):
+                self._frame_fusion_debug_layers = []
+            self._frame_fusion_debug_layers.append(debug)
+            selected_counts = []
+            selected_group_counts = []
+            retention_values = []
+            attention_token_values = []
+            for layer_debug in self._frame_fusion_debug_layers:
+                layer_batches = layer_debug.get("batches") or []
+                for batch in layer_batches:
+                    selected_counts.append(float(batch.get("selected_pairs") or 0.0))
+                    selected_group_counts.append(float(batch.get("selected_groups") or 0.0))
+                    attention_token_values.append(float(batch.get("attention_tokens") or 0.0))
+                retention_values.append(float(layer_debug.get("patch_token_retention_vs_full") or 0.0))
+            aggregate_debug = dict(debug)
+            aggregate_debug["recomputed_source_layers"] = [
+                int(layer_debug["source_layer"])
+                for layer_debug in self._frame_fusion_debug_layers
+            ]
+            aggregate_debug["num_recomputed_layers"] = len(self._frame_fusion_debug_layers)
+            aggregate_debug["avg_selected_pairs"] = (
+                sum(selected_counts) / len(selected_counts) if selected_counts else 0.0
+            )
+            aggregate_debug["avg_selected_groups"] = (
+                sum(selected_group_counts) / len(selected_group_counts)
+                if selected_group_counts
+                else 0.0
+            )
+            aggregate_debug["avg_attention_tokens"] = (
+                sum(attention_token_values) / len(attention_token_values)
+                if attention_token_values
+                else 0.0
+            )
+            aggregate_debug["avg_patch_token_retention_vs_full"] = (
+                sum(retention_values) / len(retention_values) if retention_values else 0.0
+            )
+            aggregate_debug["layers"] = self._frame_fusion_debug_layers
+            self.last_frame_fusion_debug = aggregate_debug
+        else:
+            self.last_frame_fusion_debug = debug
+        return plans
+
+    def _build_temporal_representative_plans(
+        self,
+        tokens: torch.Tensor,
+        *,
+        source_layer: int,
+    ) -> list[TemporalRepresentativeBatchPlan]:
+        """Build a fixed per-position temporal dictionary and its inverse map."""
+
+        batch_size, num_frames, num_tokens, embed_dim = tokens.shape
+        patch_tokens = tokens[:, :, self.patch_token_start :]
+        patch_count = patch_tokens.shape[2]
+        threshold = float(self.frame_fusion_target_keep_threshold)
+        plans: list[TemporalRepresentativeBatchPlan] = []
+        debug_batches: list[dict[str, object]] = []
+
+        for batch_index in range(batch_size):
+            current_memory = patch_tokens[batch_index, 0].float()
+            current_memory_norm = torch.nn.functional.normalize(
+                current_memory,
+                p=2,
+                dim=-1,
+                eps=1e-8,
+            )
+            current_representatives = torch.arange(
+                patch_count,
+                device=tokens.device,
+                dtype=torch.long,
+            )
+            representative_sources = [
+                torch.arange(patch_count, device=tokens.device, dtype=torch.long)
+            ]
+            representative_weights = [
+                torch.ones(patch_count, device=tokens.device, dtype=torch.float32)
+            ]
+            mapping_rows = [current_representatives.clone()]
+
+            for frame_index in range(1, num_frames):
+                current_frame = patch_tokens[batch_index, frame_index].float()
+                current_frame_norm = torch.nn.functional.normalize(
+                    current_frame,
+                    p=2,
+                    dim=-1,
+                    eps=1e-8,
+                )
+                similarity = (current_frame_norm * current_memory_norm).sum(dim=-1)
+                shared = similarity >= threshold
+
+                next_representatives = torch.empty_like(current_representatives)
+                next_representatives[shared] = current_representatives[shared]
+                if bool((~shared).any().item()):
+                    new_count = int((~shared).sum().item())
+                    first_new = sum(int(source.numel()) for source in representative_sources)
+                    new_ids = torch.arange(
+                        first_new,
+                        first_new + new_count,
+                        device=tokens.device,
+                        dtype=torch.long,
+                    )
+                    next_representatives[~shared] = new_ids
+                    representative_sources.append(
+                        frame_index * patch_count
+                        + torch.nonzero(~shared, as_tuple=False).flatten()
+                    )
+                    representative_weights.append(
+                        torch.ones(new_count, device=tokens.device, dtype=torch.float32)
+                    )
+
+                if bool(shared.any().item()):
+                    shared_ids = current_representatives[shared]
+                    all_weights = torch.cat(representative_weights)
+                    all_weights.index_add_(
+                        0,
+                        shared_ids,
+                        torch.ones(shared_ids.numel(), device=tokens.device, dtype=torch.float32),
+                    )
+                    offset = 0
+                    updated_weights = []
+                    for weights in representative_weights:
+                        length = int(weights.numel())
+                        updated_weights.append(all_weights[offset : offset + length])
+                        offset += length
+                    representative_weights = updated_weights
+
+                current_memory_norm = torch.where(
+                    shared.unsqueeze(-1),
+                    current_memory_norm,
+                    current_frame_norm,
+                )
+                current_memory = torch.where(
+                    shared.unsqueeze(-1),
+                    current_memory,
+                    current_frame,
+                )
+                current_representatives = next_representatives
+                mapping_rows.append(current_representatives.clone())
+
+            mapping = torch.stack(mapping_rows, dim=0)
+            source_indices = torch.cat(representative_sources, dim=0)
+            weights = torch.cat(representative_weights, dim=0)
+            plans.append(
+                TemporalRepresentativeBatchPlan(
+                    position_to_representative=mapping,
+                    representative_source_indices=source_indices,
+                    representative_weights=weights,
+                )
+            )
+            debug_batches.append(
+                {
+                    "representative_count": int(source_indices.numel()),
+                    "full_patch_tokens": int(num_frames * patch_count),
+                    "representative_patch_tokens": int(source_indices.numel()),
+                    "attention_tokens": int(num_frames * self.patch_token_start + source_indices.numel()),
+                    "patch_token_retention_vs_full": float(
+                        source_indices.numel() / max(num_frames * patch_count, 1)
+                    ),
+                    "representative_weight_min": float(weights.min().item()),
+                    "representative_weight_max": float(weights.max().item()),
+                    "representative_weight_mean": float(weights.mean().item()),
+                    "mapping_checksum": int(mapping.long().sum().item()),
+                    "mapping_shape": list(mapping.shape),
+                }
+            )
+
+        self.last_frame_fusion_debug = {
+            "mode": self.frame_fusion_mode,
+            "source_layer": source_layer,
+            "num_frames": num_frames,
+            "tokens_per_frame": num_tokens,
+            "patch_tokens_per_frame": patch_count,
+            "embed_dim": embed_dim,
+            "target_keep_threshold": threshold,
+            "mapping": "position_to_temporal_representative",
+            "weighting": "log_representative_occurrence_count_in_attention_logits",
+            "mapping_preserved": True,
+            "full_patch_tokens": int(num_frames * patch_count),
+            "retained_patch_tokens": int(debug_batches[0]["representative_patch_tokens"])
+            if debug_batches
+            else 0,
+            "patch_token_retention_vs_full": float(debug_batches[0]["patch_token_retention_vs_full"])
+            if debug_batches
+            else 1.0,
+            "batches": debug_batches,
+        }
+        return plans
+
+    def _select_frame_fusion_target_keep_patch_indices(
+        self,
+        patch_tokens: torch.Tensor,
+        selected_pairs: list[FrameFusionPair],
+        *,
+        patch_grid_size: tuple[int, int],
+        source_layer: int,
+        batch_index: int,
+    ) -> torch.Tensor:
+        if not selected_pairs or self.frame_fusion_target_keep_policy == "none":
+            return torch.empty((len(selected_pairs), 0), device=patch_tokens.device, dtype=torch.long)
+
+        patch_h, patch_w = patch_grid_size
+        patch_count = patch_tokens.shape[1]
+        if patch_count != patch_h * patch_w:
+            raise ValueError(
+                "patch token count does not match grid size: "
+                f"{patch_count} vs {patch_h}x{patch_w}"
+            )
+
+        if self.frame_fusion_target_keep_policy == "random-grid":
+            keep_rows: list[torch.Tensor] = []
+            block_size = self.frame_fusion_target_keep_grid_size
+            block_offsets = []
+            for row_start in range(0, patch_h, block_size):
+                row_end = min(row_start + block_size, patch_h)
+                for col_start in range(0, patch_w, block_size):
+                    col_end = min(col_start + block_size, patch_w)
+                    block_offsets.append(
+                        [
+                            row * patch_w + col
+                            for row in range(row_start, row_end)
+                            for col in range(col_start, col_end)
+                        ]
+                    )
+            for pair_index, _ in enumerate(selected_pairs):
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(
+                    self.frame_fusion_target_keep_seed
+                    + (source_layer + 1) * 1_000_003
+                    + batch_index * 10_007
+                    + pair_index
+                )
+                chosen = []
+                for offsets in block_offsets:
+                    local_index = int(
+                        torch.randint(
+                            low=0,
+                            high=len(offsets),
+                            size=(1,),
+                            generator=generator,
+                        ).item()
+                    )
+                    chosen.append(offsets[local_index])
+                keep_rows.append(torch.tensor(chosen, device=patch_tokens.device, dtype=torch.long))
+            return torch.stack(keep_rows, dim=0)
+
+        if self.frame_fusion_target_keep_policy == "least-similar":
+            keep_count = int(
+                torch.ceil(
+                    torch.tensor(
+                        patch_count * self.frame_fusion_target_keep_percent / 100.0,
+                        dtype=torch.float32,
+                    )
+                ).item()
+            )
+            keep_count = min(patch_count, max(1, keep_count))
+            keep_rows = []
+            for pair in selected_pairs:
+                source = patch_tokens[pair.frame_a].float()
+                target = patch_tokens[pair.frame_b].float()
+                token_similarity = torch.nn.functional.cosine_similarity(
+                    source,
+                    target,
+                    dim=-1,
+                    eps=1e-8,
+                )
+                keep_rows.append(torch.topk(token_similarity, k=keep_count, largest=False).indices)
+            return torch.stack(keep_rows, dim=0).to(device=patch_tokens.device, dtype=torch.long)
+
+        if self.frame_fusion_target_keep_policy == "similarity-threshold":
+            keep_rows = []
+            for pair in selected_pairs:
+                source = patch_tokens[pair.frame_a].float()
+                target = patch_tokens[pair.frame_b].float()
+                token_similarity = torch.nn.functional.cosine_similarity(
+                    source,
+                    target,
+                    dim=-1,
+                    eps=1e-8,
+                )
+                keep_rows.append(token_similarity < self.frame_fusion_target_keep_threshold)
+            return torch.stack(keep_rows, dim=0).to(device=patch_tokens.device, dtype=torch.bool)
+
+        raise RuntimeError(f"Unsupported target keep policy: {self.frame_fusion_target_keep_policy}")
+
+    @staticmethod
+    def _select_frame_fusion_group_shared_keep_patch_indices(
+        patch_tokens: torch.Tensor,
+        groups: tuple[FrameFusionGroup, ...],
+        *,
+        threshold: float,
+    ) -> torch.Tensor:
+        """Return per-target masks from mean pairwise token similarity in each group."""
+
+        patch_count = int(patch_tokens.shape[1])
+        keep_rows: list[torch.Tensor] = []
+        for group in groups:
+            member_indices = torch.tensor(
+                group.members,
+                device=patch_tokens.device,
+                dtype=torch.long,
+            )
+            members = patch_tokens.index_select(0, member_indices).float()
+            normalized = torch.nn.functional.normalize(members, p=2, dim=-1, eps=1e-8)
+            pair_count = len(group.members) * (len(group.members) - 1) // 2
+            if pair_count <= 0:
+                continue
+            pairwise_sum = torch.zeros(
+                patch_count,
+                device=patch_tokens.device,
+                dtype=torch.float32,
+            )
+            for first in range(len(group.members)):
+                for second in range(first + 1, len(group.members)):
+                    pairwise_sum += (normalized[first] * normalized[second]).sum(dim=-1)
+            mean_similarity = pairwise_sum / float(pair_count)
+            keep_mask = mean_similarity < float(threshold)
+            keep_rows.extend(keep_mask.clone() for _ in group.members[1:])
+        if not keep_rows:
+            return torch.empty(
+                (0, patch_count),
+                device=patch_tokens.device,
+                dtype=torch.bool,
+            )
+        return torch.stack(keep_rows, dim=0)
+
+    def _run_temporal_representative_global_attention_block(
+        self,
+        tokens: torch.Tensor,
+        *,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        embed_dim: int,
+        block_idx: int,
+        plans: list[TemporalRepresentativeBatchPlan],
+    ) -> torch.Tensor:
+        """Run global attention on representatives and restore the position map."""
+
+        block = self.inter_frame_blocks[block_idx]
+        patch_start = self.patch_token_start
+        patch_count = num_tokens - patch_start
+        outputs: list[torch.Tensor] = []
+        for batch_index, plan in enumerate(plans):
+            frame_tokens = tokens[batch_index]
+            special_tokens = frame_tokens[:, :patch_start].reshape(-1, embed_dim)
+            patch_tokens = frame_tokens[:, patch_start:].reshape(-1, embed_dim)
+            representatives = patch_tokens.index_select(
+                0,
+                plan.representative_source_indices.to(device=tokens.device),
+            )
+            compressed = torch.cat([special_tokens, representatives], dim=0).unsqueeze(0)
+            weights = torch.cat(
+                [
+                    torch.ones(
+                        special_tokens.shape[0],
+                        device=tokens.device,
+                        dtype=torch.float32,
+                    ),
+                    plan.representative_weights.to(device=tokens.device),
+                ],
+                dim=0,
+            )
+            key_log_weights = weights.clamp_min(1.0).log().to(dtype=compressed.dtype)
+            key_log_weights = key_log_weights.view(1, 1, 1, -1)
+
+            block.attn.merge_random_seed = self.merge_random_seed
+            normalized = block.norm1(compressed)
+            attention_output = block.attn(normalized, attn_bias=key_log_weights)
+            attended = compressed + block.ls1(attention_output)
+            compressed_output = attended + block.ls2(block.mlp(block.norm2(attended)))
+            compressed_output = compressed_output.squeeze(0)
+
+            restored_special = compressed_output[: special_tokens.shape[0]].view(
+                num_frames,
+                patch_start,
+                embed_dim,
+            )
+            restored_representatives = compressed_output[special_tokens.shape[0] :]
+            restored_patch = restored_representatives.index_select(
+                0,
+                plan.position_to_representative.to(device=tokens.device).reshape(-1),
+            ).view(num_frames, patch_count, embed_dim)
+            outputs.append(torch.cat([restored_special, restored_patch], dim=1))
+
+        return torch.stack(outputs, dim=0)
+
+    def _run_pair_fused_global_attention_block(
+        self,
+        tokens: torch.Tensor,
+        *,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        embed_dim: int,
+        block_idx: int,
+        frame_fusion_pair_plans: list[FrameFusionBatchPlan],
+    ) -> torch.Tensor:
+        tokens = self._fuse_frame_pair_patch_tokens(tokens, frame_fusion_pair_plans)
+        outputs: list[torch.Tensor] = []
+        block = self.inter_frame_blocks[block_idx]
+        for batch_index in range(batch_size):
+            plan = frame_fusion_pair_plans[batch_index]
+            flat_tokens = tokens[batch_index].reshape(num_frames * num_tokens, embed_dim)
+            attention_indices = plan.attention_indices.to(device=tokens.device)
+            if attention_indices.numel() == flat_tokens.shape[0]:
+                attended = block(flat_tokens.unsqueeze(0), None).squeeze(0)
+                outputs.append(attended.view(num_frames, num_tokens, embed_dim))
+                continue
+
+            compressed_tokens = flat_tokens.index_select(0, attention_indices).unsqueeze(0)
+            compressed_tokens = block(compressed_tokens, None).squeeze(0)
+            restored = flat_tokens.clone()
+            restored.index_copy_(0, attention_indices, compressed_tokens)
+            restored = self._copy_pair_patch_outputs(
+                restored,
+                plan,
+                tokens_per_frame=num_tokens,
+                num_special_tokens=self.patch_token_start,
+            )
+            outputs.append(restored.view(num_frames, num_tokens, embed_dim))
+        return torch.stack(outputs, dim=0)
+
+    def _fuse_frame_pair_patch_tokens(
+        self,
+        tokens: torch.Tensor,
+        frame_fusion_pair_plans: list[FrameFusionBatchPlan],
+    ) -> torch.Tensor:
+        output = tokens.clone()
+        patch_start = self.patch_token_start
+        patch_slice = slice(patch_start, None)
+        for batch_index, plan in enumerate(frame_fusion_pair_plans):
+            if not plan.pairs:
+                continue
+            source_frames = plan.source_frames.to(device=tokens.device, dtype=torch.long)
+            target_frames = plan.target_frames.to(device=tokens.device, dtype=torch.long)
+            patch_count = tokens.shape[2] - patch_start
+            target_keep_mask = _frame_fusion_target_keep_patch_mask(
+                plan.target_keep_patch_indices,
+                num_pairs=int(source_frames.numel()),
+                patch_count=patch_count,
+                device=tokens.device,
+            )
+            all_patch_offsets = torch.arange(patch_count, device=tokens.device, dtype=torch.long)
+            if getattr(self, "frame_fusion_mode", "pair-top-percent") == "sequential-group-average":
+                relation_offset = 0
+                for group in plan.groups:
+                    member_frames = torch.tensor(
+                        group.members,
+                        device=tokens.device,
+                        dtype=torch.long,
+                    )
+                    shared_offsets = all_patch_offsets[
+                        ~target_keep_mask[relation_offset]
+                    ]
+                    relation_offset += len(group.members) - 1
+                    if shared_offsets.numel() == 0:
+                        continue
+                    token_offsets = patch_start + shared_offsets
+                    shared_tokens = output[batch_index].index_select(0, member_frames)
+                    shared_tokens = shared_tokens.index_select(1, token_offsets).mean(dim=0)
+                    for frame in member_frames:
+                        output[batch_index, frame, token_offsets] = shared_tokens
+                continue
+            for pair_index, (source_frame, target_frame) in enumerate(zip(source_frames, target_frames)):
+                fuse_offsets = all_patch_offsets[~target_keep_mask[pair_index]]
+                if fuse_offsets.numel() == 0:
+                    continue
+                token_offsets = patch_start + fuse_offsets
+                if getattr(self, "frame_fusion_mode", "pair-top-percent") in {
+                    "group-top-percent",
+                    "sequential-group",
+                }:
+                    output[batch_index, target_frame, token_offsets] = output[
+                        batch_index, source_frame, token_offsets
+                    ]
+                else:
+                    source_patch_tokens = output[batch_index, source_frame, token_offsets]
+                    target_patch_tokens = output[batch_index, target_frame, token_offsets]
+                    averaged_patch_tokens = (source_patch_tokens + target_patch_tokens) * 0.5
+                    output[batch_index, source_frame, token_offsets] = averaged_patch_tokens
+                    output[batch_index, target_frame, token_offsets] = averaged_patch_tokens
+        return output
+
+    @staticmethod
+    def _copy_pair_patch_outputs(
+        flat_tokens: torch.Tensor,
+        plan: FrameFusionBatchPlan,
+        *,
+        tokens_per_frame: int,
+        num_special_tokens: int,
+    ) -> torch.Tensor:
+        if not plan.pairs:
+            return flat_tokens
+        patch_count = tokens_per_frame - num_special_tokens
+        if patch_count <= 0:
+            return flat_tokens
+        device = flat_tokens.device
+        offsets = torch.arange(patch_count, device=device, dtype=torch.long)
+        source_frames = plan.source_frames.to(device=device)
+        target_frames = plan.target_frames.to(device=device)
+        target_keep_mask = _frame_fusion_target_keep_patch_mask(
+            plan.target_keep_patch_indices,
+            num_pairs=int(source_frames.numel()),
+            patch_count=patch_count,
+            device=device,
+        )
+        source_index_chunks = []
+        target_index_chunks = []
+        for pair_index, (source_frame, target_frame) in enumerate(zip(source_frames, target_frames)):
+            copy_offsets = offsets[~target_keep_mask[pair_index]]
+            if copy_offsets.numel() == 0:
+                continue
+            source_index_chunks.append(source_frame * tokens_per_frame + num_special_tokens + copy_offsets)
+            target_index_chunks.append(target_frame * tokens_per_frame + num_special_tokens + copy_offsets)
+        if not source_index_chunks:
+            return flat_tokens
+        source_indices = torch.cat(source_index_chunks, dim=0)
+        target_indices = torch.cat(target_index_chunks, dim=0)
+        return flat_tokens.index_copy(0, target_indices, flat_tokens.index_select(0, source_indices))
 
     def _run_frame_block(
         self,
@@ -1098,6 +2455,8 @@ class Aggregator(nn.Module):
         block_idx: int,
         attention_type: str,
         patch_grid_size: tuple[int, int],
+        frame_fusion_pair_plans: list[FrameFusionBatchPlan] | None = None,
+        temporal_representative_plans: list[TemporalRepresentativeBatchPlan] | None = None,
     ) -> torch.Tensor:
         tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
@@ -1134,6 +2493,34 @@ class Aggregator(nn.Module):
                     embed_dim=embed_dim,
                     block_idx=block_idx,
                     patch_grid_size=patch_grid_size,
+                )
+            if self.frame_fusion_mode in {
+                "pair-top-percent",
+                "group-top-percent",
+                "sequential-group",
+                "sequential-group-average",
+            } and frame_fusion_pair_plans is not None:
+                return self._run_pair_fused_global_attention_block(
+                    tokens,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    num_tokens=num_tokens,
+                    embed_dim=embed_dim,
+                    block_idx=block_idx,
+                    frame_fusion_pair_plans=frame_fusion_pair_plans,
+                )
+            if (
+                self.frame_fusion_mode == "temporal-representative"
+                and temporal_representative_plans is not None
+            ):
+                return self._run_temporal_representative_global_attention_block(
+                    tokens,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    num_tokens=num_tokens,
+                    embed_dim=embed_dim,
+                    block_idx=block_idx,
+                    plans=temporal_representative_plans,
                 )
             tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
             self.inter_frame_blocks[block_idx].attn.merge_random_seed = self.merge_random_seed
@@ -1298,8 +2685,560 @@ def _build_patch_embed(patch_size: int, embed_dim: int) -> DinoVisionTransformer
     return model
 
 
-def slice_expand_and_flatten(token_tensor: torch.Tensor, batch_size: int, num_frames: int) -> torch.Tensor:
-    first_frame_token = token_tensor[:, 0:1].expand(batch_size, 1, *token_tensor.shape[2:])
-    other_frame_tokens = token_tensor[:, 1:].expand(batch_size, num_frames - 1, *token_tensor.shape[2:])
-    tokens = torch.cat([first_frame_token, other_frame_tokens], dim=1)
+def slice_expand_and_flatten(
+    token_tensor: torch.Tensor,
+    batch_size: int,
+    num_frames: int,
+    first_frame_token_indices: tuple[int, ...] = (0,),
+) -> torch.Tensor:
+    first_frame_token = token_tensor[:, 0:1].expand(batch_size, num_frames, *token_tensor.shape[2:])
+    other_frame_tokens = token_tensor[:, 1:2].expand(batch_size, num_frames, *token_tensor.shape[2:])
+    mask = torch.zeros(num_frames, device=token_tensor.device, dtype=torch.bool)
+    mask[list(first_frame_token_indices)] = True
+    view_shape = (1, num_frames) + (1,) * (token_tensor.ndim - 2)
+    tokens = torch.where(mask.view(view_shape), first_frame_token, other_frame_tokens)
     return tokens.view(batch_size * num_frames, *tokens.shape[2:])
+
+
+def _normalize_similarity_weights(similarity: torch.Tensor) -> torch.Tensor:
+    weights = similarity.clamp_min(0.0)
+    total = weights.sum()
+    if float(total.detach().cpu()) <= 1e-12:
+        return torch.full_like(weights, 1.0 / max(weights.numel(), 1))
+    return weights / total
+
+
+def pooled_frame_representations(
+    patch_tokens: torch.Tensor,
+    *,
+    patch_grid_size: tuple[int, int],
+    pool_size: int = 2,
+) -> torch.Tensor:
+    if patch_tokens.ndim != 4:
+        raise ValueError(
+            "patch_tokens must have shape [batch, frames, patches, channels], "
+            f"got {tuple(patch_tokens.shape)}"
+        )
+    batch_size, num_frames, patch_count, embed_dim = patch_tokens.shape
+    patch_h, patch_w = patch_grid_size
+    if patch_h <= 0 or patch_w <= 0:
+        raise ValueError(f"patch_grid_size must be positive, got {patch_grid_size}")
+    if patch_count != patch_h * patch_w:
+        raise ValueError(
+            "patch token count does not match patch_grid_size: "
+            f"{patch_count} != {patch_h} * {patch_w}"
+        )
+    pool_size = int(pool_size)
+    if pool_size <= 0:
+        raise ValueError(f"pool_size must be positive, got {pool_size}")
+    kernel_h = min(pool_size, patch_h)
+    kernel_w = min(pool_size, patch_w)
+    patches = patch_tokens.float().view(
+        batch_size,
+        num_frames,
+        patch_h,
+        patch_w,
+        embed_dim,
+    )
+    patches = patches.permute(0, 1, 4, 2, 3).reshape(
+        batch_size * num_frames,
+        embed_dim,
+        patch_h,
+        patch_w,
+    )
+    pooled = torch.nn.functional.avg_pool2d(
+        patches,
+        kernel_size=(kernel_h, kernel_w),
+        stride=(kernel_h, kernel_w),
+    )
+    return pooled.flatten(1).view(batch_size, num_frames, -1)
+
+
+def select_frame_fusion_pairs(
+    similarity: torch.Tensor,
+    *,
+    pair_percent: float,
+    exclude_frames: tuple[int, ...] | list[int] = (),
+    disjoint: bool = True,
+) -> tuple[list[FrameFusionPair], int, int]:
+    if similarity.ndim != 2 or similarity.shape[0] != similarity.shape[1]:
+        raise ValueError(f"similarity must be a square matrix, got shape {tuple(similarity.shape)}")
+    num_frames = int(similarity.shape[0])
+    excluded = _validate_frame_pair_selection_inputs(
+        num_frames,
+        pair_percent=pair_percent,
+        exclude_frames=exclude_frames,
+    )
+    if num_frames - len(excluded) < 2:
+        return [], 0, 0
+
+    sim = similarity.detach().float().cpu().clone()
+    sim.fill_diagonal_(float("-inf"))
+    if excluded:
+        excluded_index = torch.tensor(sorted(excluded), dtype=torch.long)
+        sim[excluded_index, :] = float("-inf")
+        sim[:, excluded_index] = float("-inf")
+    candidates_by_pair: dict[tuple[int, int], float] = {}
+    eligible_frames = [frame for frame in range(num_frames) if frame not in excluded]
+    for frame_index in eligible_frames:
+        neighbor = int(torch.argmax(sim[frame_index]).item())
+        frame_a, frame_b = sorted((frame_index, neighbor))
+        score = float(sim[frame_index, neighbor].item())
+        previous = candidates_by_pair.get((frame_a, frame_b))
+        if previous is None or score > previous:
+            candidates_by_pair[(frame_a, frame_b)] = score
+    candidates = [
+        FrameFusionPair(frame_a=frame_a, frame_b=frame_b, similarity=score)
+        for (frame_a, frame_b), score in candidates_by_pair.items()
+    ]
+    return _select_top_percent_frame_pairs(
+        candidates,
+        pair_percent=pair_percent,
+        disjoint=disjoint,
+    )
+
+
+def select_frame_fusion_pairs_from_normalized_representations(
+    normalized_frame_representations: torch.Tensor,
+    *,
+    pair_percent: float,
+    exclude_frames: tuple[int, ...] | list[int] = (),
+    disjoint: bool = True,
+) -> tuple[list[FrameFusionPair], int, int]:
+    if normalized_frame_representations.ndim != 2:
+        raise ValueError(
+            "normalized_frame_representations must have shape [frames, channels], "
+            f"got {tuple(normalized_frame_representations.shape)}"
+        )
+    num_frames = int(normalized_frame_representations.shape[0])
+    excluded = _validate_frame_pair_selection_inputs(
+        num_frames,
+        pair_percent=pair_percent,
+        exclude_frames=exclude_frames,
+    )
+    if num_frames - len(excluded) < 2:
+        return [], 0, 0
+
+    reps = normalized_frame_representations.detach().float()
+    candidates_by_pair: dict[tuple[int, int], float] = {}
+    eligible_frames = [frame for frame in range(num_frames) if frame not in excluded]
+    excluded_index = (
+        torch.tensor(sorted(excluded), device=reps.device, dtype=torch.long)
+        if excluded
+        else None
+    )
+    for frame_index in eligible_frames:
+        scores = torch.matmul(reps, reps[frame_index]).clamp(-1.0, 1.0)
+        scores[frame_index] = float("-inf")
+        if excluded_index is not None:
+            scores[excluded_index] = float("-inf")
+        neighbor = int(torch.argmax(scores).item())
+        frame_a, frame_b = sorted((frame_index, neighbor))
+        score = float(scores[neighbor].detach().cpu().item())
+        previous = candidates_by_pair.get((frame_a, frame_b))
+        if previous is None or score > previous:
+            candidates_by_pair[(frame_a, frame_b)] = score
+    candidates = [
+        FrameFusionPair(frame_a=frame_a, frame_b=frame_b, similarity=score)
+        for (frame_a, frame_b), score in candidates_by_pair.items()
+    ]
+    return _select_top_percent_frame_pairs(
+        candidates,
+        pair_percent=pair_percent,
+        disjoint=disjoint,
+    )
+
+
+def _validate_frame_pair_selection_inputs(
+    num_frames: int,
+    *,
+    pair_percent: float,
+    exclude_frames: tuple[int, ...] | list[int],
+) -> set[int]:
+    pair_percent = float(pair_percent)
+    if not 0.0 < pair_percent <= 100.0:
+        raise ValueError(f"pair_percent must be in (0, 100], got {pair_percent}")
+    excluded = {int(frame) for frame in exclude_frames}
+    invalid_excluded = sorted(frame for frame in excluded if frame < 0 or frame >= num_frames)
+    if invalid_excluded:
+        raise ValueError(f"exclude_frames contains out-of-range indices: {invalid_excluded}")
+    return excluded
+
+
+def _select_top_percent_frame_pairs(
+    candidates: list[FrameFusionPair],
+    *,
+    pair_percent: float,
+    disjoint: bool,
+) -> tuple[list[FrameFusionPair], int, int]:
+    candidates.sort(key=lambda pair: pair.similarity, reverse=True)
+    unique_candidate_count = len(candidates)
+    if unique_candidate_count == 0:
+        return [], 0, 0
+    requested_pair_count = int(torch.ceil(torch.tensor(unique_candidate_count * pair_percent / 100.0)).item())
+    requested_pair_count = min(unique_candidate_count, max(requested_pair_count, 1))
+
+    selected: list[FrameFusionPair] = []
+    if not disjoint:
+        return candidates[:requested_pair_count], unique_candidate_count, requested_pair_count
+    used_frames: set[int] = set()
+    for pair in candidates:
+        if pair.frame_a in used_frames or pair.frame_b in used_frames:
+            continue
+        selected.append(pair)
+        used_frames.add(pair.frame_a)
+        used_frames.add(pair.frame_b)
+        if len(selected) >= requested_pair_count:
+            break
+    return selected, unique_candidate_count, requested_pair_count
+
+
+def _connected_frame_fusion_groups(
+    pairs: list[FrameFusionPair],
+) -> list[FrameFusionGroup]:
+    """Convert overlapping selected edges into sorted connected components."""
+
+    adjacency: dict[int, set[int]] = {}
+    for pair in pairs:
+        adjacency.setdefault(pair.frame_a, set()).add(pair.frame_b)
+        adjacency.setdefault(pair.frame_b, set()).add(pair.frame_a)
+
+    groups: list[FrameFusionGroup] = []
+    visited: set[int] = set()
+    for start in sorted(adjacency):
+        if start in visited:
+            continue
+        stack = [start]
+        members: list[int] = []
+        visited.add(start)
+        while stack:
+            frame = stack.pop()
+            members.append(frame)
+            for neighbor in sorted(adjacency[frame], reverse=True):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+        ordered_members = tuple(sorted(members))
+        groups.append(FrameFusionGroup(anchor=ordered_members[0], members=ordered_members))
+    return groups
+
+
+def _sequential_frame_fusion_groups(
+    normalized_representations: torch.Tensor,
+    *,
+    similarity_threshold: float,
+    max_group_size: int,
+    first_frame: int = 1,
+) -> list[FrameFusionGroup]:
+    """Partition frames in input order using an all-members similarity gate."""
+
+    if normalized_representations.ndim != 2:
+        raise ValueError(
+            "normalized_representations must have shape [frames, channels], "
+            f"got {tuple(normalized_representations.shape)}"
+        )
+    num_frames = int(normalized_representations.shape[0])
+    max_group_size = int(max_group_size)
+    similarity_threshold = float(similarity_threshold)
+    first_frame = int(first_frame)
+    if max_group_size <= 0:
+        raise ValueError(f"max_group_size must be positive, got {max_group_size}")
+    if not -1.0 <= similarity_threshold <= 1.0:
+        raise ValueError(
+            f"similarity_threshold must be in [-1, 1], got {similarity_threshold}"
+        )
+    if not 0 <= first_frame <= num_frames:
+        raise ValueError(f"first_frame must be in [0, {num_frames}], got {first_frame}")
+
+    groups: list[FrameFusionGroup] = []
+    if first_frame == num_frames:
+        return groups
+    current = [first_frame]
+    for frame in range(first_frame + 1, num_frames):
+        if len(current) >= max_group_size:
+            groups.append(FrameFusionGroup(anchor=current[0], members=tuple(current)))
+            current = [frame]
+            continue
+        member_indices = torch.tensor(current, device=normalized_representations.device)
+        similarities = torch.matmul(
+            normalized_representations.index_select(0, member_indices),
+            normalized_representations[frame],
+        )
+        if bool(torch.all(similarities >= similarity_threshold).item()):
+            current.append(frame)
+        else:
+            groups.append(FrameFusionGroup(anchor=current[0], members=tuple(current)))
+            current = [frame]
+    groups.append(FrameFusionGroup(anchor=current[0], members=tuple(current)))
+    return groups
+
+
+def _anchor_target_frame_fusion_pairs(
+    groups: tuple[FrameFusionGroup, ...] | list[FrameFusionGroup],
+    normalized_representations: torch.Tensor,
+) -> list[FrameFusionPair]:
+    return [
+        FrameFusionPair(
+            frame_a=group.anchor,
+            frame_b=frame,
+            similarity=float(
+                torch.dot(
+                    normalized_representations[group.anchor],
+                    normalized_representations[frame],
+                ).clamp(-1.0, 1.0).item()
+            ),
+        )
+        for group in groups
+        for frame in group.members
+        if frame != group.anchor
+    ]
+
+
+def _frame_fusion_partition_summary(
+    pairs: list[FrameFusionPair],
+    groups: list[FrameFusionGroup],
+) -> dict[str, object]:
+    sizes = [len(group.members) for group in groups]
+    participating = sorted({frame for group in groups for frame in group.members})
+    candidate_membership: dict[int, int] = {}
+    for pair in pairs:
+        candidate_membership[pair.frame_a] = candidate_membership.get(pair.frame_a, 0) + 1
+        candidate_membership[pair.frame_b] = candidate_membership.get(pair.frame_b, 0) + 1
+    overlapping_frames = sorted(
+        frame
+        for frame, count in _frame_fusion_frame_membership_counts(groups).items()
+        if count > 1
+    )
+    return {
+        "candidate_edges_used": len(pairs),
+        "groups": len(groups),
+        "group_sizes": sizes,
+        "group_size_histogram": {
+            str(size): sizes.count(size) for size in sorted(set(sizes))
+        },
+        "participating_frames": len(participating),
+        "participating_frame_indices": participating,
+        "overlapping_frames": overlapping_frames,
+        "candidate_frames_with_multiple_edges": sorted(
+            frame for frame, count in candidate_membership.items() if count > 1
+        ),
+        "candidate_max_edge_degree": max(candidate_membership.values(), default=0),
+    }
+
+
+def _frame_fusion_frame_membership_counts(
+    groups: list[FrameFusionGroup],
+) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for group in groups:
+        for frame in group.members:
+            counts[frame] = counts.get(frame, 0) + 1
+    return counts
+
+
+def _frame_fusion_target_keep_patch_mask(
+    target_keep_patch_indices: torch.Tensor | None,
+    *,
+    num_pairs: int,
+    patch_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    keep_mask = torch.zeros(
+        num_pairs,
+        patch_count,
+        device=device,
+        dtype=torch.bool,
+    )
+    if target_keep_patch_indices is None or target_keep_patch_indices.numel() == 0:
+        return keep_mask
+    if target_keep_patch_indices.dtype == torch.bool:
+        if target_keep_patch_indices.ndim != 2:
+            raise ValueError(
+                "boolean target_keep_patch_indices must be [num_pairs, patch_count], "
+                f"got {tuple(target_keep_patch_indices.shape)}"
+            )
+        if tuple(target_keep_patch_indices.shape) != (num_pairs, patch_count):
+            raise ValueError(
+                "boolean target_keep_patch_indices shape must match "
+                f"({num_pairs}, {patch_count}), got {tuple(target_keep_patch_indices.shape)}"
+            )
+        return target_keep_patch_indices.to(device=device, dtype=torch.bool)
+
+    keep_indices = target_keep_patch_indices.to(device=device, dtype=torch.long)
+    if keep_indices.ndim != 2:
+        raise ValueError(
+            "target_keep_patch_indices must be [num_pairs, keep_count], "
+            f"got {tuple(keep_indices.shape)}"
+        )
+    if keep_indices.shape[0] != num_pairs:
+        raise ValueError(
+            "target_keep_patch_indices first dimension must match selected pairs, "
+            f"got {keep_indices.shape[0]} and {num_pairs}"
+        )
+    if keep_indices.shape[1] == 0:
+        return keep_mask
+    if int(keep_indices.min().item()) < 0 or int(keep_indices.max().item()) >= patch_count:
+        raise ValueError("target keep patch index out of range")
+    keep_mask.scatter_(1, keep_indices, True)
+    return keep_mask
+
+
+def _frame_fusion_target_keep_patch_counts(
+    target_keep_patch_indices: torch.Tensor | None,
+    *,
+    num_pairs: int,
+    patch_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    return _frame_fusion_target_keep_patch_mask(
+        target_keep_patch_indices,
+        num_pairs=num_pairs,
+        patch_count=patch_count,
+        device=device,
+    ).sum(dim=1)
+
+
+def frame_fusion_attention_indices(
+    *,
+    num_frames: int,
+    tokens_per_frame: int,
+    num_special_tokens: int,
+    source_frames: torch.Tensor,
+    target_frames: torch.Tensor,
+    target_keep_patch_indices: torch.Tensor | None = None,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    if num_frames <= 0:
+        raise ValueError(f"num_frames must be positive, got {num_frames}")
+    if not 0 <= num_special_tokens <= tokens_per_frame:
+        raise ValueError(
+            "num_special_tokens must be in [0, tokens_per_frame], "
+            f"got {num_special_tokens} for {tokens_per_frame}"
+        )
+    if source_frames.shape != target_frames.shape:
+        raise ValueError(
+            "source_frames and target_frames must have the same shape, "
+            f"got {tuple(source_frames.shape)} and {tuple(target_frames.shape)}"
+        )
+    device = source_frames.device if device is None else device
+    keep_mask = torch.zeros(
+        num_frames,
+        tokens_per_frame,
+        device=device,
+        dtype=torch.bool,
+    )
+    keep_mask[:, :num_special_tokens] = True
+    keep_patch_frames = torch.ones(num_frames, device=device, dtype=torch.bool)
+    if target_frames.numel() > 0:
+        target_frames = target_frames.to(device=device, dtype=torch.long)
+        if int(target_frames.min().item()) < 0 or int(target_frames.max().item()) >= num_frames:
+            raise ValueError("target frame index out of range")
+        keep_patch_frames[target_frames] = False
+    keep_mask[keep_patch_frames, num_special_tokens:] = True
+    if target_keep_patch_indices is not None and target_keep_patch_indices.numel() > 0:
+        patch_count = tokens_per_frame - num_special_tokens
+        target_keep_patch_mask = _frame_fusion_target_keep_patch_mask(
+            target_keep_patch_indices,
+            num_pairs=int(target_frames.numel()),
+            patch_count=patch_count,
+            device=device,
+        )
+        pair_offsets, patch_offsets = target_keep_patch_mask.nonzero(as_tuple=True)
+        keep_mask[target_frames[pair_offsets], num_special_tokens + patch_offsets] = True
+    return keep_mask.flatten().nonzero(as_tuple=False).flatten()
+
+
+def compute_frame_fusion_partition(
+    distance: torch.Tensor,
+    *,
+    num_groups: int,
+    max_group_size: int,
+    beta: float = 1.0,
+) -> list[FrameFusionSegment]:
+    if distance.ndim != 2 or distance.shape[0] != distance.shape[1]:
+        raise ValueError(f"distance must be a square matrix, got shape {tuple(distance.shape)}")
+    num_frames = int(distance.shape[0])
+    num_groups = int(num_groups)
+    max_group_size = int(max_group_size)
+    beta = float(beta)
+    if num_frames <= 0:
+        raise ValueError("distance matrix must contain at least one frame")
+    if num_groups <= 0:
+        raise ValueError(f"num_groups must be positive, got {num_groups}")
+    if max_group_size <= 0:
+        raise ValueError(f"max_group_size must be positive, got {max_group_size}")
+    if beta < 0.0:
+        raise ValueError(f"beta must be non-negative, got {beta}")
+    if num_groups > num_frames:
+        raise ValueError(f"num_groups ({num_groups}) must be <= num_frames ({num_frames})")
+    if num_frames > num_groups * max_group_size:
+        raise ValueError(
+            "No feasible frame partition: "
+            f"num_frames={num_frames}, num_groups={num_groups}, max_group_size={max_group_size}"
+        )
+
+    dist = distance.detach().float().cpu()
+    costs = torch.full((num_frames, num_frames), float("inf"), dtype=torch.float64)
+    medoids = torch.full((num_frames, num_frames), -1, dtype=torch.long)
+    mean_distances = torch.full((num_frames, num_frames), float("nan"), dtype=torch.float64)
+    max_distances = torch.full((num_frames, num_frames), float("nan"), dtype=torch.float64)
+    for start in range(num_frames):
+        for end in range(start, min(num_frames, start + max_group_size)):
+            group = dist[start : end + 1, start : end + 1].double()
+            medoid_local = int(torch.argmin(group.sum(dim=0)).item())
+            medoid = start + medoid_local
+            distances_to_medoid = dist[start : end + 1, medoid].double()
+            mean_distance = distances_to_medoid.mean()
+            max_distance = distances_to_medoid.max()
+            cost = mean_distance + beta * max_distance
+            costs[start, end] = cost
+            medoids[start, end] = medoid
+            mean_distances[start, end] = mean_distance
+            max_distances[start, end] = max_distance
+
+    dp = torch.full((num_groups + 1, num_frames + 1), float("inf"), dtype=torch.float64)
+    back = torch.full((num_groups + 1, num_frames + 1), -1, dtype=torch.long)
+    dp[0, 0] = 0.0
+    for group_count in range(1, num_groups + 1):
+        min_end = group_count
+        max_end = min(num_frames, group_count * max_group_size)
+        for end_exclusive in range(min_end, max_end + 1):
+            start_min = max(group_count - 1, end_exclusive - max_group_size)
+            start_max = end_exclusive - 1
+            best_cost = float("inf")
+            best_start = -1
+            for start in range(start_min, start_max + 1):
+                previous = float(dp[group_count - 1, start].item())
+                if previous == float("inf"):
+                    continue
+                candidate = previous + float(costs[start, end_exclusive - 1].item())
+                if candidate < best_cost:
+                    best_cost = candidate
+                    best_start = start
+            if best_start >= 0:
+                dp[group_count, end_exclusive] = best_cost
+                back[group_count, end_exclusive] = best_start
+
+    if not torch.isfinite(dp[num_groups, num_frames]):
+        raise RuntimeError("No feasible frame partition found")
+
+    segments: list[FrameFusionSegment] = []
+    end_exclusive = num_frames
+    for group_count in range(num_groups, 0, -1):
+        start = int(back[group_count, end_exclusive].item())
+        if start < 0:
+            raise RuntimeError(f"Missing DP backpointer for group={group_count}, end={end_exclusive}")
+        end = end_exclusive - 1
+        segments.append(
+            FrameFusionSegment(
+                start=start,
+                end=end,
+                medoid=int(medoids[start, end].item()),
+                cost=float(costs[start, end].item()),
+                mean_distance=float(mean_distances[start, end].item()),
+                max_distance=float(max_distances[start, end].item()),
+            )
+        )
+        end_exclusive = start
+    segments.reverse()
+    return segments

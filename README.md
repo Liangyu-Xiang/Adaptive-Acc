@@ -124,8 +124,8 @@ ratio, this gives about 512x336 inputs and uses less GPU memory.
 
 ## TUM-Dynamics evaluation
 
-Reproduce the paper protocol (10 randomly sampled frames per sequence,
-pairwise camera AUC@3/AUC@30, depth delta1.25/AbsRel):
+Run the default evaluation protocol (first/last-preserving uniform frame
+sampling, pairwise camera AUC@3/AUC@30, depth delta1.25/AbsRel):
 
 ```bash
 conda activate 3d
@@ -140,9 +140,13 @@ by Git.
 
 The paper reports 30.2/82.3 for AUC@3/AUC@30 and 97.4/0.041 for
 delta1.25/AbsRel with the 1B model. The release does not include its sampled
-frame IDs, so the script uses a fixed seed and writes the exact selection to
-`sampled_frames.json`, metrics to `metrics.json`, and raw pose errors to
-`pose_errors.npz`.
+frame IDs. Pass `--sampling-strategy random` to run the older seeded-random
+loader convention. Every run writes the exact selection to `sampled_frames.json`,
+metrics to `metrics.json`, and raw pose errors to `pose_errors.npz`.
+
+For long-sequence inputs, pass `--num-frames 500`. The default sampler preserves
+the first and last frame in each raw sequence pool and selects the middle frames
+with deterministic `linspace` spacing.
 
 For the separate 90-frame trajectory protocol (not the metrics in the paper's
 Tables 1 and 2), use `scripts/eval_tum_dynamics.py`. It reports Sim(3)-aligned

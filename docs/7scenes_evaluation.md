@@ -2,10 +2,13 @@
 
 `scripts/eval_7scenes_paper.py` evaluates the released VGGT-Omega 1B model
 against Tables 1 and 2 of the paper. It reads the official `TestSplit.txt`
-files and deterministically samples 10 frames from each of the 18 test
-sequences with NumPy `RandomState(42)`, matching common 7 Scenes evaluation
-loaders. The paper's wording, "for each scene or sequence", is ambiguous; use
+files and defaults to first/last-preserving uniform frame sampling. Pass
+`--sampling-strategy random` to use the older NumPy `RandomState(42)` loader
+convention. The paper's wording, "for each scene or sequence", is ambiguous; use
 `--sampling-unit scene` to run the seven-physical-scene interpretation.
+For long-sequence experiments, pass `--num-frames 500`; the default sampler keeps
+the first and last frame in each sampling pool and selects the middle frames
+with deterministic `linspace` spacing.
 
 The expected paper values for Ours-1B are AUC@3 = 29.6, AUC@30 = 83.1,
 delta1.25 = 94.6, and AbsRel = 0.058. Exact reproduction is not guaranteed

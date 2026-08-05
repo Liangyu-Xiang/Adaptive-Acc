@@ -369,7 +369,6 @@ class SelfAttention(nn.Module):
         adaptive_anchor_random_seed: int | None = None,
         adaptive_anchor_debug: bool | None = None,
     ) -> Tensor:
-        assert attn_bias is None
         B, N, _ = qkv.shape
         C = self.qkv.in_features
         self.last_merged_tokens = 0
@@ -640,7 +639,12 @@ class SelfAttention(nn.Module):
                 k = k_out.reshape(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
                 v = v_out.reshape(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
 
-        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_bias,
+        )
         x = x.transpose(1, 2)
         x = x.reshape([B, N, C])
         if unmerge is not None:

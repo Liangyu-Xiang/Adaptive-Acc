@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Visualize patch tokens retained by temporal representatives and FastVGGT.
+
+The script runs one sampled sequence with the same 512/max-size preprocessing
+used by the paper evaluators.  It records the temporal representative mapping
+and the actual FastVGGT merge trace from the last global attention block, then
+renders the retained/merged patch mask over one input frame.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import types
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image, ImageDraw
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from vggt_omega.models import VGGTOmega
+from vggt_omega.utils.load_fn import load_and_preprocess_images
+
+
+def load_model(checkpoint: Path, mode: str, device: torch.device) -> VGGTOmega:
+    if mode == "temporal090":
+        kwargs = {
+            "merge_ratio": 0.0,
+            "frame_fusion_mode": "temporal-representative",
+            "frame_fusion_start_layer": -1,
+            "frame_fusion_target_keep_threshold": 0.90,
+        }
+    elif mode == "fastvggt":
+        kwargs = {"merge_ratio": 0.9}
+    else:
+        raise ValueError(f"unsupported mode: {mode}")
+
+    model = VGGTOmega(first_frame_token_indices=(0,), **kwargs)
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
+    if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
+        state = state["model"]
+    if state and all(key.startswith("module.") for key in state):
+        state = {key.removeprefix("module."): value for key, value in state.items()}
+    model.load_state_dict(state, strict=True)
+    del state
+    return model.to(device).eval()
+
+
+def capture_temporal_plan(model: VGGTOmega, captured: dict[str, object]) -> None:
+    aggregator = model.aggregator
+    original = aggregator._build_temporal_representative_plans
+
+    def wrapped(self, tokens: torch.Tensor, *, source_layer: int):
+        plans = original(tokens, source_layer=source_layer)
+        captured["plans"] = plans
+        return plans
+
+    aggregator._build_temporal_representative_plans = types.MethodType(wrapped, aggregator)
+
+
+def capture_fast_merge_traces(model: VGGTOmega) -> None:
+    for block in model.aggregator.inter_frame_blocks:
+        block.attn.record_merge_trace = True
+
+
+def image_from_tensor(image: torch.Tensor) -> Image.Image:
+    array = image.detach().float().cpu().clamp(0.0, 1.0).permute(1, 2, 0).numpy()
+    return Image.fromarray(np.uint8(np.round(array * 255.0)), mode="RGB")
+
+
+def temporal_mask(model: VGGTOmega, captured: dict[str, object], frame_index: int, patch_count: int):
+    plans = captured.get("plans")
+    if not plans:
+        raise RuntimeError("temporal representative plan was not captured")
+    plan = plans[0]
+    mapping = plan.position_to_representative.detach().cpu().long().numpy()
+    source_indices = plan.representative_source_indices.detach().cpu().long().numpy()
+    representative_source = source_indices[mapping[frame_index]]
+    own_source = (representative_source // patch_count) == frame_index
+    return own_source.astype(bool), {
+        "retained_patch_tokens": int(own_source.sum()),
+        "full_patch_tokens": int(patch_count),
+        "representative_patch_tokens_total": int(source_indices.size),
+    }
+
+
+def fast_mask(model: VGGTOmega, frame_index: int, patch_count: int, num_frames: int, num_special: int):
+    traces = []
+    for layer, block in enumerate(model.aggregator.inter_frame_blocks):
+        selected = getattr(block.attn, "last_merge_source_indices", None)
+        if selected is None:
+            continue
+        selected = selected.detach().cpu().long().reshape(-1).numpy()
+        traces.append((layer, selected))
+    if not traces:
+        raise RuntimeError("FastVGGT merge trace was not captured")
+
+    layer, selected = traces[-1]
+    start = frame_index * (patch_count + num_special) + num_special
+    positions = np.arange(start, start + patch_count)
+    retained = ~np.isin(positions, selected)
+    total_tokens = num_frames * (patch_count + num_special)
+    all_patch_positions = np.concatenate(
+        [
+            np.arange(frame * (patch_count + num_special) + num_special,
+                      frame * (patch_count + num_special) + num_special + patch_count)
+            for frame in range(num_frames)
+        ]
+    )
+    retained_patch_tokens_total = int((~np.isin(all_patch_positions, selected)).sum())
+    return retained, {
+        "retained_patch_tokens": int(retained.sum()),
+        "full_patch_tokens": int(patch_count),
+        "retained_patch_tokens_total": retained_patch_tokens_total,
+        "full_patch_tokens_total": int(num_frames * patch_count),
+        "patch_retention_vs_full_total": float(
+            retained_patch_tokens_total / max(num_frames * patch_count, 1)
+        ),
+        "retained_all_tokens": int(total_tokens - selected.size),
+        "full_all_tokens": int(total_tokens),
+        "last_global_layer": int(layer),
+        "merged_source_tokens": int(selected.size),
+        "global_layers": [
+            {
+                "layer": int(layer_index),
+                "retained_all_tokens": int(total_tokens - values.size),
+                "retention_vs_full": float((total_tokens - values.size) / total_tokens),
+            }
+            for layer_index, values in traces
+        ],
+    }
+
+
+def render_overlay(image: Image.Image, mask: np.ndarray, title: str, output: Path) -> None:
+    width, height = image.size
+    patch_h = int(round(height / 16))
+    patch_w = int(round(width / 16))
+    if patch_h * patch_w != mask.size:
+        raise ValueError(f"image grid {patch_h}x{patch_w} does not match {mask.size} tokens")
+
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    for index, retained in enumerate(mask.reshape(patch_h, patch_w).flat):
+        row, col = divmod(index, patch_w)
+        left, top = col * 16, row * 16
+        right, bottom = (col + 1) * 16, (row + 1) * 16
+        color = (30, 190, 80, 145) if retained else (220, 55, 55, 120)
+        draw.rectangle((left, top, right - 1, bottom - 1), fill=color, outline=(255, 255, 255, 100))
+
+    composite = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+    canvas = Image.new("RGB", (width, height + 38), "white")
+    canvas.paste(composite, (0, 38))
+    text = ImageDraw.Draw(canvas)
+    text.text((8, 10), title, fill="black")
+    canvas.save(output)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--sampled-frames", type=Path, required=True)
+    parser.add_argument("--sequence", required=True)
+    parser.add_argument("--frame-index", type=int, default=150)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--device", default="cuda:0")
+    args = parser.parse_args()
+
+    sampled = json.loads(args.sampled_frames.read_text())
+    if args.sequence not in sampled:
+        raise KeyError(f"sequence not found: {args.sequence}")
+    paths = sampled[args.sequence]["rgb_paths"]
+    if not 0 <= args.frame_index < len(paths):
+        raise IndexError(f"frame index {args.frame_index} outside [0, {len(paths)})")
+
+    device = torch.device(args.device)
+    images = load_and_preprocess_images(paths, mode="max_size", image_resolution=512)
+    num_frames, _, height, width = images.shape
+    patch_h, patch_w = height // 16, width // 16
+    patch_count = patch_h * patch_w
+    num_special = 17  # one camera token plus sixteen register tokens
+    source_image = image_from_tensor(images[args.frame_index])
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    metadata: dict[str, object] = {
+        "sequence": args.sequence,
+        "input_frame_index": args.frame_index,
+        "num_frames": num_frames,
+        "image_shape": [height, width],
+        "patch_grid": [patch_h, patch_w],
+        "patch_tokens_per_frame": patch_count,
+    }
+
+    for mode in ("temporal090", "fastvggt"):
+        captured: dict[str, object] = {}
+        model = load_model(args.checkpoint, mode, device)
+        if mode == "temporal090":
+            capture_temporal_plan(model, captured)
+        else:
+            capture_fast_merge_traces(model)
+        with torch.inference_mode():
+            model(images.to(device, non_blocking=True))
+        if mode == "temporal090":
+            mask, stats = temporal_mask(model, captured, args.frame_index, patch_count)
+        else:
+            mask, stats = fast_mask(model, args.frame_index, patch_count, num_frames, num_special)
+        stats["patch_retention_vs_full"] = float(mask.mean())
+        metadata[mode] = stats
+        render_overlay(
+            source_image,
+            mask,
+            f"{mode}: green=retained, red=merged | frame={args.frame_index} | {mask.sum()}/{mask.size}",
+            args.output_dir / f"{mode}_frame{args.frame_index:03d}_overlay.png",
+        )
+        del model
+        torch.cuda.empty_cache()
+
+    (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(json.dumps(metadata, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

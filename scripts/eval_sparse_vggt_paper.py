@@ -25,6 +25,7 @@ from sparse_vggt.models.vggt import sparse_aggregator_from_vggt
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt_omega.utils.frame_sampling import SAMPLING_STRATEGIES
 
 
 DEFAULT_VGGT_CHECKPOINT = VGGT_ROOT / "ckpt" / "model.pt"
@@ -39,6 +40,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-frames", type=int, default=10)
+    parser.add_argument(
+        "--sampling-strategy",
+        choices=SAMPLING_STRATEGIES,
+        default="uniform",
+        help=(
+            "Frame selection strategy. 'uniform' is the default and preserves "
+            "first/last frames while sampling the middle evenly; 'random' keeps "
+            "the paper-style seeded protocol."
+        ),
+    )
     parser.add_argument("--sequences", nargs="*", default=None)
     parser.add_argument("--timing-repeats", type=int, default=3)
     parser.add_argument("--preprocess-mode", choices=("crop", "pad"), default="crop")
@@ -96,9 +107,16 @@ def build_sample(args: argparse.Namespace):
             records = seven_eval.load_frame_records(sequence_dir)
             pools[sequence_name] = records
             print(f"{sequence_name}: sampling pool has {len(records)} frames")
-        sampled, sampled_indices = seven_eval.sample_records(pools, args.num_frames, args.seed)
+        sampled, sampled_indices = seven_eval.sample_records(
+            pools,
+            args.num_frames,
+            args.seed,
+            strategy=args.sampling_strategy,
+        )
         selection = {
             name: {
+                "sampling_strategy": args.sampling_strategy,
+                "sampling_pool_size": len(pools[name]),
                 "pool_indices": sampled_indices[name],
                 "frame_indices": [record.index for record in records],
                 "rgb_paths": [str(record.rgb_path) for record in records],
@@ -116,9 +134,16 @@ def build_sample(args: argparse.Namespace):
             records = tum_eval.restrict_to_rgb90(records, sequence_dir, args.association_tolerance)
         pools[sequence_dir.name] = records
         print(f"{sequence_dir.name}: sampling pool has {len(records)} RGB/pose/depth frames")
-    sampled, sampled_indices = tum_eval.sample_records(pools, args.num_frames, args.seed)
+    sampled, sampled_indices = tum_eval.sample_records(
+        pools,
+        args.num_frames,
+        args.seed,
+        strategy=args.sampling_strategy,
+    )
     selection = {
         name: {
+            "sampling_strategy": args.sampling_strategy,
+            "sampling_pool_size": len(pools[name]),
             "pool_indices": sampled_indices[name],
             "rgb_timestamps": [record.rgb_timestamp for record in records],
             "rgb_paths": [str(record.rgb_path) for record in records],
@@ -250,6 +275,7 @@ def main() -> int:
             "model": "VGGT" if args.disable_sparse else "VGGT+sparse-vggt",
             "dataset": args.dataset,
             "seed": args.seed,
+            "sampling_strategy": args.sampling_strategy,
             "num_frames_per_sequence": args.num_frames,
             "preprocess_mode": args.preprocess_mode,
             "sparse_attention": not args.disable_sparse,

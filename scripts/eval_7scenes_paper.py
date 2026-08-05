@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Evaluate VGGT-Omega on 7 Scenes with the paper's 10-view protocol.
+"""Evaluate VGGT-Omega on 7 Scenes.
 
 The VGGT-Omega paper samples 10 frames per scene/sequence and reports pairwise
 relative-pose AUC plus scale-aligned depth metrics.  The paper does not publish
-the sampled frame IDs, so this implementation uses the same deterministic
-RandomState(42) convention as the public VGGT evaluation code and saves the
-selection alongside the metrics.
+the sampled frame IDs.  This evaluator defaults to first/last-preserving uniform
+sampling for long-sequence experiments; pass ``--sampling-strategy random`` to
+use the deterministic RandomState(42) convention from public VGGT loaders.
 
 The dataset must contain RGB-registered ``*.depth.proj.png`` maps.  These can be
 generated once by FastVGGT's ``scripts/prepare_7scenes.py``; this evaluator only
@@ -34,9 +34,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vggt_omega.models import VGGTOmega
+from vggt_omega.utils.frame_sampling import SAMPLING_STRATEGIES, sample_record_pools
 from vggt_omega.utils.gpu_guard import assert_exclusive_gpu
 from vggt_omega.utils.load_fn import load_and_preprocess_images
 from vggt_omega.utils.pose_enc import encoding_to_camera
+from vggt_omega.utils.reference_frame import (
+    resolve_first_frame_token_indices,
+    reference_first_order,
+    reorder_reference_first,
+    resolve_reference_frame_index,
+)
 
 
 DEFAULT_DATA_ROOT = Path("/data/mmc_lyxiang/dataset/7scenes")
@@ -97,6 +104,136 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-frames", type=int, default=10)
+    parser.add_argument(
+        "--sampling-strategy",
+        choices=SAMPLING_STRATEGIES,
+        default="uniform",
+        help=(
+            "Frame selection strategy. 'uniform' is the default and preserves the "
+            "first/last pool frames while sampling the middle evenly; 'random' "
+            "keeps the paper-style seeded protocol."
+        ),
+    )
+    parser.add_argument(
+        "--reference-frame-index",
+        type=int,
+        default=0,
+        help=(
+            "Index in the sampled frame list to move to model input position 0. "
+            "Original VGGT-Omega uses position-0 camera/register tokens as the "
+            "reference-frame distinction. Negative values follow Python indexing."
+        ),
+    )
+    parser.add_argument(
+        "--first-frame-token-indices",
+        default="0",
+        help=(
+            "Input positions that receive the learned position-0 camera/register "
+            "tokens. Use comma-separated indices, ranges, 'uniform:N', or 'all'. "
+            "Position 0 must be included. Default '0' is original VGGT-Omega."
+        ),
+    )
+    parser.add_argument(
+        "--frame-fusion-mode",
+        choices=(
+            "none",
+            "dp-medoid",
+            "pair-top-percent",
+            "group-top-percent",
+            "sequential-group",
+            "sequential-group-average",
+            "temporal-representative",
+        ),
+        default="none",
+        help="Enable frame fusion. Default keeps original VGGT-Omega behavior.",
+    )
+    parser.add_argument(
+        "--frame-fusion-k",
+        type=int,
+        default=None,
+        help="Number of frame groups for DP medoid fusion, e.g. 80 for 300 input frames.",
+    )
+    parser.add_argument(
+        "--frame-fusion-max-group-size",
+        type=int,
+        default=5,
+        help="Maximum number of original frames per frame-fusion group.",
+    )
+    parser.add_argument(
+        "--frame-fusion-beta",
+        type=float,
+        default=1.0,
+        help="Weight on max distance inside the DP medoid group cost.",
+    )
+    parser.add_argument(
+        "--frame-fusion-start-layer",
+        type=int,
+        default=-1,
+        help="-1 fuses before inter-frame block 0; non-negative values fuse after that block.",
+    )
+    parser.add_argument(
+        "--frame-fusion-pair-percent",
+        type=float,
+        default=25.0,
+        help=(
+            "Top percent of nearest-neighbor frame-pair candidates. pair-top-percent "
+            "uses disjoint pairs; group-top-percent joins overlapping candidates into groups; "
+            "sequential-group builds groups in frame order; sequential-group-average "
+            "uses group-mean shared tokens; temporal-representative builds a sequential "
+            "per-position temporal representative dictionary."
+        ),
+    )
+    parser.add_argument(
+        "--frame-fusion-pool-size",
+        type=int,
+        default=2,
+        help="Spatial average-pooling kernel/stride used to build frame representations for pair fusion.",
+    )
+    parser.add_argument(
+        "--frame-fusion-group-similarity-threshold",
+        type=float,
+        default=0.0,
+        help="Frame-level all-members threshold for sequential-group fusion.",
+    )
+    parser.add_argument(
+        "--frame-fusion-target-keep-policy",
+        choices=("none", "random-grid", "least-similar", "similarity-threshold"),
+        default="none",
+        help="Retain selected target-frame patch tokens instead of fusing the entire paired target frame.",
+    )
+    parser.add_argument(
+        "--frame-fusion-target-keep-grid-size",
+        type=int,
+        default=4,
+        help="Patch-grid block size for random-grid target patch retention.",
+    )
+    parser.add_argument(
+        "--frame-fusion-target-keep-percent",
+        type=float,
+        default=0.0,
+        help="Target patch percentage retained for least-similar retention.",
+    )
+    parser.add_argument(
+        "--frame-fusion-target-keep-threshold",
+        type=float,
+        default=0.0,
+        help="Cosine similarity threshold for similarity-threshold target patch retention.",
+    )
+    parser.add_argument(
+        "--frame-fusion-target-keep-seed",
+        type=int,
+        default=33,
+        help="Random seed for random-grid target patch retention.",
+    )
+    parser.add_argument(
+        "--frame-fusion-recompute-each-global",
+        action="store_true",
+        help=(
+            "For pair-top-percent fusion, recompute frame pairs and target kept "
+            "patches after every frame-attention block, immediately before each "
+            "global inter-frame attention block."
+        ),
+    )
     parser.add_argument(
         "--sampling-unit",
         choices=("scene", "sequence"),
@@ -586,26 +723,35 @@ def load_frame_records(sequence_dir: Path) -> list[FrameRecord]:
 
 
 def sample_records(
-    pools: dict[str, list[FrameRecord]], num_frames: int, seed: int
+    pools: dict[str, list[FrameRecord]],
+    num_frames: int,
+    seed: int,
+    strategy: str = "uniform",
 ) -> tuple[dict[str, list[FrameRecord]], dict[str, list[int]]]:
-    # This matches np.random.seed(seed) followed by sequential np.random.choice
-    # calls, as used by the public VGGT/Pi3 evaluation implementations.
-    rng = np.random.RandomState(seed)
-    sampled: dict[str, list[FrameRecord]] = {}
-    sampled_indices: dict[str, list[int]] = {}
-    for sequence_name, records in pools.items():
-        if len(records) < num_frames:
-            raise ValueError(f"{sequence_name}: only {len(records)} frames, need {num_frames}")
-        pool_indices = rng.choice(len(records), num_frames, replace=False).tolist()
-        sampled_indices[sequence_name] = pool_indices
-        sampled[sequence_name] = [records[index] for index in pool_indices]
-    return sampled, sampled_indices
+    # The random strategy matches np.random.seed(seed) followed by sequential
+    # np.random.choice calls, as used by public VGGT/Pi3 evaluation loaders.
+    return sample_record_pools(pools, num_frames, seed, strategy=strategy)
 
 
 def load_model(
     checkpoint: Path,
     device: torch.device,
     merge_ratio: float,
+    first_frame_token_indices: tuple[int, ...],
+    frame_fusion_mode: str,
+    frame_fusion_k: int | None,
+    frame_fusion_max_group_size: int,
+    frame_fusion_beta: float,
+    frame_fusion_start_layer: int,
+    frame_fusion_pair_percent: float,
+    frame_fusion_pool_size: int,
+    frame_fusion_group_similarity_threshold: float,
+    frame_fusion_target_keep_policy: str,
+    frame_fusion_target_keep_grid_size: int,
+    frame_fusion_target_keep_percent: float,
+    frame_fusion_target_keep_threshold: float,
+    frame_fusion_target_keep_seed: int,
+    frame_fusion_recompute_each_global: bool,
     sparse_attention: bool,
     sparse_ratio: float | None,
     sparse_cdf_threshold: float | None,
@@ -650,6 +796,21 @@ def load_model(
     # the model constructor's default.  Zero is the unmodified paper model.
     model_kwargs = {
         "merge_ratio": merge_ratio,
+        "first_frame_token_indices": first_frame_token_indices,
+        "frame_fusion_mode": frame_fusion_mode,
+        "frame_fusion_k": frame_fusion_k,
+        "frame_fusion_max_group_size": frame_fusion_max_group_size,
+        "frame_fusion_beta": frame_fusion_beta,
+        "frame_fusion_start_layer": frame_fusion_start_layer,
+        "frame_fusion_pair_percent": frame_fusion_pair_percent,
+        "frame_fusion_pool_size": frame_fusion_pool_size,
+        "frame_fusion_group_similarity_threshold": frame_fusion_group_similarity_threshold,
+        "frame_fusion_target_keep_policy": frame_fusion_target_keep_policy,
+        "frame_fusion_target_keep_grid_size": frame_fusion_target_keep_grid_size,
+        "frame_fusion_target_keep_percent": frame_fusion_target_keep_percent,
+        "frame_fusion_target_keep_threshold": frame_fusion_target_keep_threshold,
+        "frame_fusion_target_keep_seed": frame_fusion_target_keep_seed,
+        "frame_fusion_recompute_each_global": frame_fusion_recompute_each_global,
         "sparse_attention": sparse_attention,
         "sparse_ratio": sparse_ratio,
         "sparse_cdf_threshold": sparse_cdf_threshold,
@@ -822,6 +983,18 @@ def main() -> int:
     args = parse_args()
     if args.num_frames < 2:
         raise ValueError("--num-frames must be at least 2")
+    resolved_reference_frame_index = resolve_reference_frame_index(
+        args.reference_frame_index,
+        args.num_frames,
+    )
+    input_order_from_sample = reference_first_order(
+        args.num_frames,
+        resolved_reference_frame_index,
+    )
+    first_frame_token_indices = resolve_first_frame_token_indices(
+        args.first_frame_token_indices,
+        args.num_frames,
+    )
     if args.timing_repeats < 1:
         raise ValueError("--timing-repeats must be at least 1")
     if args.image_resolution <= 0 or args.image_resolution % 16:
@@ -830,6 +1003,48 @@ def main() -> int:
         raise ValueError("Depth range must satisfy 0 < --min-depth < --max-depth")
     if not 0.0 <= args.merge_ratio <= 1.0:
         raise ValueError("--merge-ratio must be in [0, 1]")
+    if args.frame_fusion_mode == "dp-medoid":
+        if args.frame_fusion_k is None:
+            raise ValueError("--frame-fusion-k is required when --frame-fusion-mode dp-medoid")
+        if args.frame_fusion_k <= 0:
+            raise ValueError("--frame-fusion-k must be positive")
+        if args.frame_fusion_max_group_size <= 0:
+            raise ValueError("--frame-fusion-max-group-size must be positive")
+        if args.frame_fusion_beta < 0.0:
+            raise ValueError("--frame-fusion-beta must be non-negative")
+        if args.frame_fusion_k > args.num_frames:
+            raise ValueError("--frame-fusion-k must be <= --num-frames")
+        if args.num_frames > args.frame_fusion_k * args.frame_fusion_max_group_size:
+            raise ValueError("--frame-fusion-k * --frame-fusion-max-group-size must cover --num-frames")
+    elif args.frame_fusion_mode in {
+        "pair-top-percent",
+        "group-top-percent",
+        "sequential-group",
+        "sequential-group-average",
+        "temporal-representative",
+    }:
+        if not 0.0 < args.frame_fusion_pair_percent <= 100.0:
+            raise ValueError("--frame-fusion-pair-percent must be in (0, 100]")
+        if args.frame_fusion_pool_size <= 0:
+            raise ValueError("--frame-fusion-pool-size must be positive")
+        if args.frame_fusion_target_keep_grid_size <= 0:
+            raise ValueError("--frame-fusion-target-keep-grid-size must be positive")
+        if not 0.0 <= args.frame_fusion_target_keep_percent <= 100.0:
+            raise ValueError("--frame-fusion-target-keep-percent must be in [0, 100]")
+        if (
+            args.frame_fusion_target_keep_policy == "least-similar"
+            and args.frame_fusion_target_keep_percent <= 0.0
+        ):
+            raise ValueError("--frame-fusion-target-keep-percent must be positive for least-similar")
+        if not -1.0 <= args.frame_fusion_target_keep_threshold <= 1.0:
+            raise ValueError("--frame-fusion-target-keep-threshold must be in [-1, 1]")
+        if not -1.0 <= args.frame_fusion_group_similarity_threshold <= 1.0:
+            raise ValueError("--frame-fusion-group-similarity-threshold must be in [-1, 1]")
+    if args.frame_fusion_recompute_each_global and args.frame_fusion_mode != "pair-top-percent":
+        raise ValueError("--frame-fusion-recompute-each-global requires --frame-fusion-mode pair-top-percent")
+    if args.frame_fusion_mode != "none":
+        if args.merge_ratio != 0.0:
+            raise ValueError("frame fusion requires --merge-ratio 0")
     if args.sparse_attention and args.merge_ratio > 0.0:
         raise ValueError("--sparse-attention requires --merge-ratio 0; sparse attention replaces token merging")
     if args.sparse_attention and args.sparse_ratio is None and args.sparse_cdf_threshold is None:
@@ -886,10 +1101,32 @@ def main() -> int:
     for pool_name, records in pools.items():
         print(f"{pool_name}: sampling pool has {len(records)} frames")
 
-    sampled, sampled_pool_indices = sample_records(pools, args.num_frames, args.seed)
+    sampled, sampled_pool_indices = sample_records(
+        pools,
+        args.num_frames,
+        args.seed,
+        strategy=args.sampling_strategy,
+    )
+    sampled_input_pool_indices = {
+        name: [sampled_pool_indices[name][index] for index in input_order_from_sample]
+        for name in sampled
+    }
+    sampled = {
+        name: reorder_reference_first(records, resolved_reference_frame_index)
+        for name, records in sampled.items()
+    }
     selection = {
         name: {
-            "pool_indices": sampled_pool_indices[name],
+            "sampling_strategy": args.sampling_strategy,
+            "sampling_pool_size": len(pools[name]),
+            "pool_indices": sampled_input_pool_indices[name],
+            "original_sample_order_pool_indices": sampled_pool_indices[name],
+            "input_order_from_original_sample": input_order_from_sample,
+            "reference_frame_original_sample_index": resolved_reference_frame_index,
+            "reference_pool_index": sampled_pool_indices[name][resolved_reference_frame_index],
+            "reference_frame_index": records[0].index,
+            "reference_frame_input_index": 0,
+            "first_frame_token_input_indices": list(first_frame_token_indices),
             "frame_indices": [record.index for record in records],
             "rgb_paths": [str(record.rgb_path) for record in records],
             "depth_paths": [str(record.depth_path) for record in records],
@@ -942,6 +1179,21 @@ def main() -> int:
         args.checkpoint,
         device,
         args.merge_ratio,
+        first_frame_token_indices,
+        args.frame_fusion_mode,
+        args.frame_fusion_k,
+        args.frame_fusion_max_group_size,
+        args.frame_fusion_beta,
+        args.frame_fusion_start_layer,
+        args.frame_fusion_pair_percent,
+        args.frame_fusion_pool_size,
+        args.frame_fusion_group_similarity_threshold,
+        args.frame_fusion_target_keep_policy,
+        args.frame_fusion_target_keep_grid_size,
+        args.frame_fusion_target_keep_percent,
+        args.frame_fusion_target_keep_threshold,
+        args.frame_fusion_target_keep_seed,
+        args.frame_fusion_recompute_each_global,
         args.sparse_attention,
         args.sparse_ratio,
         args.sparse_cdf_threshold,
@@ -1125,6 +1377,80 @@ def main() -> int:
             "model_latency_ms": None if args.skip_timing else float(np.median(timings_ms)),
             "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3),
         }
+        if model.aggregator.last_frame_fusion_debug:
+            debug = model.aggregator.last_frame_fusion_debug
+            row["frame_fusion_num_groups"] = debug.get("num_groups")
+            row["frame_fusion_num_fused_frames"] = debug.get("num_fused_frames")
+            row["frame_fusion_partition_seconds"] = debug.get("partition_seconds")
+            row["frame_fusion_fusion_seconds"] = debug.get("fusion_seconds")
+            batches = debug.get("batches") or []
+            first_batch = batches[0] if batches else {}
+            row["frame_fusion_selected_pairs"] = debug.get(
+                "avg_selected_pairs",
+                first_batch.get("selected_pairs"),
+            )
+            row["frame_fusion_selected_groups"] = debug.get(
+                "avg_selected_groups",
+                first_batch.get("selected_groups"),
+            )
+            row["frame_fusion_effective_anchor_target_relations"] = first_batch.get(
+                "effective_anchor_target_relations"
+            )
+            row["frame_fusion_group_size_min"] = first_batch.get("group_size_min")
+            row["frame_fusion_group_size_max"] = first_batch.get("group_size_max")
+            row["frame_fusion_group_size_mean"] = first_batch.get("group_size_mean")
+            row["frame_fusion_group_partition"] = first_batch.get("group_partition")
+            row["frame_fusion_full_partition"] = first_batch.get("full_partition")
+            row["frame_fusion_full_partition_groups"] = first_batch.get("full_partition_groups")
+            row["frame_fusion_singleton_partition_groups"] = first_batch.get(
+                "singleton_partition_groups"
+            )
+            row["frame_fusion_full_partition"] = first_batch.get("full_partition")
+            row["frame_fusion_full_partition_groups"] = first_batch.get("full_partition_groups")
+            row["frame_fusion_singleton_partition_groups"] = first_batch.get(
+                "singleton_partition_groups"
+            )
+            row["frame_fusion_original_pair_partition"] = first_batch.get(
+                "original_pair_partition"
+            )
+            row["frame_fusion_attention_tokens"] = debug.get(
+                "avg_attention_tokens",
+                first_batch.get("attention_tokens"),
+            )
+            row["frame_fusion_patch_retention_vs_full"] = debug.get(
+                "avg_patch_token_retention_vs_full",
+                debug.get("patch_token_retention_vs_full"),
+            )
+            row["frame_fusion_target_keep_policy"] = debug.get("target_keep_policy")
+            row["frame_fusion_target_keep_threshold"] = debug.get("target_keep_threshold")
+            row["frame_fusion_target_keep_patch_tokens_per_pair"] = first_batch.get(
+                "target_keep_patch_tokens_per_pair"
+            )
+            row["frame_fusion_target_keep_patch_tokens_min"] = first_batch.get(
+                "target_keep_patch_tokens_min"
+            )
+            row["frame_fusion_target_keep_patch_tokens_max"] = first_batch.get(
+                "target_keep_patch_tokens_max"
+            )
+            row["frame_fusion_target_keep_patch_tokens_total"] = first_batch.get(
+                "target_keep_patch_tokens_total"
+            )
+            row["frame_fusion_recompute_each_global"] = debug.get("recompute_each_global")
+            row["frame_fusion_num_recomputed_layers"] = debug.get("num_recomputed_layers")
+            if args.frame_fusion_mode == "temporal-representative":
+                first_batch = (debug.get("batches") or [{}])[0]
+                row["frame_fusion_representative_count"] = first_batch.get("representative_count")
+                row["frame_fusion_representative_weight_min"] = first_batch.get(
+                    "representative_weight_min"
+                )
+                row["frame_fusion_representative_weight_max"] = first_batch.get(
+                    "representative_weight_max"
+                )
+                row["frame_fusion_representative_weight_mean"] = first_batch.get(
+                    "representative_weight_mean"
+                )
+                row["frame_fusion_mapping_checksum"] = first_batch.get("mapping_checksum")
+                row["frame_fusion_mapping_shape"] = first_batch.get("mapping_shape")
         per_sequence.append(row)
         latency_text = "skipped" if args.skip_timing else f"{row['model_latency_ms']:.1f}ms"
         print(
@@ -1154,7 +1480,17 @@ def main() -> int:
         "protocol": {
             "dataset_split": "official TestSplit.txt files",
             "sampling_unit": args.sampling_unit,
+            "sampling_strategy": args.sampling_strategy,
             "seed": args.seed,
+            "reference_frame_index": args.reference_frame_index,
+            "resolved_reference_frame_index": resolved_reference_frame_index,
+            "reference_frame_ordering": "stable_front_from_sampled_order",
+            "reference_frame_semantics": (
+                "sampled frame moved to model input position 0; original "
+                "VGGT-Omega assigns position-0 camera/register tokens"
+            ),
+            "first_frame_token_indices": list(first_frame_token_indices),
+            "first_frame_token_index_spec": args.first_frame_token_indices,
             "num_frames_per_sequence": args.num_frames,
             "num_sequences": len(sampled),
             "num_pose_pairs": len(rotation_errors),
@@ -1165,6 +1501,22 @@ def main() -> int:
             "max_depth_m": args.max_depth,
             "prediction_clip_m": [args.min_depth, args.max_depth],
             "merge_ratio": args.merge_ratio,
+            "frame_fusion": {
+                "mode": args.frame_fusion_mode,
+                "k": args.frame_fusion_k,
+                "max_group_size": args.frame_fusion_max_group_size,
+                "beta": args.frame_fusion_beta,
+                "start_layer": args.frame_fusion_start_layer,
+                "pair_percent": args.frame_fusion_pair_percent,
+                "pool_size": args.frame_fusion_pool_size,
+                "group_similarity_threshold": args.frame_fusion_group_similarity_threshold,
+                "target_keep_policy": args.frame_fusion_target_keep_policy,
+                "target_keep_grid_size": args.frame_fusion_target_keep_grid_size,
+                "target_keep_percent": args.frame_fusion_target_keep_percent,
+                "target_keep_threshold": args.frame_fusion_target_keep_threshold,
+                "target_keep_seed": args.frame_fusion_target_keep_seed,
+                "recompute_each_global": args.frame_fusion_recompute_each_global,
+            },
             "sparse_attention": args.sparse_attention,
             "sparse_ratio": args.sparse_ratio,
             "sparse_cdf_threshold": args.sparse_cdf_threshold,
