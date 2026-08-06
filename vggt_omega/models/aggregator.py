@@ -5,9 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 from pathlib import Path
+import heapq
 import time
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -152,6 +154,7 @@ class Aggregator(nn.Module):
         frame_fusion_target_keep_threshold: float = 0.0,
         frame_fusion_target_keep_seed: int = 33,
         frame_fusion_recompute_each_global: bool = False,
+        frame_fusion_lambda_cost: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -356,6 +359,7 @@ class Aggregator(nn.Module):
             target_keep_threshold=frame_fusion_target_keep_threshold,
             target_keep_seed=frame_fusion_target_keep_seed,
             recompute_each_global=frame_fusion_recompute_each_global,
+            lambda_cost=frame_fusion_lambda_cost,
         )
 
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
@@ -502,6 +506,7 @@ class Aggregator(nn.Module):
         target_keep_threshold: float = 0.0,
         target_keep_seed: int = 33,
         recompute_each_global: bool = False,
+        lambda_cost: float = 1.0,
     ) -> None:
         mode = mode.replace("_", "-")
         valid_modes = {
@@ -512,6 +517,7 @@ class Aggregator(nn.Module):
             "sequential-group",
             "sequential-group-average",
             "temporal-representative",
+            "adaptive-temporal-representative",
         }
         if mode not in valid_modes:
             raise ValueError(f"frame_fusion_mode must be one of {sorted(valid_modes)}, got {mode!r}")
@@ -565,6 +571,9 @@ class Aggregator(nn.Module):
             )
         target_keep_seed = int(target_keep_seed)
         recompute_each_global = bool(recompute_each_global)
+        lambda_cost = float(lambda_cost)
+        if lambda_cost < 0.0:
+            raise ValueError(f"frame_fusion_lambda_cost must be non-negative, got {lambda_cost}")
         if mode == "dp-medoid":
             if num_groups is None:
                 raise ValueError("frame_fusion_k is required when frame_fusion_mode='dp-medoid'")
@@ -591,6 +600,7 @@ class Aggregator(nn.Module):
             "sequential-group",
             "sequential-group-average",
             "temporal-representative",
+            "adaptive-temporal-representative",
         }:
             num_groups = None
             if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio):
@@ -630,6 +640,7 @@ class Aggregator(nn.Module):
         self.frame_fusion_target_keep_threshold = target_keep_threshold
         self.frame_fusion_target_keep_seed = target_keep_seed
         self.frame_fusion_recompute_each_global = recompute_each_global
+        self.frame_fusion_lambda_cost = lambda_cost
         self.last_frame_fusion_debug.clear()
         self._frame_fusion_debug_layers.clear()
 
@@ -1115,13 +1126,22 @@ class Aggregator(nn.Module):
                 source_layer=-1,
             )
         elif (
-            self.frame_fusion_mode == "temporal-representative"
+            self.frame_fusion_mode in {
+                "temporal-representative",
+                "adaptive-temporal-representative",
+            }
             and self.frame_fusion_start_layer == -1
         ):
-            temporal_representative_plans = self._build_temporal_representative_plans(
-                tokens,
-                source_layer=-1,
-            )
+            if self.frame_fusion_mode == "adaptive-temporal-representative":
+                temporal_representative_plans = self._build_adaptive_temporal_representative_plans(
+                    tokens,
+                    source_layer=-1,
+                )
+            else:
+                temporal_representative_plans = self._build_temporal_representative_plans(
+                    tokens,
+                    source_layer=-1,
+                )
         tokens = tokens.view(batch_size * num_frames, num_tokens, embed_dim)
 
         for block_idx in range(self.depth):
@@ -1165,14 +1185,23 @@ class Aggregator(nn.Module):
                 )
                 current_pair_plans = frame_fusion_pair_plans
             elif (
-                self.frame_fusion_mode == "temporal-representative"
+                self.frame_fusion_mode in {
+                    "temporal-representative",
+                    "adaptive-temporal-representative",
+                }
                 and temporal_representative_plans is None
                 and self.frame_fusion_start_layer == block_idx
             ):
-                temporal_representative_plans = self._build_temporal_representative_plans(
-                    frame_tokens,
-                    source_layer=block_idx,
-                )
+                if self.frame_fusion_mode == "adaptive-temporal-representative":
+                    temporal_representative_plans = self._build_adaptive_temporal_representative_plans(
+                        frame_tokens,
+                        source_layer=block_idx,
+                    )
+                else:
+                    temporal_representative_plans = self._build_temporal_representative_plans(
+                        frame_tokens,
+                        source_layer=block_idx,
+                    )
                 current_temporal_plans = temporal_representative_plans
             tokens = self._run_inter_frame_attention_block(
                 tokens,
@@ -1681,14 +1710,10 @@ class Aggregator(nn.Module):
         debug_batches: list[dict[str, object]] = []
 
         for batch_index in range(batch_size):
-            current_memory = patch_tokens[batch_index, 0].float()
-            current_memory_norm = torch.nn.functional.normalize(
-                current_memory,
-                p=2,
-                dim=-1,
-                eps=1e-8,
-            )
-            current_representatives = torch.arange(
+            # Frame 0 remains a complete VGGT reference frame.  It contributes
+            # standalone attention tokens, but frame 1 initializes the temporal
+            # representative dictionary used for subsequent sharing.
+            reference_representatives = torch.arange(
                 patch_count,
                 device=tokens.device,
                 dtype=torch.long,
@@ -1699,9 +1724,44 @@ class Aggregator(nn.Module):
             representative_weights = [
                 torch.ones(patch_count, device=tokens.device, dtype=torch.float32)
             ]
-            mapping_rows = [current_representatives.clone()]
+            mapping_rows = [reference_representatives.clone()]
 
-            for frame_index in range(1, num_frames):
+            if num_frames == 1:
+                current_memory = patch_tokens[batch_index, 0].float()
+                current_memory_norm = torch.nn.functional.normalize(
+                    current_memory,
+                    p=2,
+                    dim=-1,
+                    eps=1e-8,
+                )
+                current_representatives = reference_representatives
+            else:
+                current_memory = patch_tokens[batch_index, 1].float()
+                current_memory_norm = torch.nn.functional.normalize(
+                    current_memory,
+                    p=2,
+                    dim=-1,
+                    eps=1e-8,
+                )
+                current_representatives = torch.arange(
+                    patch_count,
+                    2 * patch_count,
+                    device=tokens.device,
+                    dtype=torch.long,
+                )
+                representative_sources.append(
+                    patch_count + torch.arange(
+                        patch_count,
+                        device=tokens.device,
+                        dtype=torch.long,
+                    )
+                )
+                representative_weights.append(
+                    torch.ones(patch_count, device=tokens.device, dtype=torch.float32)
+                )
+                mapping_rows.append(current_representatives.clone())
+
+            for frame_index in range(2, num_frames):
                 current_frame = patch_tokens[batch_index, frame_index].float()
                 current_frame_norm = torch.nn.functional.normalize(
                     current_frame,
@@ -1804,6 +1864,295 @@ class Aggregator(nn.Module):
             if debug_batches
             else 0,
             "patch_token_retention_vs_full": float(debug_batches[0]["patch_token_retention_vs_full"])
+            if debug_batches
+            else 1.0,
+            "batches": debug_batches,
+        }
+        return plans
+
+    def _build_adaptive_temporal_representative_plans(
+        self,
+        tokens: torch.Tensor,
+        *,
+        source_layer: int,
+    ) -> list[TemporalRepresentativeBatchPlan]:
+        """Build the globally optimized per-position temporal dictionary.
+
+        Every spatial position starts with one segment [1, F-1], represented by
+        frame 1. Each heap step splits one segment at the position with the
+        largest distortion reduction. The knee of the compute-distortion curve
+        selects the final prefix of split operations.
+        """
+
+        batch_size, num_frames, num_tokens, embed_dim = tokens.shape
+        patch_tokens = tokens[:, :, self.patch_token_start :]
+        patch_count = int(patch_tokens.shape[2])
+        plans: list[TemporalRepresentativeBatchPlan] = []
+        debug_batches: list[dict[str, object]] = []
+        selection_started = time.perf_counter()
+
+        for batch_index in range(batch_size):
+            if num_frames <= 1:
+                mapping = torch.arange(
+                    patch_count,
+                    device=tokens.device,
+                    dtype=torch.long,
+                ).view(1, patch_count)
+                source_indices = torch.arange(
+                    patch_count,
+                    device=tokens.device,
+                    dtype=torch.long,
+                )
+                weights = torch.ones(patch_count, device=tokens.device, dtype=torch.float32)
+                plans.append(
+                    TemporalRepresentativeBatchPlan(
+                        position_to_representative=mapping,
+                        representative_source_indices=source_indices,
+                        representative_weights=weights,
+                    )
+                )
+                debug_batches.append(
+                    {
+                        "representative_count": patch_count,
+                        "full_patch_tokens": patch_count,
+                        "representative_patch_tokens": patch_count,
+                        "attention_tokens": patch_count + self.patch_token_start,
+                        "patch_token_retention_vs_full": 1.0,
+                        "optimal_split_count": 0,
+                        "max_split_count": 0,
+                        "initial_distortion": 0.0,
+                        "optimal_score": 0.0,
+                        "mapping_checksum": int(mapping.sum().item()),
+                        "mapping_shape": list(mapping.shape),
+                    }
+                )
+                continue
+
+            with torch.autocast(device_type=tokens.device.type, enabled=False):
+                normalized = torch.nn.functional.normalize(
+                    patch_tokens[batch_index].float(), p=2, dim=-1, eps=1e-8
+                )
+                similarities = torch.einsum(
+                    "tpd,spd->pts", normalized, normalized
+                ).clamp(-1.0, 1.0)
+            distance = (1.0 - similarities).detach().float().cpu().numpy().astype(np.float32)
+            prefix = np.concatenate(
+                [
+                    np.zeros((patch_count, num_frames, 1), dtype=np.float32),
+                    np.cumsum(distance, axis=2, dtype=np.float32),
+                ],
+                axis=2,
+            )
+            denominator = float(max((num_frames - 1) * patch_count, 1))
+            initial_error = prefix[:, 1, num_frames] - prefix[:, 1, 1]
+            initial_distortion = float(initial_error.sum() / denominator)
+
+            # Segment state is keyed by an id. Splitting keeps the old id for
+            # the left segment and allocates one new id for the right segment.
+            segment_state: dict[int, tuple[int, int, int, int]] = {}
+            heap: list[tuple[float, int, int, int, int, int]] = []
+            next_segment_id = patch_count
+            split_operations: list[tuple[int, int, int, int, int, int]] = []
+
+            def best_split(position: int, start: int, end: int) -> tuple[float, int]:
+                if start >= end:
+                    return float("-inf"), -1
+                candidates = np.arange(start + 1, end + 1, dtype=np.int64)
+                old_error = prefix[position, start, end + 1] - prefix[position, start, start]
+                left_error = prefix[position, start, candidates] - prefix[position, start, start]
+                right_error = (
+                    prefix[position, candidates, end + 1]
+                    - prefix[position, candidates, candidates]
+                )
+                gains = old_error - left_error - right_error
+                best_index = int(np.argmax(gains))
+                return float(gains[best_index]), int(candidates[best_index])
+
+            def push_best(segment_id: int) -> None:
+                state = segment_state.get(segment_id)
+                if state is None:
+                    return
+                position, start, end, _ = state
+                gain, split = best_split(position, start, end)
+                if split >= 0 and np.isfinite(gain):
+                    heapq.heappush(
+                        heap,
+                        (-gain, position, segment_id, start, end, split),
+                    )
+
+            for position in range(patch_count):
+                segment_state[position] = (position, 1, num_frames - 1, patch_count + position)
+                push_best(position)
+
+            max_split_count = patch_count * max(num_frames - 2, 0)
+            n0 = num_frames * self.patch_token_start + 2 * patch_count
+            n_max = num_frames * self.patch_token_start + num_frames * patch_count
+            # Use the requested token-count cost model C(N)=N. The quadratic
+            # attention cost is intentionally not used for knee selection.
+            c0 = float(n0)
+            c_max = float(n_max)
+            cost_span = max(c_max - c0, 1.0)
+            current_distortion = initial_distortion
+            best_k = 0
+            best_objective = 1.0
+            best_score = best_objective
+            best_compute_saving = 1.0
+            best_distortion = initial_distortion
+
+            for split_count in range(1, max_split_count + 1):
+                while heap:
+                    neg_gain, position, segment_id, start, end, split = heapq.heappop(heap)
+                    state = segment_state.get(segment_id)
+                    if state is not None and state[:3] == (position, start, end):
+                        break
+                else:
+                    break
+
+                _, _, _, old_representative = segment_state.pop(segment_id)
+                new_segment_id = next_segment_id
+                next_segment_id += 1
+                new_representative = 2 * patch_count + len(split_operations)
+                segment_state[segment_id] = (
+                    position,
+                    start,
+                    split - 1,
+                    old_representative,
+                )
+                segment_state[new_segment_id] = (
+                    position,
+                    split,
+                    end,
+                    new_representative,
+                )
+                split_operations.append(
+                    (position, segment_id, new_segment_id, start, end, split)
+                )
+
+                gain = -neg_gain
+                current_distortion = max(0.0, current_distortion - gain / denominator)
+                push_best(segment_id)
+                push_best(new_segment_id)
+
+                active_tokens = n0 + split_count
+                q = float((active_tokens - c0) / cost_span)
+                distortion_ratio = (
+                    current_distortion / initial_distortion
+                    if initial_distortion > 1e-12
+                    else 0.0
+                )
+                objective = distortion_ratio + self.frame_fusion_lambda_cost * q
+                if objective < best_objective:
+                    best_k = split_count
+                    best_objective = objective
+                    best_score = objective
+                    best_compute_saving = 1.0 - q
+                    best_distortion = current_distortion
+
+            # Reconstruct the selected prefix of splits. This keeps the curve
+            # search independent from the final mapping representation.
+            final_segments: dict[int, tuple[int, int, int, int]] = {
+                position: (position, 1, num_frames - 1, patch_count + position)
+                for position in range(patch_count)
+            }
+            for operation_index, operation in enumerate(split_operations[:best_k]):
+                position, segment_id, new_segment_id, start, end, split = operation
+                state = final_segments.pop(segment_id)
+                if state[:3] != (position, start, end):
+                    raise RuntimeError("adaptive temporal split replay diverged from heap state")
+                old_representative = state[3]
+                final_segments[segment_id] = (
+                    position,
+                    start,
+                    split - 1,
+                    old_representative,
+                )
+                final_segments[new_segment_id] = (
+                    position,
+                    split,
+                    end,
+                    2 * patch_count + operation_index,
+                )
+
+            mapping = torch.empty(
+                (num_frames, patch_count),
+                device=tokens.device,
+                dtype=torch.long,
+            )
+            mapping[0] = torch.arange(patch_count, device=tokens.device)
+            mapping[1] = patch_count + torch.arange(patch_count, device=tokens.device)
+            source_chunks = [
+                torch.arange(patch_count, device=tokens.device, dtype=torch.long),
+                patch_count + torch.arange(patch_count, device=tokens.device, dtype=torch.long),
+            ]
+            for operation_index, operation in enumerate(split_operations[:best_k]):
+                position, _, _, _, _, split = operation
+                source_chunks.append(
+                    torch.tensor(
+                        [split * patch_count + position],
+                        device=tokens.device,
+                        dtype=torch.long,
+                    )
+                )
+            for position, start, end, representative in final_segments.values():
+                mapping[start : end + 1, position] = representative
+            source_indices = torch.cat(source_chunks, dim=0)
+            weights = torch.bincount(
+                mapping.reshape(-1), minlength=int(source_indices.numel())
+            ).float()
+            plans.append(
+                TemporalRepresentativeBatchPlan(
+                    position_to_representative=mapping,
+                    representative_source_indices=source_indices,
+                    representative_weights=weights,
+                )
+            )
+            debug_batches.append(
+                {
+                    "representative_count": int(source_indices.numel()),
+                    "full_patch_tokens": int(num_frames * patch_count),
+                    "representative_patch_tokens": int(source_indices.numel()),
+                    "attention_tokens": int(
+                        num_frames * self.patch_token_start + source_indices.numel()
+                    ),
+                    "patch_token_retention_vs_full": float(
+                        source_indices.numel() / max(num_frames * patch_count, 1)
+                    ),
+                    "optimal_split_count": int(best_k),
+                    "max_split_count": int(max_split_count),
+                    "initial_distortion": initial_distortion,
+                    "optimal_distortion": float(best_distortion),
+                    "optimal_score": float(best_score),
+                    "optimal_compute_saving": float(best_compute_saving),
+                    "representative_weight_min": float(weights.min().item()),
+                    "representative_weight_max": float(weights.max().item()),
+                    "representative_weight_mean": float(weights.mean().item()),
+                    "mapping_checksum": int(mapping.long().sum().item()),
+                    "mapping_shape": list(mapping.shape),
+                }
+            )
+
+        selection_seconds = time.perf_counter() - selection_started
+        self.last_frame_fusion_debug = {
+            "mode": self.frame_fusion_mode,
+            "source_layer": source_layer,
+            "num_frames": num_frames,
+            "tokens_per_frame": num_tokens,
+            "patch_tokens_per_frame": patch_count,
+            "embed_dim": embed_dim,
+            "mapping": "position_to_temporal_segment_representative",
+            "weighting": "log_representative_occurrence_count_in_attention_logits",
+            "cost_model": "linear_active_token_count",
+            "lambda_cost": self.frame_fusion_lambda_cost,
+            "knee_selection": "min(normalized_distortion_k + lambda_cost*q_k)",
+            "mapping_preserved": True,
+            "selection_seconds": selection_seconds,
+            "full_patch_tokens": int(num_frames * patch_count),
+            "retained_patch_tokens": int(debug_batches[0]["representative_patch_tokens"])
+            if debug_batches
+            else 0,
+            "patch_token_retention_vs_full": float(
+                debug_batches[0]["patch_token_retention_vs_full"]
+            )
             if debug_batches
             else 1.0,
             "batches": debug_batches,
@@ -1990,21 +2339,27 @@ class Aggregator(nn.Module):
             block.attn.merge_random_seed = self.merge_random_seed
             normalized = block.norm1(compressed)
             attention_output = block.attn(normalized, attn_bias=key_log_weights)
-            attended = compressed + block.ls1(attention_output)
-            compressed_output = attended + block.ls2(block.mlp(block.norm2(attended)))
-            compressed_output = compressed_output.squeeze(0)
+            attention_update = block.ls1(attention_output).squeeze(0)
 
-            restored_special = compressed_output[: special_tokens.shape[0]].view(
+            # Restore only the attention residual to the original full token
+            # sequence. The MLP must see each frame's original token rather
+            # than a representative-expanded approximation.
+            restored_special_update = attention_update[: special_tokens.shape[0]].view(
                 num_frames,
                 patch_start,
                 embed_dim,
             )
-            restored_representatives = compressed_output[special_tokens.shape[0] :]
-            restored_patch = restored_representatives.index_select(
+            restored_representative_update = attention_update[special_tokens.shape[0] :]
+            restored_patch_update = restored_representative_update.index_select(
                 0,
                 plan.position_to_representative.to(device=tokens.device).reshape(-1),
             ).view(num_frames, patch_count, embed_dim)
-            outputs.append(torch.cat([restored_special, restored_patch], dim=1))
+            restored_attention_update = torch.cat(
+                [restored_special_update, restored_patch_update], dim=1
+            )
+            full_tokens = frame_tokens + restored_attention_update
+            full_tokens = full_tokens + block.ls2(block.mlp(block.norm2(full_tokens)))
+            outputs.append(full_tokens)
 
         return torch.stack(outputs, dim=0)
 
@@ -2511,6 +2866,19 @@ class Aggregator(nn.Module):
                 )
             if (
                 self.frame_fusion_mode == "temporal-representative"
+                and temporal_representative_plans is not None
+            ):
+                return self._run_temporal_representative_global_attention_block(
+                    tokens,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    num_tokens=num_tokens,
+                    embed_dim=embed_dim,
+                    block_idx=block_idx,
+                    plans=temporal_representative_plans,
+                )
+            if (
+                self.frame_fusion_mode == "adaptive-temporal-representative"
                 and temporal_representative_plans is not None
             ):
                 return self._run_temporal_representative_global_attention_block(

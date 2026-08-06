@@ -86,6 +86,7 @@ class VGGTOmega(nn.Module):
         frame_fusion_target_keep_threshold: float = 0.0,
         frame_fusion_target_keep_seed: int = 33,
         frame_fusion_recompute_each_global: bool = False,
+        frame_fusion_lambda_cost: float = 1.0,
     ) -> None:
         super().__init__()
         if use_register_mediated_anchor is not None:
@@ -155,6 +156,7 @@ class VGGTOmega(nn.Module):
             frame_fusion_target_keep_threshold=frame_fusion_target_keep_threshold,
             frame_fusion_target_keep_seed=frame_fusion_target_keep_seed,
             frame_fusion_recompute_each_global=frame_fusion_recompute_each_global,
+            frame_fusion_lambda_cost=frame_fusion_lambda_cost,
         )
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None

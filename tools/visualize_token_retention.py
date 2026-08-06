@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visualize patch tokens retained by temporal representatives and FastVGGT.
+"""Visualize patch tokens retained by frame-fusion and temporal schemes.
 
 The script runs one sampled sequence with the same 512/max-size preprocessing
 used by the paper evaluators.  It records the temporal representative mapping
@@ -28,12 +28,29 @@ from vggt_omega.utils.load_fn import load_and_preprocess_images
 
 
 def load_model(checkpoint: Path, mode: str, device: torch.device) -> VGGTOmega:
-    if mode == "temporal090":
+    if mode == "least20":
+        kwargs = {
+            "merge_ratio": 0.0,
+            "frame_fusion_mode": "pair-top-percent",
+            "frame_fusion_start_layer": -1,
+            "frame_fusion_pair_percent": 25.0,
+            "frame_fusion_pool_size": 2,
+            "frame_fusion_target_keep_policy": "least-similar",
+            "frame_fusion_target_keep_percent": 20.0,
+            "frame_fusion_target_keep_seed": 33,
+        }
+    elif mode == "temporal090":
         kwargs = {
             "merge_ratio": 0.0,
             "frame_fusion_mode": "temporal-representative",
             "frame_fusion_start_layer": -1,
             "frame_fusion_target_keep_threshold": 0.90,
+        }
+    elif mode == "adaptive-linear":
+        kwargs = {
+            "merge_ratio": 0.0,
+            "frame_fusion_mode": "adaptive-temporal-representative",
+            "frame_fusion_start_layer": -1,
         }
     elif mode == "fastvggt":
         kwargs = {"merge_ratio": 0.9}
@@ -63,6 +80,42 @@ def capture_temporal_plan(model: VGGTOmega, captured: dict[str, object]) -> None
     aggregator._build_temporal_representative_plans = types.MethodType(wrapped, aggregator)
 
 
+def capture_adaptive_temporal_plan(model: VGGTOmega, captured: dict[str, object]) -> None:
+    aggregator = model.aggregator
+    original = aggregator._build_adaptive_temporal_representative_plans
+
+    def wrapped(self, tokens: torch.Tensor, *, source_layer: int):
+        plans = original(tokens, source_layer=source_layer)
+        captured["plans"] = plans
+        return plans
+
+    aggregator._build_adaptive_temporal_representative_plans = types.MethodType(
+        wrapped, aggregator
+    )
+
+
+def capture_pair_plan(model: VGGTOmega, captured: dict[str, object]) -> None:
+    aggregator = model.aggregator
+    original = aggregator._build_frame_fusion_pair_plans
+
+    def wrapped(
+        self,
+        tokens: torch.Tensor,
+        *,
+        patch_grid_size: tuple[int, int],
+        source_layer: int,
+    ):
+        plans = original(
+            tokens,
+            patch_grid_size=patch_grid_size,
+            source_layer=source_layer,
+        )
+        captured["plans"] = plans
+        return plans
+
+    aggregator._build_frame_fusion_pair_plans = types.MethodType(wrapped, aggregator)
+
+
 def capture_fast_merge_traces(model: VGGTOmega) -> None:
     for block in model.aggregator.inter_frame_blocks:
         block.attn.record_merge_trace = True
@@ -87,6 +140,54 @@ def temporal_mask(model: VGGTOmega, captured: dict[str, object], frame_index: in
         "full_patch_tokens": int(patch_count),
         "representative_patch_tokens_total": int(source_indices.size),
     }
+
+
+def least20_mask(captured: dict[str, object], frame_index: int, patch_count: int):
+    plans = captured.get("plans")
+    if not plans:
+        raise RuntimeError("least20 pair plan was not captured")
+    plan = plans[0]
+    mask = np.ones(patch_count, dtype=bool)
+    target_frames = plan.target_frames.detach().cpu().long().numpy()
+    keep_indices = plan.target_keep_patch_indices.detach().cpu().long().numpy()
+    matches = np.flatnonzero(target_frames == frame_index)
+    if matches.size:
+        mask[:] = False
+        mask[keep_indices[int(matches[0])]] = True
+    return mask, {
+        "retained_patch_tokens": int(mask.sum()),
+        "full_patch_tokens": int(patch_count),
+        "selected_pairs": int(len(plan.pairs)),
+        "target_frames": [int(value) for value in target_frames.tolist()],
+        "target_keep_percent": 20.0,
+        "target_frame": bool(matches.size),
+    }
+
+
+def least20_sequence_mask(captured: dict[str, object], num_frames: int, patch_count: int):
+    plans = captured.get("plans")
+    if not plans:
+        raise RuntimeError("least20 pair plan was not captured")
+    plan = plans[0]
+    mask = np.ones((num_frames, patch_count), dtype=bool)
+    target_frames = plan.target_frames.detach().cpu().long().numpy()
+    keep_indices = plan.target_keep_patch_indices.detach().cpu().long().numpy()
+    for pair_index, frame in enumerate(target_frames):
+        mask[int(frame), :] = False
+        mask[int(frame), keep_indices[pair_index]] = True
+    return mask
+
+
+def temporal_sequence_mask(captured: dict[str, object], num_frames: int, patch_count: int):
+    plans = captured.get("plans")
+    if not plans:
+        raise RuntimeError("temporal representative plan was not captured")
+    plan = plans[0]
+    mapping = plan.position_to_representative.detach().cpu().long().numpy()
+    source_indices = plan.representative_source_indices.detach().cpu().long().numpy()
+    representative_source = source_indices[mapping]
+    frame_indices = representative_source // patch_count
+    return frame_indices == np.arange(num_frames)[:, None]
 
 
 def fast_mask(model: VGGTOmega, frame_index: int, patch_count: int, num_frames: int, num_special: int):
@@ -160,12 +261,32 @@ def render_overlay(image: Image.Image, mask: np.ndarray, title: str, output: Pat
     canvas.save(output)
 
 
+def render_sequence_heatmap(mask: np.ndarray, title: str, output: Path) -> None:
+    """Render one comparable local-retention mask for every frame."""
+
+    colors = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    colors[mask] = (45, 190, 90)
+    colors[~mask] = (220, 65, 65)
+    image = Image.fromarray(colors, mode="RGB")
+    canvas = Image.new("RGB", (image.width, image.height + 38), "white")
+    canvas.paste(image, (0, 38))
+    ImageDraw.Draw(canvas).text((8, 10), title, fill="black")
+    canvas.save(output)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--sampled-frames", type=Path, required=True)
     parser.add_argument("--sequence", required=True)
     parser.add_argument("--frame-index", type=int, default=150)
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=("least20", "temporal090", "adaptive-linear"),
+        default=("least20", "adaptive-linear"),
+        help="Visualization modes to compare.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -194,26 +315,36 @@ def main() -> int:
         "patch_tokens_per_frame": patch_count,
     }
 
-    for mode in ("temporal090", "fastvggt"):
+    for mode in args.modes:
         captured: dict[str, object] = {}
         model = load_model(args.checkpoint, mode, device)
         if mode == "temporal090":
             capture_temporal_plan(model, captured)
-        else:
-            capture_fast_merge_traces(model)
+        elif mode == "adaptive-linear":
+            capture_adaptive_temporal_plan(model, captured)
+        elif mode == "least20":
+            capture_pair_plan(model, captured)
         with torch.inference_mode():
             model(images.to(device, non_blocking=True))
-        if mode == "temporal090":
-            mask, stats = temporal_mask(model, captured, args.frame_index, patch_count)
+        if mode == "least20":
+            mask, stats = least20_mask(captured, args.frame_index, patch_count)
+            sequence_mask = least20_sequence_mask(captured, num_frames, patch_count)
         else:
-            mask, stats = fast_mask(model, args.frame_index, patch_count, num_frames, num_special)
+            mask, stats = temporal_mask(model, captured, args.frame_index, patch_count)
+            sequence_mask = temporal_sequence_mask(captured, num_frames, patch_count)
         stats["patch_retention_vs_full"] = float(mask.mean())
+        stats["sequence_local_patch_retention_vs_full"] = float(sequence_mask.mean())
         metadata[mode] = stats
         render_overlay(
             source_image,
             mask,
-            f"{mode}: green=retained, red=merged | frame={args.frame_index} | {mask.sum()}/{mask.size}",
+            f"{mode}: green=local, red=shared/omitted | frame={args.frame_index} | {mask.sum()}/{mask.size}",
             args.output_dir / f"{mode}_frame{args.frame_index:03d}_overlay.png",
+        )
+        render_sequence_heatmap(
+            sequence_mask,
+            f"{mode}: green=local, red=shared/omitted | sequence local retention={sequence_mask.mean():.3f}",
+            args.output_dir / f"{mode}_sequence_retention_heatmap.png",
         )
         del model
         torch.cuda.empty_cache()

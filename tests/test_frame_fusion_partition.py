@@ -599,10 +599,59 @@ def test_temporal_representative_plan_preserves_mapping_and_occurrence_weights()
     plans = model._build_temporal_representative_plans(tokens, source_layer=-1)
     plan = plans[0]
 
-    assert plan.position_to_representative.tolist() == [[0, 1], [0, 2], [0, 2]]
-    assert plan.representative_source_indices.tolist() == [0, 1, 3]
-    assert torch.equal(plan.representative_weights, torch.tensor([3.0, 1.0, 2.0]))
+    assert plan.position_to_representative.tolist() == [[0, 1], [2, 3], [2, 3]]
+    assert plan.representative_source_indices.tolist() == [0, 1, 2, 3]
+    assert torch.equal(plan.representative_weights, torch.tensor([1.0, 1.0, 2.0, 2.0]))
     assert model.last_frame_fusion_debug["mapping_preserved"] is True
+
+
+def test_adaptive_temporal_plan_keeps_reference_frames_and_positive_weights():
+    model = Aggregator.__new__(Aggregator)
+    model.patch_token_start = 1
+    model.frame_fusion_mode = "adaptive-temporal-representative"
+    model.frame_fusion_lambda_cost = 1.0
+
+    tokens = torch.tensor(
+        [
+            [
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                [[0.0, 0.0], [0.9, 0.1], [0.0, 1.0]],
+                [[0.0, 0.0], [0.8, 0.2], [0.0, 1.0]],
+            ]
+        ]
+    )
+
+    plan = model._build_adaptive_temporal_representative_plans(
+        tokens, source_layer=-1
+    )[0]
+    mapping = plan.position_to_representative
+
+    assert mapping[0].tolist() == [0, 1]
+    assert mapping[1].tolist() == [2, 3]
+    assert torch.equal(
+        plan.representative_weights,
+        torch.bincount(mapping.reshape(-1), minlength=plan.representative_source_indices.numel()).float(),
+    )
+    assert bool(torch.all(plan.representative_weights >= 1).item())
+    assert float(plan.representative_weights.sum()) == float(mapping.numel())
+    assert model.last_frame_fusion_debug["mapping_preserved"] is True
+    assert model.last_frame_fusion_debug["cost_model"] == "linear_active_token_count"
+
+
+def test_adaptive_temporal_lambda_controls_split_count():
+    generator = torch.Generator().manual_seed(7)
+    tokens = torch.randn((1, 8, 5, 4), generator=generator)
+    split_counts = []
+    for lambda_cost in (1.0, 0.75, 0.5, 0.25):
+        model = Aggregator.__new__(Aggregator)
+        model.patch_token_start = 1
+        model.frame_fusion_mode = "adaptive-temporal-representative"
+        model.frame_fusion_lambda_cost = lambda_cost
+        model._build_adaptive_temporal_representative_plans(tokens, source_layer=-1)
+        split_counts.append(model.last_frame_fusion_debug["batches"][0]["optimal_split_count"])
+
+    assert split_counts == sorted(split_counts)
 
 
 def test_layer_token_swap_patch_special_and_whole_scopes():

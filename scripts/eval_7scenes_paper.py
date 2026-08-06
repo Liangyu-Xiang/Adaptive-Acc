@@ -143,6 +143,7 @@ def parse_args() -> argparse.Namespace:
             "sequential-group",
             "sequential-group-average",
             "temporal-representative",
+            "adaptive-temporal-representative",
         ),
         default="none",
         help="Enable frame fusion. Default keeps original VGGT-Omega behavior.",
@@ -233,6 +234,12 @@ def parse_args() -> argparse.Namespace:
             "patches after every frame-attention block, immediately before each "
             "global inter-frame attention block."
         ),
+    )
+    parser.add_argument(
+        "--frame-fusion-lambda-cost",
+        type=float,
+        default=1.0,
+        help="Lambda for adaptive temporal representative objective D_tilde + lambda*q.",
     )
     parser.add_argument(
         "--sampling-unit",
@@ -752,6 +759,7 @@ def load_model(
     frame_fusion_target_keep_threshold: float,
     frame_fusion_target_keep_seed: int,
     frame_fusion_recompute_each_global: bool,
+    frame_fusion_lambda_cost: float,
     sparse_attention: bool,
     sparse_ratio: float | None,
     sparse_cdf_threshold: float | None,
@@ -811,6 +819,7 @@ def load_model(
         "frame_fusion_target_keep_threshold": frame_fusion_target_keep_threshold,
         "frame_fusion_target_keep_seed": frame_fusion_target_keep_seed,
         "frame_fusion_recompute_each_global": frame_fusion_recompute_each_global,
+        "frame_fusion_lambda_cost": frame_fusion_lambda_cost,
         "sparse_attention": sparse_attention,
         "sparse_ratio": sparse_ratio,
         "sparse_cdf_threshold": sparse_cdf_threshold,
@@ -1003,6 +1012,8 @@ def main() -> int:
         raise ValueError("Depth range must satisfy 0 < --min-depth < --max-depth")
     if not 0.0 <= args.merge_ratio <= 1.0:
         raise ValueError("--merge-ratio must be in [0, 1]")
+    if args.frame_fusion_lambda_cost < 0.0:
+        raise ValueError("--frame-fusion-lambda-cost must be non-negative")
     if args.frame_fusion_mode == "dp-medoid":
         if args.frame_fusion_k is None:
             raise ValueError("--frame-fusion-k is required when --frame-fusion-mode dp-medoid")
@@ -1022,6 +1033,7 @@ def main() -> int:
         "sequential-group",
         "sequential-group-average",
         "temporal-representative",
+        "adaptive-temporal-representative",
     }:
         if not 0.0 < args.frame_fusion_pair_percent <= 100.0:
             raise ValueError("--frame-fusion-pair-percent must be in (0, 100]")
@@ -1194,6 +1206,7 @@ def main() -> int:
         args.frame_fusion_target_keep_threshold,
         args.frame_fusion_target_keep_seed,
         args.frame_fusion_recompute_each_global,
+        args.frame_fusion_lambda_cost,
         args.sparse_attention,
         args.sparse_ratio,
         args.sparse_cdf_threshold,
@@ -1437,7 +1450,14 @@ def main() -> int:
             )
             row["frame_fusion_recompute_each_global"] = debug.get("recompute_each_global")
             row["frame_fusion_num_recomputed_layers"] = debug.get("num_recomputed_layers")
-            if args.frame_fusion_mode == "temporal-representative":
+            row["frame_fusion_cost_model"] = debug.get("cost_model")
+            row["frame_fusion_lambda_cost"] = debug.get(
+                "lambda_cost", args.frame_fusion_lambda_cost
+            )
+            if args.frame_fusion_mode in {
+                "temporal-representative",
+                "adaptive-temporal-representative",
+            }:
                 first_batch = (debug.get("batches") or [{}])[0]
                 row["frame_fusion_representative_count"] = first_batch.get("representative_count")
                 row["frame_fusion_representative_weight_min"] = first_batch.get(
@@ -1516,6 +1536,7 @@ def main() -> int:
                 "target_keep_threshold": args.frame_fusion_target_keep_threshold,
                 "target_keep_seed": args.frame_fusion_target_keep_seed,
                 "recompute_each_global": args.frame_fusion_recompute_each_global,
+                "lambda_cost": args.frame_fusion_lambda_cost,
             },
             "sparse_attention": args.sparse_attention,
             "sparse_ratio": args.sparse_ratio,
