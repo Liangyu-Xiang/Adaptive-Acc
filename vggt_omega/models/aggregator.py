@@ -2886,10 +2886,16 @@ class Aggregator(nn.Module):
                 else None
             ),
             "selection": (
-                "min(D_k + lambda_cost * active_k / total_k)"
+                "min(D_m + lambda_cost * M_m / ((F - 1) * P))"
                 if uses_lambda
                 else "geometric_knee"
             ),
+            "cost_scope": (
+                "non_reference_patch_tokens"
+                if uses_lambda
+                else "all_candidate_patch_tokens"
+            ),
+            "cost_denominator": "(F - 1) * P" if uses_lambda else None,
             "reassignment_candidates": getattr(self, "frame_fusion_reassignment_candidates", 8),
             "representative_update": (
                 "best-of-parents"

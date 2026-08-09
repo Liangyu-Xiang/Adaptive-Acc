@@ -921,7 +921,9 @@ def test_unified_debug_uses_frame_count_for_attention_token_statistics():
     debug = model.last_frame_fusion_debug
 
     assert debug["lambda_cost"] == pytest.approx(0.25)
-    assert debug["selection"] == "min(D_k + lambda_cost * active_k / total_k)"
+    assert debug["selection"] == "min(D_m + lambda_cost * M_m / ((F - 1) * P))"
+    assert debug["cost_scope"] == "non_reference_patch_tokens"
+    assert debug["cost_denominator"] == "(F - 1) * P"
     assert debug["representative_update"] == "best-of-parents"
     for batch_debug, plan in zip(debug["batches"], plans):
         assert batch_debug["attention_tokens"] == 3 + plan.representative_source_indices.numel()
