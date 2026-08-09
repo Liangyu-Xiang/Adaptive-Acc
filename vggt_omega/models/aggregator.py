@@ -2134,6 +2134,7 @@ class Aggregator(nn.Module):
         patch_count: int,
         *,
         include_temporal_spatial: bool,
+        exclude_frame_zero: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Build the local candidate graph without an N-by-N distance matrix."""
 
@@ -2147,6 +2148,8 @@ class Aggregator(nn.Module):
         source: list[int] = []
         target: list[int] = []
         for frame in range(num_frames):
+            if exclude_frame_zero and frame == 0:
+                continue
             for row in range(height):
                 for col in range(width):
                     position = row * width + col
@@ -2186,7 +2189,10 @@ class Aggregator(nn.Module):
         x = np.asarray(active_counts, dtype=np.float64)
         y = np.asarray(distortions, dtype=np.float64)
         x = (x - x[-1]) / max(x[0] - x[-1], 1.0)
-        y = (y - y[0]) / max(y[-1] - y[0], 1e-12)
+        # Keep the distortion in its fixed cosine-distance scale. Per-curve
+        # normalization would erase the absolute redundancy difference
+        # between sequences before the operating point is selected.
+        y = y - y[0]
         start = np.asarray([x[0], y[0]])
         end = np.asarray([x[-1], y[-1]])
         direction = end - start
@@ -2196,8 +2202,8 @@ class Aggregator(nn.Module):
             direction[0] * (start[1] - points[:, 1])
             - (start[0] - points[:, 0]) * direction[1]
         ) / norm
-        # Index zero is the uncompressed endpoint.  A zero-curvature curve is
-        # allowed to keep the minimum configured number of tokens.
+        # Index zero is the uncompressed endpoint.  The full merge path is
+        # evaluated first; the knee then selects the operating point.
         return int(np.argmax(distances[1:]) + 1)
 
     def _greedy_spatiotemporal_group_merge(
@@ -2209,14 +2215,18 @@ class Aggregator(nn.Module):
         *,
         protected: np.ndarray,
         initial_weights: np.ndarray | None = None,
-        max_group_size: int,
+        max_group_size: int | None = None,
+        min_keep_ratio: float | None = None,
+        lambda_cost: float | None = None,
+        prefer_best_parent: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
         """Greedy local whole-group merging used by H-M and U-M.
 
-        The edge queue is local in time and space.  Groups are never split;
-        the final representative is selected from the group's parent tokens.
-        This keeps the exact whole-group semantics while making 300-frame
-        planning practical.
+        The queue is local in time and space, but its priority is recomputed
+        after every group merge.  A group's error is represented exactly for
+        cosine distance by its weighted feature sum, so the merge increment is
+        ``E(A union B) - E(A) - E(B)`` rather than a fixed singleton-edge
+        distance or a Ward-style proxy. Groups are never split.
         """
 
         count = int(source_indices.size)
@@ -2224,105 +2234,201 @@ class Aggregator(nn.Module):
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), {}
         if initial_weights is None:
             initial_weights = np.ones(count, dtype=np.float64)
-        costs: list[np.ndarray] = []
+        initial_weights = np.asarray(initial_weights, dtype=np.float64)
+        if initial_weights.shape != (count,):
+            raise ValueError(
+                "initial_weights must have one value per source group, "
+                f"got shape {initial_weights.shape} for {count} groups"
+            )
+
         feature_device = normalized_features.device
+        weight_tensor = torch.as_tensor(
+            initial_weights,
+            device=feature_device,
+            dtype=normalized_features.dtype,
+        )
+        costs: list[np.ndarray] = []
         chunk_size = 250_000
         for start in range(0, edge_source.size, chunk_size):
             end = min(start + chunk_size, edge_source.size)
             left = torch.as_tensor(edge_source[start:end], device=feature_device)
             right = torch.as_tensor(edge_target[start:end], device=feature_device)
-            costs.append(
-                (1.0 - (normalized_features[left] * normalized_features[right]).sum(dim=-1))
-                .detach()
-                .float()
-                .cpu()
-                .numpy()
+            merged_weight = weight_tensor[left] + weight_tensor[right]
+            merged_sum = (
+                normalized_features[left] * weight_tensor[left, None]
+                + normalized_features[right] * weight_tensor[right, None]
             )
+            left_error = merged_weight - (merged_sum * normalized_features[left]).sum(dim=-1)
+            right_error = merged_weight - (merged_sum * normalized_features[right]).sum(dim=-1)
+            if prefer_best_parent or getattr(self, "frame_fusion_representative_update", "parent") == "exact-medoid":
+                costs.append(torch.minimum(left_error, right_error).detach().float().cpu().numpy())
+            else:
+                costs.append(left_error.detach().float().cpu().numpy())
         edge_cost = np.concatenate(costs) if costs else np.empty(0, dtype=np.float32)
-        order = np.argsort(edge_cost, kind="stable")
-
-        parent = np.arange(count, dtype=np.int64)
-        current_group = np.arange(count, dtype=np.int64)
-
-        def find(value: int) -> int:
-            while parent[value] != value:
-                parent[value] = parent[parent[value]]
-                value = int(parent[value])
-            return value
 
         members: list[list[int]] = [[index] for index in range(count)]
         representative: list[int] = list(range(count))
         group_protected: list[bool] = [bool(value) for value in protected]
         group_weights: list[float] = [float(value) for value in initial_weights]
+        # Singleton groups borrow their source feature without allocating a
+        # second copy. Merged groups retain only their active weighted sum.
+        group_sums: list[torch.Tensor | None] = [None] * count
         group_error: list[float] = [0.0] * count
+        active: list[bool] = [True] * count
+        group_alias: list[int] = list(range(count))
+        group_adjacency: list[set[int]] = [set() for _ in range(count)]
+        for left, right in zip(edge_source.tolist(), edge_target.tolist()):
+            left = int(left)
+            right = int(right)
+            if left == right:
+                continue
+            group_adjacency[left].add(right)
+            group_adjacency[right].add(left)
+
+        def find_group(value: int) -> int:
+            while group_alias[value] != value:
+                group_alias[value] = group_alias[group_alias[value]]
+                value = group_alias[value]
+            return value
+
+        def group_sum(group: int) -> torch.Tensor:
+            cached = group_sums[group]
+            if cached is not None:
+                return cached
+            if group_weights[group] == 1.0:
+                return normalized_features[group]
+            return normalized_features[group] * group_weights[group]
+
+        def merge_statistics(
+            left_group: int,
+            right_group: int,
+        ) -> tuple[float, int, float, torch.Tensor]:
+            merged_weight = group_weights[left_group] + group_weights[right_group]
+            merged_sum = group_sum(left_group) + group_sum(right_group)
+            left_rep = representative[left_group]
+            right_rep = representative[right_group]
+            left_error = merged_weight - float(
+                torch.dot(merged_sum, normalized_features[left_rep]).detach().cpu()
+            )
+            right_error = merged_weight - float(
+                torch.dot(merged_sum, normalized_features[right_rep]).detach().cpu()
+            )
+            choose_right = (
+                (prefer_best_parent or getattr(self, "frame_fusion_representative_update", "parent") == "exact-medoid")
+                and right_error < left_error
+            )
+            if choose_right:
+                return right_error - group_error[left_group] - group_error[right_group], right_rep, right_error, merged_sum
+            return left_error - group_error[left_group] - group_error[right_group], left_rep, left_error, merged_sum
+
+        heap: list[tuple[float, int, int, int]] = []
+        heap_counter = 0
+        for edge_index, (left, right) in enumerate(zip(edge_source.tolist(), edge_target.tolist())):
+            left = int(left)
+            right = int(right)
+            if left > right:
+                left, right = right, left
+            heapq.heappush(heap, (float(edge_cost[edge_index]), heap_counter, left, right))
+            heap_counter += 1
+
         records: list[tuple[int, int, int, int, tuple[int, ...]]] = []
         active_counts = [count]
         distortions = [0.0]
         total_error = 0.0
-        min_keep = max(
-            int(np.ceil(count * float(getattr(self, "frame_fusion_min_keep_ratio", 0.4)))),
-            int(np.count_nonzero(protected)),
-        )
+        min_keep = None
+        if min_keep_ratio is not None:
+            min_keep = max(
+                int(np.ceil(count * float(min_keep_ratio))),
+                int(np.count_nonzero(protected)),
+            )
 
-        for edge_index in order:
-            left_root = find(int(edge_source[edge_index]))
-            right_root = find(int(edge_target[edge_index]))
-            if left_root == right_root:
+        while heap:
+            _, _, queued_left, queued_right = heapq.heappop(heap)
+            left_group = find_group(queued_left)
+            right_group = find_group(queued_right)
+            if left_group == right_group:
                 continue
-            left_group = int(current_group[left_root])
-            right_group = int(current_group[right_root])
+            if left_group > right_group:
+                left_group, right_group = right_group, left_group
+            if not active[left_group] or not active[right_group]:
+                continue
+            if right_group not in group_adjacency[left_group]:
+                continue
+            # Neighboring pairs are refreshed eagerly after each merge. Old
+            # entries therefore become invalid as soon as either endpoint is
+            # absorbed into a new group.
+            if queued_left != left_group or queued_right != right_group:
+                continue
             if (
-                len(members[left_group]) + len(members[right_group]) > max_group_size
-                or (group_protected[left_group] and group_protected[right_group])
+                (
+                    max_group_size is not None
+                    and len(members[left_group]) + len(members[right_group]) > max_group_size
+                )
+                or group_protected[left_group]
+                or group_protected[right_group]
             ):
                 continue
-            left_rep = representative[left_group]
-            right_rep = representative[right_group]
+            merge_delta, new_rep, new_error, merged_sum = merge_statistics(left_group, right_group)
             merged_members = members[left_group] + members[right_group]
-            if group_protected[left_group]:
-                new_rep = left_rep
-            elif group_protected[right_group]:
-                new_rep = right_rep
-            else:
-                new_rep = left_rep
-                if getattr(self, "frame_fusion_representative_update", "parent") == "exact-medoid":
-                    candidate_reps = [left_rep, right_rep]
-                    candidate_errors = []
-                    for candidate in candidate_reps:
-                        member_tensor = torch.as_tensor(merged_members, device=feature_device)
-                        candidate_errors.append(
-                            float(
-                                (1.0 - (normalized_features[member_tensor] * normalized_features[candidate]).sum(dim=-1))
-                                .detach()
-                                .double()
-                                .cpu()
-                                .sum()
-                            )
-                        )
-                    new_rep = candidate_reps[int(np.argmin(candidate_errors))]
-            merge_distance = float(edge_cost[edge_index])
-            left_weight = max(group_weights[left_group], 1e-12)
-            right_weight = max(group_weights[right_group], 1e-12)
-            new_error = group_error[left_group] + group_error[right_group]
-            new_error += merge_distance * left_weight * right_weight / (left_weight + right_weight)
             new_group = len(members)
             members.append(merged_members)
             representative.append(new_rep)
             group_protected.append(group_protected[left_group] or group_protected[right_group])
             group_weights.append(group_weights[left_group] + group_weights[right_group])
+            group_sums.append(merged_sum)
             group_error.append(new_error)
+            active.append(True)
+            group_alias[left_group] = new_group
+            group_alias[right_group] = new_group
+            group_alias.append(new_group)
+            neighbors = (group_adjacency[left_group] | group_adjacency[right_group]) - {
+                left_group,
+                right_group,
+            }
+            group_adjacency.append(set(neighbors))
+            for neighbor in neighbors:
+                group_adjacency[neighbor].discard(left_group)
+                group_adjacency[neighbor].discard(right_group)
+                group_adjacency[neighbor].add(new_group)
+                if group_protected[new_group] or group_protected[neighbor]:
+                    continue
+                if (
+                    max_group_size is not None
+                    and len(members[new_group]) + len(members[neighbor]) > max_group_size
+                ):
+                    continue
+                neighbor_delta, _, _, _ = merge_statistics(new_group, neighbor)
+                heapq.heappush(
+                    heap,
+                    (
+                        neighbor_delta,
+                        heap_counter,
+                        min(new_group, neighbor),
+                        max(new_group, neighbor),
+                    ),
+                )
+                heap_counter += 1
+            active[left_group] = False
+            active[right_group] = False
             records.append(
                 (left_group, right_group, new_group, new_rep, tuple(merged_members))
             )
-            total_error += max(0.0, new_error - group_error[left_group] - group_error[right_group])
+            total_error += merge_delta
             active_counts.append(count - len(records))
             distortions.append(total_error / max(float(initial_weights.sum()), 1.0))
-            parent[right_root] = left_root
-            current_group[left_root] = new_group
-            if active_counts[-1] <= min_keep:
+            if min_keep is not None and active_counts[-1] <= min_keep:
                 break
 
-        selected_merges = self._spatiotemporal_knee_index(active_counts, distortions)
+        if lambda_cost is not None:
+            active_ratio = np.asarray(active_counts, dtype=np.float64) / max(float(count), 1.0)
+            objective = np.asarray(distortions, dtype=np.float64) + float(lambda_cost) * active_ratio
+            selected_merges = int(np.argmin(objective))
+            selection = "min_distortion_plus_lambda_active_ratio"
+            selected_objective = float(objective[selected_merges])
+        else:
+            selected_merges = self._spatiotemporal_knee_index(active_counts, distortions)
+            selection = "geometric_knee"
+            selected_objective = None
         selected_merges = min(selected_merges, len(records))
         assignment = np.arange(count, dtype=np.int64)
         group_representative: dict[int, int] = {index: index for index in range(count)}
@@ -2340,10 +2446,15 @@ class Aggregator(nn.Module):
         debug = {
             "initial_active_tokens": count,
             "minimum_active_tokens": min_keep,
+            "max_group_size": max_group_size,
+            "lambda_cost": lambda_cost,
             "accepted_merges": len(records),
             "selected_merges": selected_merges,
             "knee_active_tokens": int(selected_sources.size),
             "knee_distortion": float(distortions[selected_merges]),
+            "selected_distortion": float(distortions[selected_merges]),
+            "selected_objective": selected_objective,
+            "selection": selection,
             "group_size_max": int(max((len(group) for group in members), default=1)),
         }
         return mapping, selected_sources, debug
@@ -2389,6 +2500,8 @@ class Aggregator(nn.Module):
             for linear_index, representative_index in enumerate(temporal_mapping.reshape(-1)):
                 support[int(representative_index)].append(linear_index // patch_count)
             for index, (frame, position) in enumerate(zip(source_frames, source_positions)):
+                if int(frame) == 0:
+                    continue
                 row, col = divmod(int(position), int(width))
                 for dr, dc in offsets:
                     nr, nc = row + dr, col + dc
@@ -2412,6 +2525,7 @@ class Aggregator(nn.Module):
                 protected=protected,
                 initial_weights=temporal_plan.representative_weights.detach().cpu().numpy(),
                 max_group_size=int(getattr(self, "frame_fusion_max_group_size", 4)),
+                min_keep_ratio=float(getattr(self, "frame_fusion_min_keep_ratio", 0.4)),
             )
             final_mapping = torch.as_tensor(
                 assignment[temporal_mapping.reshape(-1)].reshape(num_frames, patch_count),
@@ -2429,16 +2543,19 @@ class Aggregator(nn.Module):
             )
             for frame in range(num_frames):
                 for position in range(patch_count):
+                    if frame == 0:
+                        candidate_lists.append([int(temporal_mapping[0, position])])
+                        continue
                     row, col = divmod(position, width)
                     candidates: list[int] = []
-                    candidates.extend(int(value) for value in temporal_mapping[:, position])
+                    candidates.extend(int(value) for value in temporal_mapping[1:, position])
                     for dr, dc in offsets:
                         nr, nc = row + dr, col + dc
                         if 0 <= nr < height and 0 <= nc < width:
                             candidates.append(int(temporal_mapping[frame, nr * width + nc]))
                     for delta in range(1, int(getattr(self, "frame_fusion_temporal_window", 1)) + 1):
                         for other_frame in (frame - delta, frame + delta):
-                            if 0 <= other_frame < num_frames:
+                            if 1 <= other_frame < num_frames:
                                 candidates.extend(int(value) for value in temporal_mapping[other_frame, position : position + 1])
                                 for dr, dc in offsets:
                                     nr, nc = row + dr, col + dc
@@ -2529,7 +2646,10 @@ class Aggregator(nn.Module):
         protected[:patch_count] = True
         if reallocate:
             edge_source, edge_target = self._build_local_spatiotemporal_edges(
-                num_frames, patch_count, include_temporal_spatial=True
+                num_frames,
+                patch_count,
+                include_temporal_spatial=True,
+                exclude_frame_zero=True,
             )
             candidate_lists = [[] for _ in range(total)]
             for source, target in zip(edge_source.tolist(), edge_target.tolist()):
@@ -2537,10 +2657,6 @@ class Aggregator(nn.Module):
                 candidate_lists[target].append(source)
             for index in range(total):
                 candidate_lists[index].insert(0, index)
-                # The protected frame-0 token at the same spatial position is
-                # always a valid fallback after arbitrary representatives are
-                # deleted.
-                candidate_lists[index].append(index % patch_count)
             max_candidates = max(len(values) for values in candidate_lists)
             candidate_matrix = np.full((total, max_candidates), -1, dtype=np.int64)
             for index, values in enumerate(candidate_lists):
@@ -2564,6 +2680,14 @@ class Aggregator(nn.Module):
             keep = np.zeros(total, dtype=bool)
             keep[:patch_count] = True
             keep[removable[np.argsort(nearest[removable].detach().cpu().numpy())[-max(target - patch_count, 0) :]]] = True
+            for index in range(patch_count, total):
+                if not any(
+                    0 <= candidate < total
+                    and not protected[candidate]
+                    and keep[candidate]
+                    for candidate in candidate_lists[index]
+                ):
+                    keep[index] = True
             keep_ids = np.flatnonzero(keep)
             keep_map = {int(value): index for index, value in enumerate(keep_ids)}
             keep_tensor = torch.as_tensor(keep, device=tokens.device)
@@ -2591,7 +2715,10 @@ class Aggregator(nn.Module):
             }
         else:
             edge_source, edge_target = self._build_local_spatiotemporal_edges(
-                num_frames, patch_count, include_temporal_spatial=False
+                num_frames,
+                patch_count,
+                include_temporal_spatial=False,
+                exclude_frame_zero=True,
             )
             final_mapping, selected_sources, debug = self._greedy_spatiotemporal_group_merge(
                 normalized,
@@ -2599,7 +2726,10 @@ class Aggregator(nn.Module):
                 edge_source,
                 edge_target,
                 protected=protected,
-                max_group_size=int(getattr(self, "frame_fusion_max_group_size", 8)),
+                max_group_size=None,
+                min_keep_ratio=None,
+                lambda_cost=float(getattr(self, "frame_fusion_lambda_cost", 0.15)),
+                prefer_best_parent=True,
             )
         mapping = torch.as_tensor(final_mapping.reshape(num_frames, patch_count), device=tokens.device, dtype=torch.long)
         source_indices = torch.as_tensor(selected_sources, device=tokens.device, dtype=torch.long)
@@ -2610,6 +2740,7 @@ class Aggregator(nn.Module):
                 "full_patch_tokens": total,
                 "representative_patch_tokens": int(source_indices.numel()),
                 "attention_tokens": int(num_frames * self.patch_token_start + source_indices.numel()),
+                "representative_update": "best-of-parents" if not reallocate else "reassignment",
                 "patch_token_retention_vs_full": float(source_indices.numel() / max(total, 1)),
                 "representative_weight_min": float(weights.min().item()),
                 "representative_weight_max": float(weights.max().item()),
@@ -2618,6 +2749,8 @@ class Aggregator(nn.Module):
                 "mapping_shape": list(mapping.shape),
             }
         )
+        self._hybrid_debug = getattr(self, "_hybrid_debug", [])
+        self._hybrid_debug.append(debug.copy())
         return TemporalRepresentativeBatchPlan(
             position_to_representative=mapping,
             representative_source_indices=source_indices,
@@ -2655,27 +2788,52 @@ class Aggregator(nn.Module):
                         tokens[batch_index], reallocate=mode == "u-r"
                     )
                 )
-        first = self._hybrid_debug[0] if self._hybrid_debug else {}
+        batch_debug = list(self._hybrid_debug)
+        first = batch_debug[0] if batch_debug else {}
+        uses_lambda = mode == "u-m"
         self.last_frame_fusion_debug = {
             "mode": mode,
             "source_layer": source_layer,
             "mapping": "original_token_to_spatiotemporal_representative",
-            "cost_model": "local_spatiotemporal_knee",
+            "cost_model": (
+                "local_spatiotemporal_exact_distortion_plus_lambda"
+                if uses_lambda
+                else "local_spatiotemporal_exact_distortion_knee"
+            ),
             "spatial_neighborhood": getattr(self, "frame_fusion_spatial_neighborhood", "N8"),
             "temporal_window": getattr(self, "frame_fusion_temporal_window", 1),
             "time_overlap": getattr(self, "frame_fusion_time_overlap", 0.5),
-            "minimum_keep_ratio": getattr(self, "frame_fusion_min_keep_ratio", 0.4),
+            "minimum_keep_ratio": (
+                None if mode == "u-m" else getattr(self, "frame_fusion_min_keep_ratio", 0.4)
+            ),
+            "max_group_size": (
+                None if mode == "u-m" else getattr(self, "frame_fusion_max_group_size", None)
+            ),
+            "lambda_cost": (
+                getattr(self, "frame_fusion_lambda_cost", 0.15)
+                if uses_lambda
+                else None
+            ),
+            "selection": (
+                "min(D_k + lambda_cost * active_k / total_k)"
+                if uses_lambda
+                else "geometric_knee"
+            ),
             "reassignment_candidates": getattr(self, "frame_fusion_reassignment_candidates", 8),
-            "representative_update": getattr(self, "frame_fusion_representative_update", "parent"),
+            "representative_update": (
+                "best-of-parents"
+                if uses_lambda
+                else getattr(self, "frame_fusion_representative_update", "parent")
+            ),
             "attention_only": True,
             "mlp_scope": "full_original_token_sequence",
             "batches": [
                 {
-                    **first,
+                    **(batch_debug[batch_index] if batch_index < len(batch_debug) else first),
                     "representative_count": int(plan.representative_source_indices.numel()),
                     "full_patch_tokens": int(tokens.shape[2] - self.patch_token_start) * tokens.shape[1],
                     "representative_patch_tokens": int(plan.representative_source_indices.numel()),
-                    "attention_tokens": int(tokens.shape[0] * self.patch_token_start + plan.representative_source_indices.numel()),
+                    "attention_tokens": int(tokens.shape[1] * self.patch_token_start + plan.representative_source_indices.numel()),
                     "patch_token_retention_vs_full": float(
                         plan.representative_source_indices.numel()
                         / max(tokens.shape[1] * (tokens.shape[2] - self.patch_token_start), 1)
@@ -2686,7 +2844,7 @@ class Aggregator(nn.Module):
                     "mapping_checksum": int(plan.position_to_representative.sum().item()),
                     "mapping_shape": list(plan.position_to_representative.shape),
                 }
-                for plan in plans
+                for batch_index, plan in enumerate(plans)
             ],
         }
         self._frame_fusion_plan_seconds = getattr(

@@ -28,12 +28,19 @@ compression design are exposed as `h-m`, `h-r`, `u-m`, and `u-r`:
 - `u-m`: unified local time/space whole-group merges;
 - `u-r`: unified local deletion and reassignment.
 
-All four protect frame 0 and special tokens, operate only in global attention,
-restore the attention residual to the original token layout, and run the full
-per-token MLP afterward. Balanced defaults are N8, temporal window 1,
-overlap threshold 0.5, minimum active ratio 0.4, H group size 4, U group size
-8, and reassignment candidate limit 8. The evaluation scripts expose these as
-`--frame-fusion-*` options.
+All four strictly isolate frame 0 patch tokens: they remain one-to-one
+representatives, are excluded from candidate edges, and cannot represent
+tokens from later frames. Special tokens are always preserved. The schemes
+operate only in global attention, restore the attention residual to the
+original token layout, and run the full per-token MLP afterward. U-M builds
+the complete legal merge path with dynamic whole-group cosine reconstruction
+losses, chooses the better of the two parent representatives after each
+merge, and selects the operating point by
+`D_k + lambda_cost * active_k / total_k`. It does not use `min_keep_ratio` or
+`max_group_size`. The legacy limits remain available for H-M/H-R/U-R
+compatibility. Balanced defaults are N8, temporal window 1, overlap threshold
+0.5, minimum active ratio 0.4, H group size 4, and reassignment candidate
+limit 8. The evaluation scripts expose these as `--frame-fusion-*` options.
 
 ## Progressive Multi-Level Attention
 

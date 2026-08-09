@@ -1,4 +1,5 @@
 import pytest
+import numpy as np
 import torch
 
 from vggt_omega.models.aggregator import (
@@ -771,6 +772,133 @@ def test_spatiotemporal_representative_modes_protect_frame_zero(mode):
             minlength=plan.representative_source_indices.numel(),
         ).float(),
     )
-    assert set(range(4)).issubset(set(plan.representative_source_indices.tolist()))
+    frame_zero_representatives = torch.nonzero(
+        plan.representative_source_indices < 4,
+        as_tuple=False,
+    ).flatten()
+    assert frame_zero_representatives.numel() == 4
+    assert torch.equal(
+        torch.sort(plan.position_to_representative[0]).values,
+        torch.sort(frame_zero_representatives).values,
+    )
+    assert not bool(
+        torch.isin(
+            plan.position_to_representative[1:].reshape(-1),
+            frame_zero_representatives,
+        ).any()
+    )
     assert int(plan.position_to_representative.min()) >= 0
     assert int(plan.position_to_representative.max()) < plan.representative_source_indices.numel()
+
+
+@pytest.mark.parametrize("reallocate", (False, True))
+def test_unified_spatiotemporal_graph_excludes_frame_zero(reallocate):
+    model = Aggregator.__new__(Aggregator)
+    model.patch_token_start = 1
+    model.frame_fusion_min_keep_ratio = 0.4
+    model.frame_fusion_temporal_window = 1
+    model.frame_fusion_spatial_neighborhood = "N8"
+    model.frame_fusion_reassignment_candidates = 8
+    model.frame_fusion_max_group_size = 8
+    model.frame_fusion_representative_update = "parent"
+    model._frame_fusion_patch_grid_size = (1, 1)
+
+    # Make the non-reference frames identical so the old implementation
+    # would be tempted to absorb them into frame 0 through the temporal edge.
+    tokens = torch.tensor(
+        [
+            [[0.0, 0.0], [1.0, 0.0]],
+            [[0.0, 0.0], [0.0, 1.0]],
+            [[0.0, 0.0], [0.0, 1.0]],
+        ]
+    ).unsqueeze(0)
+    model.frame_fusion_mode = "u-r" if reallocate else "u-m"
+    plan = model._build_unified_representative_plan(tokens[0], reallocate=reallocate)
+
+    frame_zero_representatives = torch.nonzero(
+        plan.representative_source_indices < 1,
+        as_tuple=False,
+    ).flatten()
+    assert frame_zero_representatives.tolist() == [0]
+    assert plan.position_to_representative[0, 0].item() == 0
+    assert not bool(
+        torch.isin(
+            plan.position_to_representative[1:].reshape(-1),
+            frame_zero_representatives,
+        ).any()
+    )
+
+
+def test_unified_merge_path_does_not_use_min_keep_or_group_size_limits():
+    model = Aggregator.__new__(Aggregator)
+    model.patch_token_start = 1
+    model.frame_fusion_min_keep_ratio = 1.0
+    model.frame_fusion_max_group_size = 1
+    model.frame_fusion_temporal_window = 1
+    model.frame_fusion_spatial_neighborhood = "N8"
+    model.frame_fusion_time_overlap = 0.5
+    model.frame_fusion_representative_update = "parent"
+    model._frame_fusion_patch_grid_size = (1, 1)
+
+    # The reference frame is isolated.  The remaining three frames form one
+    # identical temporal chain, which must still produce a merge path despite
+    # deliberately restrictive legacy parameter values above.
+    tokens = torch.tensor(
+        [
+            [[0.0, 0.0], [0.0, 1.0]],
+            [[0.0, 0.0], [1.0, 0.0]],
+            [[0.0, 0.0], [1.0, 0.0]],
+            [[0.0, 0.0], [1.0, 0.0]],
+        ]
+    )
+    plan = model._build_unified_representative_plan(tokens, reallocate=False)
+
+    assert plan.representative_source_indices.numel() < 4
+    assert plan.position_to_representative[0, 0].item() == 0
+
+
+def test_spatiotemporal_group_error_uses_true_weighted_reconstruction_loss():
+    model = Aggregator.__new__(Aggregator)
+    model.frame_fusion_representative_update = "parent"
+    features = torch.nn.functional.normalize(
+        torch.tensor([[1.0, 0.0], [0.8, 0.6]]), dim=-1
+    )
+
+    _, selected_sources, debug = model._greedy_spatiotemporal_group_merge(
+        features,
+        np.arange(2, dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([1], dtype=np.int64),
+        protected=np.zeros(2, dtype=bool),
+        initial_weights=np.asarray([2.0, 1.0]),
+        lambda_cost=2.0,
+        prefer_best_parent=True,
+    )
+
+    # The merged group is represented by token 0. Its exact error is
+    # 1 * (1 - 0.8), averaged over total weight 3, rather than the old
+    # Ward-style d * 2 * 1 / 3 approximation.
+    assert selected_sources.tolist() == [0]
+    assert debug["accepted_merges"] == 1
+    assert debug["selected_distortion"] == pytest.approx(0.2 / 3.0, abs=1e-6)
+
+
+def test_unified_debug_uses_frame_count_for_attention_token_statistics():
+    model = Aggregator.__new__(Aggregator)
+    model.patch_token_start = 1
+    model.frame_fusion_mode = "u-m"
+    model.frame_fusion_lambda_cost = 0.25
+    model.frame_fusion_temporal_window = 1
+    model.frame_fusion_spatial_neighborhood = "N8"
+    model.frame_fusion_representative_update = "parent"
+    model._frame_fusion_patch_grid_size = (1, 1)
+
+    tokens = torch.randn((2, 3, 2, 4), generator=torch.Generator().manual_seed(13))
+    plans = model._build_spatiotemporal_representative_plans(tokens, source_layer=-1)
+    debug = model.last_frame_fusion_debug
+
+    assert debug["lambda_cost"] == pytest.approx(0.25)
+    assert debug["selection"] == "min(D_k + lambda_cost * active_k / total_k)"
+    assert debug["representative_update"] == "best-of-parents"
+    for batch_debug, plan in zip(debug["batches"], plans):
+        assert batch_debug["attention_tokens"] == 3 + plan.representative_source_indices.numel()
