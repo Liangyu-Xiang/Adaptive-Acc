@@ -2266,13 +2266,22 @@ class Aggregator(nn.Module):
                 costs.append(left_error.detach().float().cpu().numpy())
         edge_cost = np.concatenate(costs) if costs else np.empty(0, dtype=np.float32)
 
+        # The merge path is a CPU-side priority-queue operation.  Keep the
+        # feature sums on CPU after the one-time edge-cost pass so each
+        # dynamic group update does not launch a tiny GPU dot product and
+        # synchronize the device.  This is algebraically identical to the
+        # weighted cosine calculations above, but avoids hundreds of
+        # thousands of GPU/CPU synchronization points for 300-frame inputs.
+        feature_array = normalized_features.detach().float().cpu().numpy()
+        del normalized_features
+
         group_size: list[int] = [1] * count
         representative: list[int] = list(range(count))
         group_protected: list[bool] = [bool(value) for value in protected]
         group_weights: list[float] = [float(value) for value in initial_weights]
         # Singleton groups borrow their source feature without allocating a
         # second copy. Merged groups retain only their active weighted sum.
-        group_sums: list[torch.Tensor | None] = [None] * count
+        group_sums: list[np.ndarray | None] = [None] * count
         group_error: list[float] = [0.0] * count
         active: list[bool] = [True] * count
         group_alias: list[int] = list(range(count))
@@ -2291,28 +2300,24 @@ class Aggregator(nn.Module):
                 value = group_alias[value]
             return value
 
-        def group_sum(group: int) -> torch.Tensor:
+        def group_sum(group: int) -> np.ndarray:
             cached = group_sums[group]
             if cached is not None:
                 return cached
             if group_weights[group] == 1.0:
-                return normalized_features[group]
-            return normalized_features[group] * group_weights[group]
+                return feature_array[group]
+            return feature_array[group] * group_weights[group]
 
         def merge_statistics(
             left_group: int,
             right_group: int,
-        ) -> tuple[float, int, float, torch.Tensor]:
+        ) -> tuple[float, int, float, np.ndarray]:
             merged_weight = group_weights[left_group] + group_weights[right_group]
             merged_sum = group_sum(left_group) + group_sum(right_group)
             left_rep = representative[left_group]
             right_rep = representative[right_group]
-            left_error = merged_weight - float(
-                torch.dot(merged_sum, normalized_features[left_rep]).detach().cpu()
-            )
-            right_error = merged_weight - float(
-                torch.dot(merged_sum, normalized_features[right_rep]).detach().cpu()
-            )
+            left_error = merged_weight - float(np.dot(merged_sum, feature_array[left_rep]))
+            right_error = merged_weight - float(np.dot(merged_sum, feature_array[right_rep]))
             choose_right = (
                 (prefer_best_parent or getattr(self, "frame_fusion_representative_update", "parent") == "exact-medoid")
                 and right_error < left_error
@@ -2335,12 +2340,16 @@ class Aggregator(nn.Module):
         active_counts = [count]
         distortions = [0.0]
         total_error = 0.0
+        best_merges = 0
+        best_objective = float("inf")
         min_keep = None
         if min_keep_ratio is not None:
             min_keep = max(
                 int(np.ceil(count * float(min_keep_ratio))),
                 int(np.count_nonzero(protected)),
             )
+        if lambda_cost is not None:
+            best_objective = float(lambda_cost)
 
         while heap:
             _, _, queued_left, queued_right = heapq.heappop(heap)
@@ -2425,13 +2434,29 @@ class Aggregator(nn.Module):
             total_error += merge_delta
             active_counts.append(count - len(records))
             distortions.append(total_error / max(float(initial_weights.sum()), 1.0))
+            if lambda_cost is not None:
+                current_objective = distortions[-1] + float(lambda_cost) * (
+                    active_counts[-1] / max(float(count), 1.0)
+                )
+                if current_objective < best_objective:
+                    best_objective = current_objective
+                    best_merges = len(records)
+                # Group distortion is monotone under merging.  Therefore the
+                # best possible future objective is bounded below by the
+                # current distortion plus the cost at the minimum active
+                # count.  This is an exact early stop for a fixed lambda and
+                # avoids materializing the unused tail of the curve.
+                future_lower_bound = distortions[-1] + float(lambda_cost) * (
+                    (min_keep if min_keep is not None else 0)
+                    / max(float(count), 1.0)
+                )
+                if best_objective <= future_lower_bound:
+                    break
 
         if lambda_cost is not None:
-            active_ratio = np.asarray(active_counts, dtype=np.float64) / max(float(count), 1.0)
-            objective = np.asarray(distortions, dtype=np.float64) + float(lambda_cost) * active_ratio
-            selected_merges = int(np.argmin(objective))
+            selected_merges = best_merges
             selection = "min_distortion_plus_lambda_active_ratio"
-            selected_objective = float(objective[selected_merges])
+            selected_objective = best_objective
         else:
             selected_merges = self._spatiotemporal_knee_index(active_counts, distortions)
             selection = "geometric_knee"
