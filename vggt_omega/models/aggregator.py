@@ -2266,7 +2266,7 @@ class Aggregator(nn.Module):
                 costs.append(left_error.detach().float().cpu().numpy())
         edge_cost = np.concatenate(costs) if costs else np.empty(0, dtype=np.float32)
 
-        members: list[list[int]] = [[index] for index in range(count)]
+        group_size: list[int] = [1] * count
         representative: list[int] = list(range(count))
         group_protected: list[bool] = [bool(value) for value in protected]
         group_weights: list[float] = [float(value) for value in initial_weights]
@@ -2277,7 +2277,7 @@ class Aggregator(nn.Module):
         active: list[bool] = [True] * count
         group_alias: list[int] = list(range(count))
         group_adjacency: list[set[int]] = [set() for _ in range(count)]
-        for left, right in zip(edge_source.tolist(), edge_target.tolist()):
+        for left, right in zip(edge_source, edge_target):
             left = int(left)
             right = int(right)
             if left == right:
@@ -2323,7 +2323,7 @@ class Aggregator(nn.Module):
 
         heap: list[tuple[float, int, int, int]] = []
         heap_counter = 0
-        for edge_index, (left, right) in enumerate(zip(edge_source.tolist(), edge_target.tolist())):
+        for edge_index, (left, right) in enumerate(zip(edge_source, edge_target)):
             left = int(left)
             right = int(right)
             if left > right:
@@ -2331,7 +2331,7 @@ class Aggregator(nn.Module):
             heapq.heappush(heap, (float(edge_cost[edge_index]), heap_counter, left, right))
             heap_counter += 1
 
-        records: list[tuple[int, int, int, int, tuple[int, ...]]] = []
+        records: list[tuple[int, int, int, int]] = []
         active_counts = [count]
         distortions = [0.0]
         total_error = 0.0
@@ -2362,7 +2362,7 @@ class Aggregator(nn.Module):
             if (
                 (
                     max_group_size is not None
-                    and len(members[left_group]) + len(members[right_group]) > max_group_size
+                    and group_size[left_group] + group_size[right_group] > max_group_size
                 )
                 or group_protected[left_group]
                 or group_protected[right_group]
@@ -2371,9 +2371,8 @@ class Aggregator(nn.Module):
             if min_keep is not None and active_counts[-1] - 1 < min_keep:
                 break
             merge_delta, new_rep, new_error, merged_sum = merge_statistics(left_group, right_group)
-            merged_members = members[left_group] + members[right_group]
-            new_group = len(members)
-            members.append(merged_members)
+            new_group = len(group_size)
+            group_size.append(group_size[left_group] + group_size[right_group])
             representative.append(new_rep)
             group_protected.append(group_protected[left_group] or group_protected[right_group])
             group_weights.append(group_weights[left_group] + group_weights[right_group])
@@ -2396,7 +2395,7 @@ class Aggregator(nn.Module):
                     continue
                 if (
                     max_group_size is not None
-                    and len(members[new_group]) + len(members[neighbor]) > max_group_size
+                    and group_size[new_group] + group_size[neighbor] > max_group_size
                 ):
                     continue
                 neighbor_delta, _, _, _ = merge_statistics(new_group, neighbor)
@@ -2410,11 +2409,19 @@ class Aggregator(nn.Module):
                     ),
                 )
                 heap_counter += 1
+            group_adjacency[left_group].clear()
+            group_adjacency[right_group].clear()
+            group_sums[left_group] = None
+            group_sums[right_group] = None
+            group_size[left_group] = 0
+            group_size[right_group] = 0
+            group_weights[left_group] = 0.0
+            group_weights[right_group] = 0.0
+            group_error[left_group] = 0.0
+            group_error[right_group] = 0.0
             active[left_group] = False
             active[right_group] = False
-            records.append(
-                (left_group, right_group, new_group, new_rep, tuple(merged_members))
-            )
+            records.append((left_group, right_group, new_group, new_rep))
             total_error += merge_delta
             active_counts.append(count - len(records))
             distortions.append(total_error / max(float(initial_weights.sum()), 1.0))
@@ -2430,17 +2437,29 @@ class Aggregator(nn.Module):
             selection = "geometric_knee"
             selected_objective = None
         selected_merges = min(selected_merges, len(records))
-        assignment = np.arange(count, dtype=np.int64)
-        group_representative: dict[int, int] = {index: index for index in range(count)}
-        for left_group, right_group, new_group, new_rep, merged_members in records[:selected_merges]:
-            for member in merged_members:
-                assignment[member] = new_group
-            group_representative[new_group] = new_rep
+        replay_parent = np.arange(count + len(records), dtype=np.int64)
+
+        def replay_find(value: int) -> int:
+            while replay_parent[value] != value:
+                replay_parent[value] = replay_parent[replay_parent[value]]
+                value = int(replay_parent[value])
+            return value
+
+        for left_group, right_group, new_group, _ in records[:selected_merges]:
+            left_root = replay_find(left_group)
+            right_root = replay_find(right_group)
+            replay_parent[left_root] = new_group
+            replay_parent[right_root] = new_group
+            replay_parent[new_group] = new_group
+        assignment = np.asarray(
+            [replay_find(index) for index in range(count)],
+            dtype=np.int64,
+        )
         unique_groups = sorted(set(int(group) for group in assignment))
         group_to_local = {group: local for local, group in enumerate(unique_groups)}
         mapping = np.asarray([group_to_local[int(group)] for group in assignment], dtype=np.int64)
         selected_sources = np.asarray(
-            [source_indices[group_representative[group]] for group in unique_groups],
+            [source_indices[representative[group]] for group in unique_groups],
             dtype=np.int64,
         )
         debug = {
@@ -2455,7 +2474,7 @@ class Aggregator(nn.Module):
             "selected_distortion": float(distortions[selected_merges]),
             "selected_objective": selected_objective,
             "selection": selection,
-            "group_size_max": int(max((len(group) for group in members), default=1)),
+            "group_size_max": int(max(group_size, default=1)),
         }
         return mapping, selected_sources, debug
 
@@ -2517,23 +2536,50 @@ class Aggregator(nn.Module):
                         edges_right.append(other)
             edge_left = np.asarray(edges_left, dtype=np.int64)
             edge_right = np.asarray(edges_right, dtype=np.int64)
+            protected_indices = np.flatnonzero(protected).astype(np.int64)
+            search_indices = np.flatnonzero(~protected).astype(np.int64)
+            temporal_weights = temporal_plan.representative_weights.detach().cpu().numpy()
+            local_index = np.full(temporal_count, -1, dtype=np.int64)
+            local_index[search_indices] = np.arange(search_indices.size, dtype=np.int64)
+            search_edge_left = local_index[edge_left]
+            search_edge_right = local_index[edge_right]
             assignment, selected_sources, merge_debug = self._greedy_spatiotemporal_group_merge(
-                source_features,
-                np.arange(temporal_count, dtype=np.int64),
-                edge_left,
-                edge_right,
-                protected=protected,
-                initial_weights=temporal_plan.representative_weights.detach().cpu().numpy(),
+                source_features.index_select(
+                    0,
+                    torch.as_tensor(search_indices, device=tokens.device, dtype=torch.long),
+                ),
+                search_indices,
+                search_edge_left,
+                search_edge_right,
+                protected=np.zeros(search_indices.size, dtype=bool),
+                initial_weights=temporal_weights[search_indices],
                 max_group_size=int(getattr(self, "frame_fusion_max_group_size", 4)),
                 min_keep_ratio=float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)),
             )
+            temporal_to_final = np.full(temporal_count, -1, dtype=np.int64)
+            temporal_to_final[protected_indices] = np.arange(protected_indices.size, dtype=np.int64)
+            temporal_to_final[search_indices] = protected_indices.size + assignment
             final_mapping = torch.as_tensor(
-                assignment[temporal_mapping.reshape(-1)].reshape(num_frames, patch_count),
+                temporal_to_final[temporal_mapping.reshape(-1)].reshape(num_frames, patch_count),
                 device=tokens.device,
                 dtype=torch.long,
             )
             final_sources = torch.as_tensor(
-                temporal_sources[selected_sources], device=tokens.device, dtype=torch.long
+                np.concatenate(
+                    [
+                        temporal_sources[protected_indices],
+                        temporal_sources[selected_sources],
+                    ]
+                ),
+                device=tokens.device,
+                dtype=torch.long,
+            )
+            merge_debug.update(
+                {
+                    "reference_frame_patch_tokens": int(protected_indices.size),
+                    "search_space_patch_tokens": int(search_indices.size),
+                    "search_space_excludes_frame_zero": True,
+                }
             )
         else:
             candidate_lists: list[list[int]] = []
@@ -2720,16 +2766,41 @@ class Aggregator(nn.Module):
                 include_temporal_spatial=False,
                 exclude_frame_zero=True,
             )
-            final_mapping, selected_sources, debug = self._greedy_spatiotemporal_group_merge(
-                normalized,
-                np.arange(total, dtype=np.int64),
-                edge_source,
-                edge_target,
-                protected=protected,
+            search_indices = np.flatnonzero(~protected).astype(np.int64)
+            local_index = np.full(total, -1, dtype=np.int64)
+            local_index[search_indices] = np.arange(search_indices.size, dtype=np.int64)
+            search_edge_source = local_index[edge_source]
+            search_edge_target = local_index[edge_target]
+            search_features = normalized.index_select(
+                0,
+                torch.as_tensor(search_indices, device=tokens.device, dtype=torch.long),
+            )
+            search_mapping, search_sources, debug = self._greedy_spatiotemporal_group_merge(
+                search_features,
+                search_indices,
+                search_edge_source,
+                search_edge_target,
+                protected=np.zeros(search_indices.size, dtype=bool),
                 max_group_size=None,
                 min_keep_ratio=float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)),
                 lambda_cost=float(getattr(self, "frame_fusion_lambda_cost", 0.15)),
                 prefer_best_parent=True,
+            )
+            final_mapping = np.empty(total, dtype=np.int64)
+            final_mapping[:patch_count] = np.arange(patch_count, dtype=np.int64)
+            final_mapping[search_indices] = patch_count + search_mapping
+            selected_sources = np.concatenate(
+                [
+                    np.arange(patch_count, dtype=np.int64),
+                    search_sources,
+                ]
+            )
+            debug.update(
+                {
+                    "reference_frame_patch_tokens": patch_count,
+                    "search_space_patch_tokens": int(search_indices.size),
+                    "search_space_excludes_frame_zero": True,
+                }
             )
         mapping = torch.as_tensor(final_mapping.reshape(num_frames, patch_count), device=tokens.device, dtype=torch.long)
         source_indices = torch.as_tensor(selected_sources, device=tokens.device, dtype=torch.long)
