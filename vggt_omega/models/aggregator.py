@@ -80,6 +80,15 @@ class TemporalRepresentativeBatchPlan:
     representative_weights: torch.Tensor
 
 
+@dataclass(frozen=True)
+class SpatialRepresentativeBatchPlan:
+    """Fixed per-frame spatial representative mapping for one batch element."""
+
+    position_to_representative: torch.Tensor
+    representative_source_indices: torch.Tensor
+    representative_weights: torch.Tensor
+
+
 class Aggregator(nn.Module):
     """Alternating-attention encoder over video frames."""
 
@@ -154,7 +163,13 @@ class Aggregator(nn.Module):
         frame_fusion_target_keep_threshold: float = 0.0,
         frame_fusion_target_keep_seed: int = 33,
         frame_fusion_recompute_each_global: bool = False,
-        frame_fusion_lambda_cost: float = 1.0,
+        frame_fusion_lambda_cost: float = 0.15,
+        frame_fusion_min_keep_ratio: float = 0.4,
+        frame_fusion_temporal_window: int = 1,
+        frame_fusion_spatial_neighborhood: str = "N8",
+        frame_fusion_time_overlap: float = 0.5,
+        frame_fusion_reassignment_candidates: int = 8,
+        frame_fusion_representative_update: str = "parent",
     ) -> None:
         super().__init__()
 
@@ -287,8 +302,18 @@ class Aggregator(nn.Module):
         self.frame_fusion_target_keep_threshold = float(frame_fusion_target_keep_threshold)
         self.frame_fusion_target_keep_seed = int(frame_fusion_target_keep_seed)
         self.frame_fusion_recompute_each_global = bool(frame_fusion_recompute_each_global)
+        self.frame_fusion_min_keep_ratio = float(frame_fusion_min_keep_ratio)
+        self.frame_fusion_temporal_window = int(frame_fusion_temporal_window)
+        self.frame_fusion_spatial_neighborhood = str(frame_fusion_spatial_neighborhood).upper()
+        self.frame_fusion_time_overlap = float(frame_fusion_time_overlap)
+        self.frame_fusion_reassignment_candidates = int(frame_fusion_reassignment_candidates)
+        self.frame_fusion_representative_update = str(frame_fusion_representative_update)
         self.last_frame_fusion_debug: dict[str, object] = {}
         self._frame_fusion_debug_layers: list[dict[str, object]] = []
+        self._frame_fusion_plan_seconds = 0.0
+        self._frame_fusion_global_attention_seconds = 0.0
+        self.last_fastvggt_debug: dict[str, object] = {}
+        self._fastvggt_merge_debug_layers: list[dict[str, object]] = []
         self.layer_token_swap_layer: int | None = None
         self.layer_token_swap_kind = "none"
         self.layer_token_swap_pairs: tuple[tuple[int, int], ...] = ()
@@ -374,6 +399,25 @@ class Aggregator(nn.Module):
     def _frame_fusion_enabled(self) -> bool:
         return self.frame_fusion_mode != "none"
 
+    def _frame_fusion_then_fastvggt_enabled(self) -> bool:
+        """Whether representative fusion is followed by FastVGGT merging.
+
+        Temporal representatives produce a full token sequence after their
+        attention residual is restored, so subsequent global blocks can use
+        the ordinary FastVGGT bipartite merge path. Pair/group fusion does not
+        have this sequential composition and remains mutually exclusive with
+        token merging.
+        """
+
+        return self.frame_fusion_mode in {
+            "temporal-representative",
+            "adaptive-temporal-representative",
+        } and self._merge_is_enabled(
+            getattr(self, "global_merging", False),
+            getattr(self, "merging", None),
+            getattr(self, "merge_ratio", 0.0),
+        )
+
     def init_weights(self) -> None:
         nn.init.normal_(self.camera_token, std=1e-3)
         nn.init.normal_(self.register_token, std=1e-3)
@@ -383,7 +427,14 @@ class Aggregator(nn.Module):
             raise ValueError(f"merge_ratio must be between 0.0 and 1.0, got {merge_ratio}")
         if self.sparse_attention and merge_ratio > 0.0:
             raise ValueError("Sparse attention and token merging are mutually exclusive")
-        if self._frame_fusion_enabled() and self._merge_is_enabled(self.global_merging, self.merging, merge_ratio):
+        if (
+            self._frame_fusion_enabled()
+            and self.frame_fusion_mode not in {
+                "temporal-representative",
+                "adaptive-temporal-representative",
+            }
+            and self._merge_is_enabled(self.global_merging, self.merging, merge_ratio)
+        ):
             raise ValueError("Frame fusion requires merge_ratio=0 or disabled token merging")
         if (
             self.use_adaptive_kv_anchor
@@ -506,7 +557,7 @@ class Aggregator(nn.Module):
         target_keep_threshold: float = 0.0,
         target_keep_seed: int = 33,
         recompute_each_global: bool = False,
-        lambda_cost: float = 1.0,
+        lambda_cost: float = 0.15,
     ) -> None:
         mode = mode.replace("_", "-")
         valid_modes = {
@@ -518,6 +569,11 @@ class Aggregator(nn.Module):
             "sequential-group-average",
             "temporal-representative",
             "adaptive-temporal-representative",
+            "adaptive-spatial-representative",
+            "h-m",
+            "h-r",
+            "u-m",
+            "u-r",
         }
         if mode not in valid_modes:
             raise ValueError(f"frame_fusion_mode must be one of {sorted(valid_modes)}, got {mode!r}")
@@ -574,6 +630,36 @@ class Aggregator(nn.Module):
         lambda_cost = float(lambda_cost)
         if lambda_cost < 0.0:
             raise ValueError(f"frame_fusion_lambda_cost must be non-negative, got {lambda_cost}")
+        min_keep_ratio = float(getattr(self, "frame_fusion_min_keep_ratio", 0.4))
+        if not 0.0 < min_keep_ratio <= 1.0:
+            raise ValueError(
+                f"frame_fusion_min_keep_ratio must be in (0, 1], got {min_keep_ratio}"
+            )
+        temporal_window = int(getattr(self, "frame_fusion_temporal_window", 1))
+        if temporal_window <= 0:
+            raise ValueError("frame_fusion_temporal_window must be positive")
+        spatial_neighborhood = str(
+            getattr(self, "frame_fusion_spatial_neighborhood", "N8")
+        ).upper()
+        if spatial_neighborhood not in {"N4", "N8", "N8-R2"}:
+            raise ValueError(
+                "frame_fusion_spatial_neighborhood must be N4, N8, or N8-R2"
+            )
+        time_overlap = float(getattr(self, "frame_fusion_time_overlap", 0.5))
+        if not 0.0 <= time_overlap <= 1.0:
+            raise ValueError("frame_fusion_time_overlap must be in [0, 1]")
+        reassignment_candidates = int(
+            getattr(self, "frame_fusion_reassignment_candidates", 8)
+        )
+        if reassignment_candidates <= 0:
+            raise ValueError("frame_fusion_reassignment_candidates must be positive")
+        representative_update = str(
+            getattr(self, "frame_fusion_representative_update", "parent")
+        ).replace("_", "-")
+        if representative_update not in {"parent", "exact-medoid"}:
+            raise ValueError(
+                "frame_fusion_representative_update must be parent or exact-medoid"
+            )
         if mode == "dp-medoid":
             if num_groups is None:
                 raise ValueError("frame_fusion_k is required when frame_fusion_mode='dp-medoid'")
@@ -599,8 +685,6 @@ class Aggregator(nn.Module):
             "group-top-percent",
             "sequential-group",
             "sequential-group-average",
-            "temporal-representative",
-            "adaptive-temporal-representative",
         }:
             num_groups = None
             if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio):
@@ -618,6 +702,69 @@ class Aggregator(nn.Module):
                     "frame_fusion_target_keep_percent must be positive for least-similar retention"
                 )
             if recompute_each_global and mode != "pair-top-percent":
+                raise ValueError(
+                    "per-global recomputation is only supported for pair-top-percent frame fusion"
+                )
+        elif mode in {
+            "temporal-representative",
+            "adaptive-temporal-representative",
+        }:
+            num_groups = None
+            if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio):
+                # Temporal representative fusion is applied once, then the
+                # restored full token sequence enters FastVGGT on subsequent
+                # global blocks.
+                pass
+            if self.sparse_attention:
+                raise ValueError("frame fusion and sparse attention are mutually exclusive")
+            if self.progressive_attention_config.enabled:
+                raise ValueError("frame fusion and progressive attention are mutually exclusive")
+            if self.inter_frame_only_layers:
+                raise ValueError("frame fusion and inter-frame-only attention are mutually exclusive")
+            if self.use_adaptive_kv_anchor and self.adaptive_anchor_layers:
+                raise ValueError("frame fusion and adaptive K/V anchors are mutually exclusive")
+            if target_keep_policy == "least-similar" and target_keep_percent <= 0.0:
+                raise ValueError(
+                    "frame_fusion_target_keep_percent must be positive for least-similar retention"
+                )
+            if recompute_each_global:
+                raise ValueError(
+                    "per-global recomputation is only supported for pair-top-percent frame fusion"
+                )
+        elif mode == "adaptive-spatial-representative":
+            num_groups = None
+            if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio):
+                raise ValueError(
+                    "adaptive spatial representative fusion requires merge_ratio=0; "
+                    "it is evaluated as a standalone spatial scheme"
+                )
+            if self.sparse_attention:
+                raise ValueError("frame fusion and sparse attention are mutually exclusive")
+            if self.progressive_attention_config.enabled:
+                raise ValueError("frame fusion and progressive attention are mutually exclusive")
+            if self.inter_frame_only_layers:
+                raise ValueError("frame fusion and inter-frame-only attention are mutually exclusive")
+            if self.use_adaptive_kv_anchor and self.adaptive_anchor_layers:
+                raise ValueError("frame fusion and adaptive K/V anchors are mutually exclusive")
+            if recompute_each_global:
+                raise ValueError(
+                    "per-global recomputation is only supported for pair-top-percent frame fusion"
+                )
+        elif mode in {"h-m", "h-r", "u-m", "u-r"}:
+            num_groups = None
+            if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio):
+                raise ValueError(
+                    "unified spatiotemporal representative fusion requires merge_ratio=0"
+                )
+            if self.sparse_attention:
+                raise ValueError("frame fusion and sparse attention are mutually exclusive")
+            if self.progressive_attention_config.enabled:
+                raise ValueError("frame fusion and progressive attention are mutually exclusive")
+            if self.inter_frame_only_layers:
+                raise ValueError("frame fusion and inter-frame-only attention are mutually exclusive")
+            if self.use_adaptive_kv_anchor and self.adaptive_anchor_layers:
+                raise ValueError("frame fusion and adaptive K/V anchors are mutually exclusive")
+            if recompute_each_global:
                 raise ValueError(
                     "per-global recomputation is only supported for pair-top-percent frame fusion"
                 )
@@ -641,8 +788,18 @@ class Aggregator(nn.Module):
         self.frame_fusion_target_keep_seed = target_keep_seed
         self.frame_fusion_recompute_each_global = recompute_each_global
         self.frame_fusion_lambda_cost = lambda_cost
+        self.frame_fusion_min_keep_ratio = min_keep_ratio
+        self.frame_fusion_temporal_window = temporal_window
+        self.frame_fusion_spatial_neighborhood = spatial_neighborhood
+        self.frame_fusion_time_overlap = time_overlap
+        self.frame_fusion_reassignment_candidates = reassignment_candidates
+        self.frame_fusion_representative_update = representative_update
         self.last_frame_fusion_debug.clear()
         self._frame_fusion_debug_layers.clear()
+        self._frame_fusion_plan_seconds = 0.0
+        self._frame_fusion_global_attention_seconds = 0.0
+        self.last_fastvggt_debug.clear()
+        self._fastvggt_merge_debug_layers.clear()
 
     def progressive_attention_metadata(self) -> dict[str, object]:
         config = self.progressive_attention_config
@@ -1075,6 +1232,7 @@ class Aggregator(nn.Module):
         _, num_tokens, embed_dim = tokens.shape
 
         patch_grid_size = (height // self.patch_size, width // self.patch_size)
+        self._frame_fusion_patch_grid_size = patch_grid_size
         with torch.no_grad():
             rope_sin, rope_cos = self.rope_embed(H=patch_grid_size[0], W=patch_grid_size[1])
             frame_rope = (
@@ -1091,11 +1249,17 @@ class Aggregator(nn.Module):
         self.last_adaptive_pair_scope_debug.clear()
         self.last_frame_fusion_debug.clear()
         self._frame_fusion_debug_layers.clear()
+        self.last_fastvggt_debug.clear()
+        self._fastvggt_merge_debug_layers.clear()
 
         tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
         frame_fusion_restore_index: torch.Tensor | None = None
         frame_fusion_pair_plans: list[FrameFusionBatchPlan] | None = None
         temporal_representative_plans: list[TemporalRepresentativeBatchPlan] | None = None
+        spatial_representative_plans: list[SpatialRepresentativeBatchPlan] | None = None
+        spatiotemporal_representative_plans: list[TemporalRepresentativeBatchPlan] | None = None
+        temporal_representative_applied = False
+        frame_fusion_then_fastvggt = self._frame_fusion_then_fastvggt_enabled()
         frame_fusion_applied = False
         recompute_pair_plans_each_global = (
             self.frame_fusion_mode in {
@@ -1142,6 +1306,24 @@ class Aggregator(nn.Module):
                     tokens,
                     source_layer=-1,
                 )
+        elif (
+            self.frame_fusion_mode == "adaptive-spatial-representative"
+            and self.frame_fusion_start_layer == -1
+        ):
+            spatial_representative_plans = self._build_adaptive_spatial_representative_plans(
+                tokens,
+                source_layer=-1,
+            )
+        elif (
+            self.frame_fusion_mode in {"h-m", "h-r", "u-m", "u-r"}
+            and self.frame_fusion_start_layer == -1
+        ):
+            spatiotemporal_representative_plans = (
+                self._build_spatiotemporal_representative_plans(
+                    tokens,
+                    source_layer=-1,
+                )
+            )
         tokens = tokens.view(batch_size * num_frames, num_tokens, embed_dim)
 
         for block_idx in range(self.depth):
@@ -1156,6 +1338,11 @@ class Aggregator(nn.Module):
             )
             current_pair_plans = frame_fusion_pair_plans
             current_temporal_plans = temporal_representative_plans
+            current_spatial_plans = spatial_representative_plans
+            current_spatiotemporal_plans = spatiotemporal_representative_plans
+            if frame_fusion_then_fastvggt and temporal_representative_applied:
+                current_temporal_plans = None
+            fastvggt_enabled = not frame_fusion_then_fastvggt or temporal_representative_applied
             if recompute_pair_plans_each_global:
                 current_pair_plans = None
                 first_recompute_layer = max(self.frame_fusion_start_layer, 0)
@@ -1203,6 +1390,28 @@ class Aggregator(nn.Module):
                         source_layer=block_idx,
                     )
                 current_temporal_plans = temporal_representative_plans
+            elif (
+                self.frame_fusion_mode == "adaptive-spatial-representative"
+                and spatial_representative_plans is None
+                and self.frame_fusion_start_layer == block_idx
+            ):
+                spatial_representative_plans = self._build_adaptive_spatial_representative_plans(
+                    frame_tokens,
+                    source_layer=block_idx,
+                )
+                current_spatial_plans = spatial_representative_plans
+            elif (
+                self.frame_fusion_mode in {"h-m", "h-r", "u-m", "u-r"}
+                and spatiotemporal_representative_plans is None
+                and self.frame_fusion_start_layer == block_idx
+            ):
+                spatiotemporal_representative_plans = (
+                    self._build_spatiotemporal_representative_plans(
+                        frame_tokens,
+                        source_layer=block_idx,
+                    )
+                )
+                current_spatiotemporal_plans = spatiotemporal_representative_plans
             tokens = self._run_inter_frame_attention_block(
                 tokens,
                 batch_size,
@@ -1214,7 +1423,16 @@ class Aggregator(nn.Module):
                 patch_grid_size,
                 frame_fusion_pair_plans=current_pair_plans,
                 temporal_representative_plans=current_temporal_plans,
+                spatial_representative_plans=current_spatial_plans,
+                spatiotemporal_representative_plans=current_spatiotemporal_plans,
+                fastvggt_enabled=fastvggt_enabled,
             )
+            if (
+                frame_fusion_then_fastvggt
+                and current_temporal_plans is not None
+                and self.inter_frame_attention_types[block_idx] == "global"
+            ):
+                temporal_representative_applied = True
             layer_token_swap_active = (
                 self.layer_token_swap_layer == block_idx
                 and self.layer_token_swap_kind != "none"
@@ -1254,6 +1472,32 @@ class Aggregator(nn.Module):
                 num_frames = tokens.shape[1]
                 frame_fusion_applied = True
 
+        merge_layers = self._fastvggt_merge_debug_layers
+        input_total = sum(int(layer["input_tokens"]) for layer in merge_layers)
+        output_total = sum(int(layer["output_tokens"]) for layer in merge_layers)
+        merged_total = sum(int(layer["merged_tokens"]) for layer in merge_layers)
+        self.last_fastvggt_debug = {
+            "enabled": bool(
+                self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio)
+            ),
+            "requested_merge_ratio": float(self.merge_ratio),
+            "merge_start_layer": int(self.merging) if self.merging is not None else None,
+            "full_attention_tokens_per_layer": int(batch_size * original_num_frames * num_tokens),
+            "num_merge_layers": len(merge_layers),
+            "input_tokens_total": input_total,
+            "output_tokens_total": output_total,
+            "merged_tokens_total": merged_total,
+            "retention_vs_fastvggt_input": output_total / max(input_total, 1),
+            "merged_fraction_vs_fastvggt_input": merged_total / max(input_total, 1),
+            "layers": merge_layers,
+        }
+        if self.last_frame_fusion_debug:
+            self.last_frame_fusion_debug["planning_seconds"] = float(
+                self._frame_fusion_plan_seconds
+            )
+            self.last_frame_fusion_debug["global_attention_seconds"] = float(
+                self._frame_fusion_global_attention_seconds
+            )
         return outputs, self.patch_token_start
 
     def _apply_layer_token_swap(
@@ -1366,6 +1610,8 @@ class Aggregator(nn.Module):
         self.last_frame_fusion_debug = {
             "mode": self.frame_fusion_mode,
             "source_layer": source_layer,
+            "fastvggt_after_frame_fusion": self._frame_fusion_then_fastvggt_enabled(),
+            "fastvggt_merge_ratio": self.merge_ratio if self._frame_fusion_then_fastvggt_enabled() else 0.0,
             "num_frames": num_frames,
             "num_fused_frames": fused.shape[1],
             "tokens_per_frame": num_tokens,
@@ -1851,6 +2097,8 @@ class Aggregator(nn.Module):
         self.last_frame_fusion_debug = {
             "mode": self.frame_fusion_mode,
             "source_layer": source_layer,
+            "fastvggt_after_frame_fusion": self._frame_fusion_then_fastvggt_enabled(),
+            "fastvggt_merge_ratio": self.merge_ratio if self._frame_fusion_then_fastvggt_enabled() else 0.0,
             "num_frames": num_frames,
             "tokens_per_frame": num_tokens,
             "patch_tokens_per_frame": patch_count,
@@ -1864,6 +2112,787 @@ class Aggregator(nn.Module):
             if debug_batches
             else 0,
             "patch_token_retention_vs_full": float(debug_batches[0]["patch_token_retention_vs_full"])
+            if debug_batches
+            else 1.0,
+            "batches": debug_batches,
+        }
+        return plans
+
+    @staticmethod
+    def _spatiotemporal_neighbor_offsets(neighborhood: str) -> tuple[tuple[int, int], ...]:
+        neighborhood = neighborhood.upper()
+        offsets = [(0, 1), (1, 0)]
+        if neighborhood in {"N8", "N8-R2"}:
+            offsets.extend([(1, 1), (1, -1)])
+        if neighborhood == "N8-R2":
+            offsets.extend([(0, 2), (2, 0)])
+        return tuple(offsets)
+
+    def _build_local_spatiotemporal_edges(
+        self,
+        num_frames: int,
+        patch_count: int,
+        *,
+        include_temporal_spatial: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build the local candidate graph without an N-by-N distance matrix."""
+
+        height, width = getattr(self, "_frame_fusion_patch_grid_size", (1, patch_count))
+        if height * width != patch_count:
+            height, width = 1, patch_count
+        offsets = self._spatiotemporal_neighbor_offsets(
+            getattr(self, "frame_fusion_spatial_neighborhood", "N8")
+        )
+        temporal_window = int(getattr(self, "frame_fusion_temporal_window", 1))
+        source: list[int] = []
+        target: list[int] = []
+        for frame in range(num_frames):
+            for row in range(height):
+                for col in range(width):
+                    position = row * width + col
+                    current = frame * patch_count + position
+                    for dr, dc in offsets:
+                        nr, nc = row + dr, col + dc
+                        if nr < 0 or nr >= height or nc < 0 or nc >= width:
+                            continue
+                        source.append(current)
+                        target.append(frame * patch_count + nr * width + nc)
+                    for delta in range(1, temporal_window + 1):
+                        if frame + delta < num_frames:
+                            source.append(current)
+                            target.append((frame + delta) * patch_count + position)
+                            if include_temporal_spatial:
+                                for dr, dc in offsets:
+                                    nr, nc = row + dr, col + dc
+                                    if 0 <= nr < height and 0 <= nc < width:
+                                        source.append(current)
+                                        target.append(
+                                            (frame + delta) * patch_count
+                                            + nr * width
+                                            + nc
+                                        )
+        return (
+            np.asarray(source, dtype=np.int64),
+            np.asarray(target, dtype=np.int64),
+        )
+
+    @staticmethod
+    def _spatiotemporal_knee_index(
+        active_counts: list[int],
+        distortions: list[float],
+    ) -> int:
+        if len(active_counts) <= 2:
+            return 0
+        x = np.asarray(active_counts, dtype=np.float64)
+        y = np.asarray(distortions, dtype=np.float64)
+        x = (x - x[-1]) / max(x[0] - x[-1], 1.0)
+        y = (y - y[0]) / max(y[-1] - y[0], 1e-12)
+        start = np.asarray([x[0], y[0]])
+        end = np.asarray([x[-1], y[-1]])
+        direction = end - start
+        norm = max(float(np.linalg.norm(direction)), 1e-12)
+        points = np.stack([x, y], axis=1)
+        distances = np.abs(
+            direction[0] * (start[1] - points[:, 1])
+            - (start[0] - points[:, 0]) * direction[1]
+        ) / norm
+        # Index zero is the uncompressed endpoint.  A zero-curvature curve is
+        # allowed to keep the minimum configured number of tokens.
+        return int(np.argmax(distances[1:]) + 1)
+
+    def _greedy_spatiotemporal_group_merge(
+        self,
+        normalized_features: torch.Tensor,
+        source_indices: np.ndarray,
+        edge_source: np.ndarray,
+        edge_target: np.ndarray,
+        *,
+        protected: np.ndarray,
+        initial_weights: np.ndarray | None = None,
+        max_group_size: int,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+        """Greedy local whole-group merging used by H-M and U-M.
+
+        The edge queue is local in time and space.  Groups are never split;
+        the final representative is selected from the group's parent tokens.
+        This keeps the exact whole-group semantics while making 300-frame
+        planning practical.
+        """
+
+        count = int(source_indices.size)
+        if count == 0:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), {}
+        if initial_weights is None:
+            initial_weights = np.ones(count, dtype=np.float64)
+        costs: list[np.ndarray] = []
+        feature_device = normalized_features.device
+        chunk_size = 250_000
+        for start in range(0, edge_source.size, chunk_size):
+            end = min(start + chunk_size, edge_source.size)
+            left = torch.as_tensor(edge_source[start:end], device=feature_device)
+            right = torch.as_tensor(edge_target[start:end], device=feature_device)
+            costs.append(
+                (1.0 - (normalized_features[left] * normalized_features[right]).sum(dim=-1))
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+            )
+        edge_cost = np.concatenate(costs) if costs else np.empty(0, dtype=np.float32)
+        order = np.argsort(edge_cost, kind="stable")
+
+        parent = np.arange(count, dtype=np.int64)
+        current_group = np.arange(count, dtype=np.int64)
+
+        def find(value: int) -> int:
+            while parent[value] != value:
+                parent[value] = parent[parent[value]]
+                value = int(parent[value])
+            return value
+
+        members: list[list[int]] = [[index] for index in range(count)]
+        representative: list[int] = list(range(count))
+        group_protected: list[bool] = [bool(value) for value in protected]
+        group_weights: list[float] = [float(value) for value in initial_weights]
+        group_error: list[float] = [0.0] * count
+        records: list[tuple[int, int, int, int, tuple[int, ...]]] = []
+        active_counts = [count]
+        distortions = [0.0]
+        total_error = 0.0
+        min_keep = max(
+            int(np.ceil(count * float(getattr(self, "frame_fusion_min_keep_ratio", 0.4)))),
+            int(np.count_nonzero(protected)),
+        )
+
+        for edge_index in order:
+            left_root = find(int(edge_source[edge_index]))
+            right_root = find(int(edge_target[edge_index]))
+            if left_root == right_root:
+                continue
+            left_group = int(current_group[left_root])
+            right_group = int(current_group[right_root])
+            if (
+                len(members[left_group]) + len(members[right_group]) > max_group_size
+                or (group_protected[left_group] and group_protected[right_group])
+            ):
+                continue
+            left_rep = representative[left_group]
+            right_rep = representative[right_group]
+            merged_members = members[left_group] + members[right_group]
+            if group_protected[left_group]:
+                new_rep = left_rep
+            elif group_protected[right_group]:
+                new_rep = right_rep
+            else:
+                new_rep = left_rep
+                if getattr(self, "frame_fusion_representative_update", "parent") == "exact-medoid":
+                    candidate_reps = [left_rep, right_rep]
+                    candidate_errors = []
+                    for candidate in candidate_reps:
+                        member_tensor = torch.as_tensor(merged_members, device=feature_device)
+                        candidate_errors.append(
+                            float(
+                                (1.0 - (normalized_features[member_tensor] * normalized_features[candidate]).sum(dim=-1))
+                                .detach()
+                                .double()
+                                .cpu()
+                                .sum()
+                            )
+                        )
+                    new_rep = candidate_reps[int(np.argmin(candidate_errors))]
+            merge_distance = float(edge_cost[edge_index])
+            left_weight = max(group_weights[left_group], 1e-12)
+            right_weight = max(group_weights[right_group], 1e-12)
+            new_error = group_error[left_group] + group_error[right_group]
+            new_error += merge_distance * left_weight * right_weight / (left_weight + right_weight)
+            new_group = len(members)
+            members.append(merged_members)
+            representative.append(new_rep)
+            group_protected.append(group_protected[left_group] or group_protected[right_group])
+            group_weights.append(group_weights[left_group] + group_weights[right_group])
+            group_error.append(new_error)
+            records.append(
+                (left_group, right_group, new_group, new_rep, tuple(merged_members))
+            )
+            total_error += max(0.0, new_error - group_error[left_group] - group_error[right_group])
+            active_counts.append(count - len(records))
+            distortions.append(total_error / max(float(initial_weights.sum()), 1.0))
+            parent[right_root] = left_root
+            current_group[left_root] = new_group
+            if active_counts[-1] <= min_keep:
+                break
+
+        selected_merges = self._spatiotemporal_knee_index(active_counts, distortions)
+        selected_merges = min(selected_merges, len(records))
+        assignment = np.arange(count, dtype=np.int64)
+        group_representative: dict[int, int] = {index: index for index in range(count)}
+        for left_group, right_group, new_group, new_rep, merged_members in records[:selected_merges]:
+            for member in merged_members:
+                assignment[member] = new_group
+            group_representative[new_group] = new_rep
+        unique_groups = sorted(set(int(group) for group in assignment))
+        group_to_local = {group: local for local, group in enumerate(unique_groups)}
+        mapping = np.asarray([group_to_local[int(group)] for group in assignment], dtype=np.int64)
+        selected_sources = np.asarray(
+            [source_indices[group_representative[group]] for group in unique_groups],
+            dtype=np.int64,
+        )
+        debug = {
+            "initial_active_tokens": count,
+            "minimum_active_tokens": min_keep,
+            "accepted_merges": len(records),
+            "selected_merges": selected_merges,
+            "knee_active_tokens": int(selected_sources.size),
+            "knee_distortion": float(distortions[selected_merges]),
+            "group_size_max": int(max((len(group) for group in members), default=1)),
+        }
+        return mapping, selected_sources, debug
+
+    def _build_hybrid_representative_plan(
+        self,
+        tokens: torch.Tensor,
+        temporal_plan: TemporalRepresentativeBatchPlan,
+        *,
+        reallocate: bool,
+    ) -> TemporalRepresentativeBatchPlan:
+        """Apply H-M or H-R to the active representatives from the time stage."""
+
+        patch_tokens = tokens[:, self.patch_token_start :].reshape(-1, tokens.shape[-1])
+        patch_count = tokens.shape[1] - self.patch_token_start
+        num_frames = tokens.shape[0]
+        temporal_mapping = temporal_plan.position_to_representative.detach().cpu().numpy()
+        temporal_sources = temporal_plan.representative_source_indices.detach().cpu().numpy()
+        temporal_count = int(temporal_sources.size)
+        if temporal_count == 0:
+            return temporal_plan
+        normalized = torch.nn.functional.normalize(patch_tokens.float(), p=2, dim=-1, eps=1e-8)
+        source_features = normalized.index_select(
+            0, torch.as_tensor(temporal_sources, device=normalized.device)
+        )
+        source_frames = temporal_sources // patch_count
+        source_positions = temporal_sources % patch_count
+        protected = source_frames == 0
+
+        if not reallocate:
+            height, width = getattr(self, "_frame_fusion_patch_grid_size", (1, patch_count))
+            offsets = self._spatiotemporal_neighbor_offsets(
+                getattr(self, "frame_fusion_spatial_neighborhood", "N8")
+            )
+            index_by_frame_position: dict[tuple[int, int], int] = {
+                (int(frame), int(position)): index
+                for index, (frame, position) in enumerate(zip(source_frames, source_positions))
+            }
+            edges_left: list[int] = []
+            edges_right: list[int] = []
+            eta = float(getattr(self, "frame_fusion_time_overlap", 0.5))
+            support: list[list[int]] = [[] for _ in range(temporal_count)]
+            for linear_index, representative_index in enumerate(temporal_mapping.reshape(-1)):
+                support[int(representative_index)].append(linear_index // patch_count)
+            for index, (frame, position) in enumerate(zip(source_frames, source_positions)):
+                row, col = divmod(int(position), int(width))
+                for dr, dc in offsets:
+                    nr, nc = row + dr, col + dc
+                    if not (0 <= nr < height and 0 <= nc < width):
+                        continue
+                    other = index_by_frame_position.get((int(frame), nr * width + nc))
+                    if other is None or other <= index:
+                        continue
+                    overlap = len(set(support[index]) & set(support[other]))
+                    denom = max(min(len(support[index]), len(support[other])), 1)
+                    if overlap / denom >= eta:
+                        edges_left.append(index)
+                        edges_right.append(other)
+            edge_left = np.asarray(edges_left, dtype=np.int64)
+            edge_right = np.asarray(edges_right, dtype=np.int64)
+            assignment, selected_sources, merge_debug = self._greedy_spatiotemporal_group_merge(
+                source_features,
+                np.arange(temporal_count, dtype=np.int64),
+                edge_left,
+                edge_right,
+                protected=protected,
+                initial_weights=temporal_plan.representative_weights.detach().cpu().numpy(),
+                max_group_size=int(getattr(self, "frame_fusion_max_group_size", 4)),
+            )
+            final_mapping = torch.as_tensor(
+                assignment[temporal_mapping.reshape(-1)].reshape(num_frames, patch_count),
+                device=tokens.device,
+                dtype=torch.long,
+            )
+            final_sources = torch.as_tensor(
+                temporal_sources[selected_sources], device=tokens.device, dtype=torch.long
+            )
+        else:
+            candidate_lists: list[list[int]] = []
+            height, width = getattr(self, "_frame_fusion_patch_grid_size", (1, patch_count))
+            offsets = self._spatiotemporal_neighbor_offsets(
+                getattr(self, "frame_fusion_spatial_neighborhood", "N8")
+            )
+            for frame in range(num_frames):
+                for position in range(patch_count):
+                    row, col = divmod(position, width)
+                    candidates: list[int] = []
+                    candidates.extend(int(value) for value in temporal_mapping[:, position])
+                    for dr, dc in offsets:
+                        nr, nc = row + dr, col + dc
+                        if 0 <= nr < height and 0 <= nc < width:
+                            candidates.append(int(temporal_mapping[frame, nr * width + nc]))
+                    for delta in range(1, int(getattr(self, "frame_fusion_temporal_window", 1)) + 1):
+                        for other_frame in (frame - delta, frame + delta):
+                            if 0 <= other_frame < num_frames:
+                                candidates.extend(int(value) for value in temporal_mapping[other_frame, position : position + 1])
+                                for dr, dc in offsets:
+                                    nr, nc = row + dr, col + dc
+                                    if 0 <= nr < height and 0 <= nc < width:
+                                        candidates.append(int(temporal_mapping[other_frame, nr * width + nc]))
+                    unique = list(dict.fromkeys(candidates))
+                    candidate_lists.append(unique[: max(2, int(getattr(self, "frame_fusion_reassignment_candidates", 8)))])
+            active = np.ones(temporal_count, dtype=bool)
+            protected_indices = np.flatnonzero(protected)
+            removable = np.flatnonzero(~protected)
+            removal_scores = np.full(temporal_count, np.inf, dtype=np.float32)
+            for rep_index in removable:
+                source_position = int(temporal_sources[rep_index])
+                candidates = [candidate for candidate in candidate_lists[source_position] if candidate != rep_index]
+                candidates = [candidate for candidate in candidates if active[candidate]]
+                if candidates:
+                    rep = source_features[rep_index]
+                    candidate_tensor = source_features[torch.as_tensor(candidates, device=tokens.device)]
+                    removal_scores[rep_index] = float(
+                        (1.0 - (candidate_tensor * rep).sum(dim=-1)).min().detach().cpu()
+                    )
+            target = max(int(np.ceil(temporal_count * float(getattr(self, "frame_fusion_min_keep_ratio", 0.4)))), len(protected_indices))
+            remove_count = max(0, temporal_count - target)
+            remove_order = removable[np.argsort(removal_scores[removable], kind="stable")]
+            active[remove_order[:remove_count]] = False
+            active[protected_indices] = True
+            survivors = np.flatnonzero(active)
+            survivor_to_local = {int(value): index for index, value in enumerate(survivors)}
+            final_mapping_np = np.empty(num_frames * patch_count, dtype=np.int64)
+            source_index_tensor = torch.as_tensor(temporal_sources[active], device=tokens.device)
+            survivor_features = source_features.index_select(0, torch.as_tensor(survivors, device=tokens.device))
+            normalized_flat = normalized
+            max_candidates = max(len(values) for values in candidate_lists)
+            candidate_matrix = np.full((num_frames * patch_count, max_candidates), -1, dtype=np.int64)
+            for index, values in enumerate(candidate_lists):
+                candidate_matrix[index, : len(values)] = values
+            active_tensor = torch.as_tensor(active, device=tokens.device)
+            for start in range(0, final_mapping_np.size, 4_096):
+                end = min(start + 4_096, final_mapping_np.size)
+                candidate_ids = torch.as_tensor(candidate_matrix[start:end], device=tokens.device)
+                valid = candidate_ids >= 0
+                local_ids = torch.zeros_like(candidate_ids)
+                for survivor, local in survivor_to_local.items():
+                    local_ids[candidate_ids == survivor] = local
+                safe_ids = local_ids.clamp_min(0)
+                candidate_features = survivor_features[safe_ids]
+                scores = (normalized_flat[start:end, None, :] * candidate_features).sum(dim=-1)
+                scores = scores.masked_fill(
+                    ~valid | ~active_tensor[candidate_ids.clamp_min(0)],
+                    -1e9,
+                )
+                best_column = scores.argmax(dim=-1, keepdim=True)
+                final_mapping_np[start:end] = local_ids.gather(
+                    1, best_column
+                ).squeeze(1).detach().cpu().numpy()
+            final_mapping = torch.as_tensor(final_mapping_np.reshape(num_frames, patch_count), device=tokens.device, dtype=torch.long)
+            final_sources = source_index_tensor
+            merge_debug = {
+                "initial_active_tokens": temporal_count,
+                "minimum_active_tokens": target,
+                "selected_merges": remove_count,
+                "knee_active_tokens": int(survivors.size),
+                "reassignment": True,
+            }
+        weights = torch.bincount(final_mapping.reshape(-1), minlength=int(final_sources.numel())).float()
+        self._hybrid_debug = getattr(self, "_hybrid_debug", [])
+        self._hybrid_debug.append(merge_debug)
+        return TemporalRepresentativeBatchPlan(
+            position_to_representative=final_mapping,
+            representative_source_indices=final_sources,
+            representative_weights=weights,
+        )
+
+    def _build_unified_representative_plan(
+        self,
+        tokens: torch.Tensor,
+        *,
+        reallocate: bool,
+    ) -> TemporalRepresentativeBatchPlan:
+        """Build U-M/U-R plans on the local time/space candidate graph."""
+
+        num_frames, num_tokens, embed_dim = tokens.shape
+        patch_count = num_tokens - self.patch_token_start
+        patch_tokens = tokens[:, self.patch_token_start :].reshape(-1, embed_dim)
+        normalized = torch.nn.functional.normalize(patch_tokens.float(), p=2, dim=-1, eps=1e-8)
+        total = num_frames * patch_count
+        protected = np.zeros(total, dtype=bool)
+        protected[:patch_count] = True
+        if reallocate:
+            edge_source, edge_target = self._build_local_spatiotemporal_edges(
+                num_frames, patch_count, include_temporal_spatial=True
+            )
+            candidate_lists = [[] for _ in range(total)]
+            for source, target in zip(edge_source.tolist(), edge_target.tolist()):
+                candidate_lists[source].append(target)
+                candidate_lists[target].append(source)
+            for index in range(total):
+                candidate_lists[index].insert(0, index)
+                # The protected frame-0 token at the same spatial position is
+                # always a valid fallback after arbitrary representatives are
+                # deleted.
+                candidate_lists[index].append(index % patch_count)
+            max_candidates = max(len(values) for values in candidate_lists)
+            candidate_matrix = np.full((total, max_candidates), -1, dtype=np.int64)
+            for index, values in enumerate(candidate_lists):
+                candidate_matrix[index, : len(values)] = values
+            candidate_ids = torch.as_tensor(candidate_matrix, device=tokens.device)
+            valid = candidate_ids >= 0
+            nearest = torch.empty(total, device=tokens.device, dtype=torch.float32)
+            for start in range(0, total, 4_096):
+                end = min(start + 4_096, total)
+                local_ids = candidate_ids[start:end]
+                local_valid = valid[start:end]
+                candidate_features = normalized[local_ids.clamp_min(0)]
+                local_score = (normalized[start:end, None, :] * candidate_features).sum(dim=-1)
+                local_score = local_score.masked_fill(~local_valid, -1e9)
+                local_score[:, 0] = -1e9
+                nearest[start:end] = local_score.max(dim=-1).values
+            # Deleting a singleton representative is cheap when its nearest
+            # local candidate is similar.  Frame 0 is never removable.
+            removable = np.flatnonzero(~protected)
+            target = max(int(np.ceil(total * float(getattr(self, "frame_fusion_min_keep_ratio", 0.4)))), patch_count)
+            keep = np.zeros(total, dtype=bool)
+            keep[:patch_count] = True
+            keep[removable[np.argsort(nearest[removable].detach().cpu().numpy())[-max(target - patch_count, 0) :]]] = True
+            keep_ids = np.flatnonzero(keep)
+            keep_map = {int(value): index for index, value in enumerate(keep_ids)}
+            keep_tensor = torch.as_tensor(keep, device=tokens.device)
+            final_mapping = np.empty(total, dtype=np.int64)
+            for start in range(0, total, 4_096):
+                end = min(start + 4_096, total)
+                local_ids = candidate_ids[start:end]
+                local_valid = valid[start:end]
+                candidate_features = normalized[local_ids.clamp_min(0)]
+                local_score = (normalized[start:end, None, :] * candidate_features).sum(dim=-1)
+                local_score = local_score.masked_fill(
+                    ~local_valid | ~keep_tensor[local_ids.clamp_min(0)],
+                    -1e9,
+                )
+                selected = local_ids.gather(1, local_score.argmax(dim=-1, keepdim=True)).squeeze(1)
+                final_mapping[start:end] = selected.detach().cpu().numpy()
+            final_mapping = np.asarray([keep_map[int(value)] for value in final_mapping], dtype=np.int64)
+            selected_sources = keep_ids
+            debug = {
+                "initial_active_tokens": total,
+                "minimum_active_tokens": target,
+                "knee_active_tokens": int(selected_sources.size),
+                "selected_merges": int(total - selected_sources.size),
+                "reassignment": True,
+            }
+        else:
+            edge_source, edge_target = self._build_local_spatiotemporal_edges(
+                num_frames, patch_count, include_temporal_spatial=False
+            )
+            final_mapping, selected_sources, debug = self._greedy_spatiotemporal_group_merge(
+                normalized,
+                np.arange(total, dtype=np.int64),
+                edge_source,
+                edge_target,
+                protected=protected,
+                max_group_size=int(getattr(self, "frame_fusion_max_group_size", 8)),
+            )
+        mapping = torch.as_tensor(final_mapping.reshape(num_frames, patch_count), device=tokens.device, dtype=torch.long)
+        source_indices = torch.as_tensor(selected_sources, device=tokens.device, dtype=torch.long)
+        weights = torch.bincount(mapping.reshape(-1), minlength=int(source_indices.numel())).float()
+        debug.update(
+            {
+                "representative_count": int(source_indices.numel()),
+                "full_patch_tokens": total,
+                "representative_patch_tokens": int(source_indices.numel()),
+                "attention_tokens": int(num_frames * self.patch_token_start + source_indices.numel()),
+                "patch_token_retention_vs_full": float(source_indices.numel() / max(total, 1)),
+                "representative_weight_min": float(weights.min().item()),
+                "representative_weight_max": float(weights.max().item()),
+                "representative_weight_mean": float(weights.mean().item()),
+                "mapping_checksum": int(mapping.long().sum().item()),
+                "mapping_shape": list(mapping.shape),
+            }
+        )
+        return TemporalRepresentativeBatchPlan(
+            position_to_representative=mapping,
+            representative_source_indices=source_indices,
+            representative_weights=weights,
+        )
+
+    def _build_spatiotemporal_representative_plans(
+        self,
+        tokens: torch.Tensor,
+        *,
+        source_layer: int,
+    ) -> list[TemporalRepresentativeBatchPlan]:
+        """Build one of H-M, H-R, U-M, or U-R using a shared plan format."""
+
+        started = time.perf_counter()
+        self._hybrid_debug = []
+        plans: list[TemporalRepresentativeBatchPlan] = []
+        mode = self.frame_fusion_mode
+        if mode in {"h-m", "h-r"}:
+            temporal_plans = self._build_adaptive_temporal_representative_plans(
+                tokens, source_layer=source_layer
+            )
+            for batch_index, temporal_plan in enumerate(temporal_plans):
+                plans.append(
+                    self._build_hybrid_representative_plan(
+                        tokens[batch_index],
+                        temporal_plan,
+                        reallocate=mode == "h-r",
+                    )
+                )
+        else:
+            for batch_index in range(tokens.shape[0]):
+                plans.append(
+                    self._build_unified_representative_plan(
+                        tokens[batch_index], reallocate=mode == "u-r"
+                    )
+                )
+        first = self._hybrid_debug[0] if self._hybrid_debug else {}
+        self.last_frame_fusion_debug = {
+            "mode": mode,
+            "source_layer": source_layer,
+            "mapping": "original_token_to_spatiotemporal_representative",
+            "cost_model": "local_spatiotemporal_knee",
+            "spatial_neighborhood": getattr(self, "frame_fusion_spatial_neighborhood", "N8"),
+            "temporal_window": getattr(self, "frame_fusion_temporal_window", 1),
+            "time_overlap": getattr(self, "frame_fusion_time_overlap", 0.5),
+            "minimum_keep_ratio": getattr(self, "frame_fusion_min_keep_ratio", 0.4),
+            "reassignment_candidates": getattr(self, "frame_fusion_reassignment_candidates", 8),
+            "representative_update": getattr(self, "frame_fusion_representative_update", "parent"),
+            "attention_only": True,
+            "mlp_scope": "full_original_token_sequence",
+            "batches": [
+                {
+                    **first,
+                    "representative_count": int(plan.representative_source_indices.numel()),
+                    "full_patch_tokens": int(tokens.shape[2] - self.patch_token_start) * tokens.shape[1],
+                    "representative_patch_tokens": int(plan.representative_source_indices.numel()),
+                    "attention_tokens": int(tokens.shape[0] * self.patch_token_start + plan.representative_source_indices.numel()),
+                    "patch_token_retention_vs_full": float(
+                        plan.representative_source_indices.numel()
+                        / max(tokens.shape[1] * (tokens.shape[2] - self.patch_token_start), 1)
+                    ),
+                    "representative_weight_min": float(plan.representative_weights.min().item()),
+                    "representative_weight_max": float(plan.representative_weights.max().item()),
+                    "representative_weight_mean": float(plan.representative_weights.mean().item()),
+                    "mapping_checksum": int(plan.position_to_representative.sum().item()),
+                    "mapping_shape": list(plan.position_to_representative.shape),
+                }
+                for plan in plans
+            ],
+        }
+        self._frame_fusion_plan_seconds = getattr(
+            self, "_frame_fusion_plan_seconds", 0.0
+        ) + time.perf_counter() - started
+        self.last_frame_fusion_debug["planning_seconds"] = float(
+            self._frame_fusion_plan_seconds
+        )
+        return plans
+
+    def _build_adaptive_spatial_representative_plans(
+        self,
+        tokens: torch.Tensor,
+        *,
+        source_layer: int,
+    ) -> list[SpatialRepresentativeBatchPlan]:
+        """Build independent spatial representative dictionaries per frame.
+
+        Frame 0 is a reference frame and is copied into the compressed
+        dictionary one-to-one. For every later frame, the spatial patch tokens
+        are normalized and represented with a medoid followed by lazy-greedy
+        maximum-error-reduction selection. The selected prefix minimizes
+        ``D_S(k) + lambda_cost * k / P``. The resulting assignment is only used
+        for global attention; the attention residual is expanded back to every
+        original patch position before the per-token MLP runs.
+        """
+
+        batch_size, num_frames, num_tokens, embed_dim = tokens.shape
+        patch_tokens = tokens[:, :, self.patch_token_start :]
+        patch_count = int(patch_tokens.shape[2])
+        plans: list[SpatialRepresentativeBatchPlan] = []
+        debug_batches: list[dict[str, object]] = []
+        selection_started = time.perf_counter()
+
+        for batch_index in range(batch_size):
+            mapping = torch.empty(
+                (num_frames, patch_count),
+                device=tokens.device,
+                dtype=torch.long,
+            )
+            mapping[0] = torch.arange(patch_count, device=tokens.device)
+            source_chunks = [
+                torch.arange(patch_count, device=tokens.device, dtype=torch.long)
+            ]
+            frame_debug: list[dict[str, object]] = []
+
+            for frame_index in range(1, num_frames):
+                with torch.autocast(device_type=tokens.device.type, enabled=False):
+                    normalized = torch.nn.functional.normalize(
+                        patch_tokens[batch_index, frame_index].float(),
+                        p=2,
+                        dim=-1,
+                        eps=1e-8,
+                    )
+                    similarities = (normalized @ normalized.transpose(0, 1)).clamp(-1.0, 1.0)
+                distance = (
+                    1.0 - similarities
+                ).detach().float().cpu().numpy().astype(np.float32)
+
+                medoid = int(np.argmin(distance.sum(axis=1)))
+                selected = [medoid]
+                current_error = distance[:, medoid].copy()
+                initial_distortion = float(current_error.mean())
+                best_k = 1
+                best_distortion = initial_distortion
+                best_objective = initial_distortion + self.frame_fusion_lambda_cost / max(
+                    patch_count, 1
+                )
+                cost_per_token = self.frame_fusion_lambda_cost / max(patch_count, 1)
+
+                # The gain of an unselected candidate is monotone non-increasing
+                # as representatives are added. Stored heap values are upper
+                # bounds; recomputing only the current heap maximum avoids the
+                # O(P^2 K) cost of rebuilding all candidate gains at every step.
+                candidates = np.arange(patch_count, dtype=np.int64)
+                candidates = candidates[candidates != medoid]
+                if candidates.size:
+                    initial_gains = np.maximum(
+                        current_error[:, None] - distance[:, candidates], 0.0
+                    ).mean(axis=0)
+                    heap: list[tuple[float, int]] = [
+                        (-float(gain), int(candidate))
+                        for gain, candidate in zip(initial_gains, candidates)
+                    ]
+                    heapq.heapify(heap)
+                else:
+                    heap = []
+
+                while heap and len(selected) < patch_count:
+                    _, candidate = heapq.heappop(heap)
+                    if candidate in selected:
+                        continue
+                    exact_gain = float(
+                        np.maximum(current_error - distance[:, candidate], 0.0).mean()
+                    )
+                    if heap and exact_gain + 1e-12 < -heap[0][0]:
+                        heapq.heappush(heap, (-exact_gain, candidate))
+                        continue
+                    if exact_gain <= cost_per_token:
+                        break
+
+                    selected.append(candidate)
+                    current_error = np.minimum(current_error, distance[:, candidate])
+                    current_distortion = float(current_error.mean())
+                    objective = current_distortion + cost_per_token * len(selected)
+                    if objective < best_objective:
+                        best_k = len(selected)
+                        best_distortion = current_distortion
+                        best_objective = objective
+
+                selected = selected[:best_k]
+                assignment = np.argmin(distance[:, selected], axis=1)
+                representative_offset = sum(int(chunk.numel()) for chunk in source_chunks)
+                representative_ids = np.arange(
+                    representative_offset,
+                    representative_offset + best_k,
+                    dtype=np.int64,
+                )
+                mapping[frame_index] = torch.as_tensor(
+                    representative_ids[assignment],
+                    device=tokens.device,
+                    dtype=torch.long,
+                )
+                source_chunks.append(
+                    torch.as_tensor(
+                        frame_index * patch_count + np.asarray(selected, dtype=np.int64),
+                        device=tokens.device,
+                        dtype=torch.long,
+                    )
+                )
+                frame_debug.append(
+                    {
+                        "frame_index": frame_index,
+                        "medoid_index": medoid,
+                        "representative_count": best_k,
+                        "full_patch_tokens": patch_count,
+                        "initial_distortion": initial_distortion,
+                        "optimal_distortion": best_distortion,
+                        "optimal_score": best_objective,
+                        "compute_saving_vs_frame": 1.0 - best_k / max(patch_count, 1),
+                    }
+                )
+
+            source_indices = torch.cat(source_chunks, dim=0)
+            weights = torch.bincount(
+                mapping.reshape(-1), minlength=int(source_indices.numel())
+            ).float()
+            optimal_counts = [
+                int(frame_info["representative_count"]) for frame_info in frame_debug
+            ]
+            plans.append(
+                SpatialRepresentativeBatchPlan(
+                    position_to_representative=mapping,
+                    representative_source_indices=source_indices,
+                    representative_weights=weights,
+                )
+            )
+            debug_batches.append(
+                {
+                    "reference_frame_index": 0,
+                    "processed_frame_indices": list(range(1, num_frames)),
+                    "frame_representative_counts": optimal_counts,
+                    "representative_count": int(source_indices.numel()),
+                    "full_patch_tokens": int(num_frames * patch_count),
+                    "representative_patch_tokens": int(source_indices.numel()),
+                    "attention_tokens": int(
+                        num_frames * self.patch_token_start + source_indices.numel()
+                    ),
+                    "patch_token_retention_vs_full": float(
+                        source_indices.numel() / max(num_frames * patch_count, 1)
+                    ),
+                    "representative_weight_min": float(weights.min().item()),
+                    "representative_weight_max": float(weights.max().item()),
+                    "representative_weight_mean": float(weights.mean().item()),
+                    "mapping_checksum": int(mapping.long().sum().item()),
+                    "mapping_shape": list(mapping.shape),
+                    "frames": frame_debug,
+                }
+            )
+
+        selection_seconds = time.perf_counter() - selection_started
+        self.last_frame_fusion_debug = {
+            "mode": self.frame_fusion_mode,
+            "source_layer": source_layer,
+            "num_frames": num_frames,
+            "tokens_per_frame": num_tokens,
+            "patch_tokens_per_frame": patch_count,
+            "embed_dim": embed_dim,
+            "mapping": "frame_position_to_spatial_representative",
+            "weighting": "log_representative_occurrence_count_in_attention_logits",
+            "cost_model": "spatial_distortion_plus_lambda_k_over_P",
+            "lambda_cost": self.frame_fusion_lambda_cost,
+            "selection": "medoid_then_lazy_greedy_max_distortion_reduction",
+            "reference_frame_index": 0,
+            "reference_frame_compression": "none",
+            "attention_only": True,
+            "mlp_scope": "full_original_token_sequence",
+            "mapping_preserved": True,
+            "selection_seconds": selection_seconds,
+            "full_patch_tokens": int(num_frames * patch_count),
+            "retained_patch_tokens": int(debug_batches[0]["representative_patch_tokens"])
+            if debug_batches
+            else 0,
+            "patch_token_retention_vs_full": float(
+                debug_batches[0]["patch_token_retention_vs_full"]
+            )
             if debug_batches
             else 1.0,
             "batches": debug_batches,
@@ -2309,6 +3338,7 @@ class Aggregator(nn.Module):
     ) -> torch.Tensor:
         """Run global attention on representatives and restore the position map."""
 
+        started = time.perf_counter()
         block = self.inter_frame_blocks[block_idx]
         patch_start = self.patch_token_start
         patch_count = num_tokens - patch_start
@@ -2344,6 +3374,72 @@ class Aggregator(nn.Module):
             # Restore only the attention residual to the original full token
             # sequence. The MLP must see each frame's original token rather
             # than a representative-expanded approximation.
+            restored_special_update = attention_update[: special_tokens.shape[0]].view(
+                num_frames,
+                patch_start,
+                embed_dim,
+            )
+            restored_representative_update = attention_update[special_tokens.shape[0] :]
+            restored_patch_update = restored_representative_update.index_select(
+                0,
+                plan.position_to_representative.to(device=tokens.device).reshape(-1),
+            ).view(num_frames, patch_count, embed_dim)
+            restored_attention_update = torch.cat(
+                [restored_special_update, restored_patch_update], dim=1
+            )
+            full_tokens = frame_tokens + restored_attention_update
+            full_tokens = full_tokens + block.ls2(block.mlp(block.norm2(full_tokens)))
+            outputs.append(full_tokens)
+
+        result = torch.stack(outputs, dim=0)
+        self._frame_fusion_global_attention_seconds += time.perf_counter() - started
+        return result
+
+    def _run_adaptive_spatial_representative_global_attention_block(
+        self,
+        tokens: torch.Tensor,
+        *,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        embed_dim: int,
+        block_idx: int,
+        plans: list[SpatialRepresentativeBatchPlan],
+    ) -> torch.Tensor:
+        """Run global attention on spatial representatives and restore all frames."""
+
+        block = self.inter_frame_blocks[block_idx]
+        patch_start = self.patch_token_start
+        patch_count = num_tokens - patch_start
+        outputs: list[torch.Tensor] = []
+        for batch_index, plan in enumerate(plans):
+            frame_tokens = tokens[batch_index]
+            special_tokens = frame_tokens[:, :patch_start].reshape(-1, embed_dim)
+            patch_tokens = frame_tokens[:, patch_start:].reshape(-1, embed_dim)
+            representatives = patch_tokens.index_select(
+                0,
+                plan.representative_source_indices.to(device=tokens.device),
+            )
+            compressed = torch.cat([special_tokens, representatives], dim=0).unsqueeze(0)
+            weights = torch.cat(
+                [
+                    torch.ones(
+                        special_tokens.shape[0],
+                        device=tokens.device,
+                        dtype=torch.float32,
+                    ),
+                    plan.representative_weights.to(device=tokens.device),
+                ],
+                dim=0,
+            )
+            key_log_weights = weights.clamp_min(1.0).log().to(dtype=compressed.dtype)
+            key_log_weights = key_log_weights.view(1, 1, 1, -1)
+
+            block.attn.merge_random_seed = self.merge_random_seed
+            normalized = block.norm1(compressed)
+            attention_output = block.attn(normalized, attn_bias=key_log_weights)
+            attention_update = block.ls1(attention_output).squeeze(0)
+
             restored_special_update = attention_update[: special_tokens.shape[0]].view(
                 num_frames,
                 patch_start,
@@ -2812,6 +3908,9 @@ class Aggregator(nn.Module):
         patch_grid_size: tuple[int, int],
         frame_fusion_pair_plans: list[FrameFusionBatchPlan] | None = None,
         temporal_representative_plans: list[TemporalRepresentativeBatchPlan] | None = None,
+        spatial_representative_plans: list[SpatialRepresentativeBatchPlan] | None = None,
+        spatiotemporal_representative_plans: list[TemporalRepresentativeBatchPlan] | None = None,
+        fastvggt_enabled: bool = True,
     ) -> torch.Tensor:
         tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
@@ -2890,6 +3989,32 @@ class Aggregator(nn.Module):
                     block_idx=block_idx,
                     plans=temporal_representative_plans,
                 )
+            if (
+                self.frame_fusion_mode == "adaptive-spatial-representative"
+                and spatial_representative_plans is not None
+            ):
+                return self._run_adaptive_spatial_representative_global_attention_block(
+                    tokens,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    num_tokens=num_tokens,
+                    embed_dim=embed_dim,
+                    block_idx=block_idx,
+                    plans=spatial_representative_plans,
+                )
+            if (
+                self.frame_fusion_mode in {"h-m", "h-r", "u-m", "u-r"}
+                and spatiotemporal_representative_plans is not None
+            ):
+                return self._run_temporal_representative_global_attention_block(
+                    tokens,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    num_tokens=num_tokens,
+                    embed_dim=embed_dim,
+                    block_idx=block_idx,
+                    plans=spatiotemporal_representative_plans,
+                )
             tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
             self.inter_frame_blocks[block_idx].attn.merge_random_seed = self.merge_random_seed
             self.inter_frame_blocks[block_idx].attn.precomputed_intra_scores = self._adaptive_intra_scores.get(block_idx)
@@ -2911,6 +4036,7 @@ class Aggregator(nn.Module):
             global_merging = (
                 block_idx
                 if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio)
+                and fastvggt_enabled
                 and block_idx >= self.merging
                 and not inter_frame_only_attention
                 and not adaptive_kv_anchor
@@ -2959,6 +4085,20 @@ class Aggregator(nn.Module):
                 adaptive_anchor_random_seed=self.adaptive_anchor_random_seed,
                 adaptive_anchor_debug=self.adaptive_anchor_debug,
             )
+            if global_merging is not None:
+                attention = self.inter_frame_blocks[block_idx].attn
+                input_tokens = int(attention.last_merge_input_tokens)
+                output_tokens = int(attention.last_merge_output_tokens)
+                self._fastvggt_merge_debug_layers.append(
+                    {
+                        "layer": int(block_idx),
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "merged_tokens": int(attention.last_merged_tokens),
+                        "retention": output_tokens / max(input_tokens, 1),
+                        "merge_applied": bool(attention.last_merge_applied),
+                    }
+                )
             self.inter_frame_blocks[block_idx].attn.precomputed_intra_scores = None
             if adaptive_kv_anchor:
                 self._maybe_save_adaptive_anchor_debug(block_idx)

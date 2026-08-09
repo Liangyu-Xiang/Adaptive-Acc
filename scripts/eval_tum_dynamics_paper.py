@@ -173,6 +173,11 @@ def parse_args() -> argparse.Namespace:
             "sequential-group-average",
             "temporal-representative",
             "adaptive-temporal-representative",
+            "adaptive-spatial-representative",
+            "h-m",
+            "h-r",
+            "u-m",
+            "u-r",
         ),
         default="none",
         help="Enable frame fusion. Default keeps original VGGT-Omega behavior.",
@@ -267,8 +272,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--frame-fusion-lambda-cost",
         type=float,
-        default=1.0,
+        default=0.15,
         help="Lambda for adaptive temporal representative objective D_tilde + lambda*q.",
+    )
+    parser.add_argument("--frame-fusion-min-keep-ratio", type=float, default=0.4)
+    parser.add_argument("--frame-fusion-temporal-window", type=int, default=1)
+    parser.add_argument(
+        "--frame-fusion-spatial-neighborhood",
+        choices=("N4", "N8", "N8-R2"),
+        default="N8",
+    )
+    parser.add_argument("--frame-fusion-time-overlap", type=float, default=0.5)
+    parser.add_argument("--frame-fusion-reassignment-candidates", type=int, default=8)
+    parser.add_argument(
+        "--frame-fusion-representative-update",
+        choices=("parent", "exact-medoid"),
+        default="parent",
     )
     parser.add_argument(
         "--sampling-pool",
@@ -817,7 +836,13 @@ def load_model(
     frame_fusion_target_keep_threshold: float = 0.0,
     frame_fusion_target_keep_seed: int = 33,
     frame_fusion_recompute_each_global: bool = False,
-    frame_fusion_lambda_cost: float = 1.0,
+    frame_fusion_lambda_cost: float = 0.15,
+    frame_fusion_min_keep_ratio: float = 0.4,
+    frame_fusion_temporal_window: int = 1,
+    frame_fusion_spatial_neighborhood: str = "N8",
+    frame_fusion_time_overlap: float = 0.5,
+    frame_fusion_reassignment_candidates: int = 8,
+    frame_fusion_representative_update: str = "parent",
     sparse_attention: bool = False,
     sparse_ratio: float | None = None,
     sparse_cdf_threshold: float | None = None,
@@ -876,6 +901,12 @@ def load_model(
         "frame_fusion_target_keep_seed": frame_fusion_target_keep_seed,
         "frame_fusion_recompute_each_global": frame_fusion_recompute_each_global,
         "frame_fusion_lambda_cost": frame_fusion_lambda_cost,
+        "frame_fusion_min_keep_ratio": frame_fusion_min_keep_ratio,
+        "frame_fusion_temporal_window": frame_fusion_temporal_window,
+        "frame_fusion_spatial_neighborhood": frame_fusion_spatial_neighborhood,
+        "frame_fusion_time_overlap": frame_fusion_time_overlap,
+        "frame_fusion_reassignment_candidates": frame_fusion_reassignment_candidates,
+        "frame_fusion_representative_update": frame_fusion_representative_update,
         "sparse_attention": sparse_attention,
         "sparse_ratio": sparse_ratio,
         "sparse_cdf_threshold": sparse_cdf_threshold,
@@ -1052,6 +1083,14 @@ def main() -> int:
         raise ValueError("--merge-ratio must be in [0, 1]")
     if args.frame_fusion_lambda_cost < 0.0:
         raise ValueError("--frame-fusion-lambda-cost must be non-negative")
+    if not 0.0 < args.frame_fusion_min_keep_ratio <= 1.0:
+        raise ValueError("--frame-fusion-min-keep-ratio must be in (0, 1]")
+    if args.frame_fusion_temporal_window <= 0:
+        raise ValueError("--frame-fusion-temporal-window must be positive")
+    if not 0.0 <= args.frame_fusion_time_overlap <= 1.0:
+        raise ValueError("--frame-fusion-time-overlap must be in [0, 1]")
+    if args.frame_fusion_reassignment_candidates <= 0:
+        raise ValueError("--frame-fusion-reassignment-candidates must be positive")
     if args.frame_fusion_mode == "dp-medoid":
         if args.frame_fusion_k is None:
             raise ValueError("--frame-fusion-k is required when --frame-fusion-mode dp-medoid")
@@ -1072,6 +1111,11 @@ def main() -> int:
         "sequential-group-average",
         "temporal-representative",
         "adaptive-temporal-representative",
+        "adaptive-spatial-representative",
+        "h-m",
+        "h-r",
+        "u-m",
+        "u-r",
     }:
         if not 0.0 < args.frame_fusion_pair_percent <= 100.0:
             raise ValueError("--frame-fusion-pair-percent must be in (0, 100]")
@@ -1093,8 +1137,14 @@ def main() -> int:
     if args.frame_fusion_recompute_each_global and args.frame_fusion_mode != "pair-top-percent":
         raise ValueError("--frame-fusion-recompute-each-global requires --frame-fusion-mode pair-top-percent")
     if args.frame_fusion_mode != "none":
-        if args.merge_ratio != 0.0:
-            raise ValueError("frame fusion requires --merge-ratio 0")
+        temporal_modes = {
+            "temporal-representative",
+            "adaptive-temporal-representative",
+        }
+        if args.merge_ratio != 0.0 and args.frame_fusion_mode not in temporal_modes:
+            raise ValueError(
+                "FastVGGT after frame fusion is only supported for temporal representative modes"
+            )
     if args.sparse_attention and args.merge_ratio > 0.0:
         raise ValueError("--sparse-attention requires --merge-ratio 0; sparse attention replaces token merging")
     if args.sparse_attention and args.sparse_ratio is None and args.sparse_cdf_threshold is None:
@@ -1232,6 +1282,12 @@ def main() -> int:
         frame_fusion_target_keep_seed=args.frame_fusion_target_keep_seed,
         frame_fusion_recompute_each_global=args.frame_fusion_recompute_each_global,
         frame_fusion_lambda_cost=args.frame_fusion_lambda_cost,
+        frame_fusion_min_keep_ratio=args.frame_fusion_min_keep_ratio,
+        frame_fusion_temporal_window=args.frame_fusion_temporal_window,
+        frame_fusion_spatial_neighborhood=args.frame_fusion_spatial_neighborhood,
+        frame_fusion_time_overlap=args.frame_fusion_time_overlap,
+        frame_fusion_reassignment_candidates=args.frame_fusion_reassignment_candidates,
+        frame_fusion_representative_update=args.frame_fusion_representative_update,
         sparse_attention=args.sparse_attention,
         sparse_ratio=args.sparse_ratio,
         sparse_cdf_threshold=args.sparse_cdf_threshold,
@@ -1431,6 +1487,10 @@ def main() -> int:
             row["frame_fusion_num_fused_frames"] = debug.get("num_fused_frames")
             row["frame_fusion_partition_seconds"] = debug.get("partition_seconds")
             row["frame_fusion_fusion_seconds"] = debug.get("fusion_seconds")
+            row["frame_fusion_planning_seconds"] = debug.get("planning_seconds")
+            row["frame_fusion_global_attention_seconds"] = debug.get(
+                "global_attention_seconds"
+            )
             batches = debug.get("batches") or []
             first_batch = batches[0] if batches else {}
             row["frame_fusion_selected_pairs"] = debug.get(
@@ -1487,6 +1547,11 @@ def main() -> int:
             if args.frame_fusion_mode in {
                 "temporal-representative",
                 "adaptive-temporal-representative",
+                "adaptive-spatial-representative",
+                "h-m",
+                "h-r",
+                "u-m",
+                "u-r",
             }:
                 first_batch = (debug.get("batches") or [{}])[0]
                 row["frame_fusion_representative_count"] = first_batch.get("representative_count")
@@ -1501,6 +1566,16 @@ def main() -> int:
                 )
                 row["frame_fusion_mapping_checksum"] = first_batch.get("mapping_checksum")
                 row["frame_fusion_mapping_shape"] = first_batch.get("mapping_shape")
+        fastvggt_debug = model.aggregator.last_fastvggt_debug
+        row["fastvggt_actual_merge_ratio"] = fastvggt_debug.get("requested_merge_ratio")
+        row["fastvggt_actual_merge_layers"] = fastvggt_debug.get("num_merge_layers")
+        row["fastvggt_actual_input_tokens"] = fastvggt_debug.get("input_tokens_total")
+        row["fastvggt_actual_output_tokens"] = fastvggt_debug.get("output_tokens_total")
+        row["fastvggt_actual_merged_tokens"] = fastvggt_debug.get("merged_tokens_total")
+        row["fastvggt_actual_retention_vs_input"] = fastvggt_debug.get(
+            "retention_vs_fastvggt_input"
+        )
+        row["fastvggt_actual_layers"] = fastvggt_debug.get("layers")
         per_sequence.append(row)
         latency_text = "skipped" if args.skip_timing else f"{model_latency_ms:.1f}ms"
         print(
@@ -1560,6 +1635,12 @@ def main() -> int:
                 "target_keep_seed": args.frame_fusion_target_keep_seed,
                 "recompute_each_global": args.frame_fusion_recompute_each_global,
                 "lambda_cost": args.frame_fusion_lambda_cost,
+                "min_keep_ratio": args.frame_fusion_min_keep_ratio,
+                "temporal_window": args.frame_fusion_temporal_window,
+                "spatial_neighborhood": args.frame_fusion_spatial_neighborhood,
+                "time_overlap": args.frame_fusion_time_overlap,
+                "reassignment_candidates": args.frame_fusion_reassignment_candidates,
+                "representative_update": args.frame_fusion_representative_update,
             },
             "sparse_attention": args.sparse_attention,
             "sparse_ratio": args.sparse_ratio,
@@ -1620,6 +1701,15 @@ def main() -> int:
             ),
             "peak_reserved_gib_max": float(
                 np.max([float(row["peak_reserved_gib"]) for row in per_sequence])
+            ),
+            "fastvggt_actual_retention_vs_input_mean": float(
+                np.mean(
+                    [
+                        float(row["fastvggt_actual_retention_vs_input"])
+                        for row in per_sequence
+                        if row.get("fastvggt_actual_retention_vs_input") is not None
+                    ]
+                )
             ),
         },
         "per_sequence": per_sequence,

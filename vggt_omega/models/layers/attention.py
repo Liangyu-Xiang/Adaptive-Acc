@@ -178,6 +178,12 @@ class SelfAttention(nn.Module):
         self.last_adaptive_anchor_debug = None
         self.last_adaptive_anchor_kv_tokens = None
         self.last_adaptive_anchor_patch_tokens = None
+        # Runtime accounting for the actual FastVGGT attention sequence.
+        # Unlike merge_ratio, these values reflect protection and boundary
+        # effects in the bipartite merge implementation.
+        self.last_merge_input_tokens = 0
+        self.last_merge_output_tokens = 0
+        self.last_merge_applied = False
         # VGGT-Omega change: the aggregator checkpoint was trained with Q/K
         # normalization, while upstream DINOv3 attention does not expose it.
         self.use_qk_norm = use_qk_norm
@@ -372,6 +378,9 @@ class SelfAttention(nn.Module):
         B, N, _ = qkv.shape
         C = self.qkv.in_features
         self.last_merged_tokens = 0
+        self.last_merge_input_tokens = 0
+        self.last_merge_output_tokens = 0
+        self.last_merge_applied = False
         self.last_sparse_sparsity = None
         self.last_adaptive_anchor_debug = None
         self.last_adaptive_anchor_kv_tokens = None
@@ -586,6 +595,7 @@ class SelfAttention(nn.Module):
         if global_merging is not None and not getattr(self, "disable_global_merging", False):
             if patch_grid_size is None:
                 raise ValueError("patch_grid_size is required when global_merging is enabled")
+            self.last_merge_input_tokens = int(N)
             patch_h, patch_w = patch_grid_size
             generator = torch.Generator(device=qkv.device)
             generator.manual_seed(int(getattr(self, "merge_random_seed", 33)))
@@ -621,6 +631,8 @@ class SelfAttention(nn.Module):
                 k_out, v_out = merge(k_merge_in, mode="mean", extra_tensors=v_merge_in)
                 merged_tokens = k_out.shape[1]
                 self.last_merged_tokens = N - merged_tokens
+                self.last_merge_output_tokens = int(merged_tokens)
+                self.last_merge_applied = True
                 k = k_out.reshape(B, merged_tokens, self.num_heads, C // self.num_heads).transpose(1, 2)
                 v = v_out.reshape(B, merged_tokens, self.num_heads, C // self.num_heads).transpose(1, 2)
                 # Q stays full-length, so every patch keeps its output identity.
@@ -635,6 +647,8 @@ class SelfAttention(nn.Module):
                 )
                 N = q_out.shape[1]
                 self.last_merged_tokens = qkv.shape[1] - N
+                self.last_merge_output_tokens = int(N)
+                self.last_merge_applied = True
                 q = q_out.reshape(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
                 k = k_out.reshape(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
                 v = v_out.reshape(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)

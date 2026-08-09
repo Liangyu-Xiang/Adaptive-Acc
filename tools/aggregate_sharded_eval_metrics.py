@@ -45,6 +45,21 @@ def main() -> None:
         for row in rows
     )
     latency_values = [row["model_latency_ms"] for row in rows if row.get("model_latency_ms") is not None]
+    fast_retention_values = [
+        float(row["fastvggt_actual_retention_vs_input"])
+        for row in rows
+        if row.get("fastvggt_actual_retention_vs_input") is not None
+    ]
+    fast_input_values = [
+        int(row["fastvggt_actual_input_tokens"])
+        for row in rows
+        if row.get("fastvggt_actual_input_tokens") is not None
+    ]
+    fast_output_values = [
+        int(row["fastvggt_actual_output_tokens"])
+        for row in rows
+        if row.get("fastvggt_actual_output_tokens") is not None
+    ]
     overall = {
         "auc_3_percent": 100.0 * official_auc(rotation_errors, translation_errors, 3),
         "auc_30_percent": 100.0 * official_auc(rotation_errors, translation_errors, 30),
@@ -53,7 +68,17 @@ def main() -> None:
         "valid_depth_pixels": total_valid,
         "model_latency_ms_mean": float(np.mean(latency_values)) if latency_values else None,
         "peak_allocated_gib_max": float(max(row["peak_allocated_gib"] for row in rows)),
+        "fastvggt_actual_retention_vs_input_mean": (
+            float(np.mean(fast_retention_values)) if fast_retention_values else None
+        ),
+        "fastvggt_actual_input_tokens_total": int(sum(fast_input_values)),
+        "fastvggt_actual_output_tokens_total": int(sum(fast_output_values)),
     }
+    if overall["fastvggt_actual_input_tokens_total"]:
+        overall["fastvggt_actual_retention_vs_input_weighted"] = (
+            overall["fastvggt_actual_output_tokens_total"]
+            / overall["fastvggt_actual_input_tokens_total"]
+        )
     result = {
         "protocol": worker_metrics[0]["protocol"] | {"num_sequences": len(rows)},
         "paper_targets_1b": worker_metrics[0].get("paper_targets_1b", {}),

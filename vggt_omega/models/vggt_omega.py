@@ -86,7 +86,13 @@ class VGGTOmega(nn.Module):
         frame_fusion_target_keep_threshold: float = 0.0,
         frame_fusion_target_keep_seed: int = 33,
         frame_fusion_recompute_each_global: bool = False,
-        frame_fusion_lambda_cost: float = 1.0,
+        frame_fusion_lambda_cost: float = 0.15,
+        frame_fusion_min_keep_ratio: float = 0.4,
+        frame_fusion_temporal_window: int = 1,
+        frame_fusion_spatial_neighborhood: str = "N8",
+        frame_fusion_time_overlap: float = 0.5,
+        frame_fusion_reassignment_candidates: int = 8,
+        frame_fusion_representative_update: str = "parent",
     ) -> None:
         super().__init__()
         if use_register_mediated_anchor is not None:
@@ -157,6 +163,12 @@ class VGGTOmega(nn.Module):
             frame_fusion_target_keep_seed=frame_fusion_target_keep_seed,
             frame_fusion_recompute_each_global=frame_fusion_recompute_each_global,
             frame_fusion_lambda_cost=frame_fusion_lambda_cost,
+            frame_fusion_min_keep_ratio=frame_fusion_min_keep_ratio,
+            frame_fusion_temporal_window=frame_fusion_temporal_window,
+            frame_fusion_spatial_neighborhood=frame_fusion_spatial_neighborhood,
+            frame_fusion_time_overlap=frame_fusion_time_overlap,
+            frame_fusion_reassignment_candidates=frame_fusion_reassignment_candidates,
+            frame_fusion_representative_update=frame_fusion_representative_update,
         )
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None

@@ -654,6 +654,62 @@ def test_adaptive_temporal_lambda_controls_split_count():
     assert split_counts == sorted(split_counts)
 
 
+def test_adaptive_spatial_plan_preserves_reference_frame_and_processes_later_frames():
+    model = Aggregator.__new__(Aggregator)
+    model.patch_token_start = 1
+    model.frame_fusion_mode = "adaptive-spatial-representative"
+    model.frame_fusion_lambda_cost = 1.0
+
+    tokens = torch.tensor(
+        [
+            [
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
+                [[0.0, 0.0], [1.0, 0.0], [0.99, 0.01], [0.0, 1.0]],
+                [[0.0, 0.0], [-1.0, 0.0], [-0.99, 0.01], [0.0, 1.0]],
+            ]
+        ]
+    )
+
+    plan = model._build_adaptive_spatial_representative_plans(tokens, source_layer=-1)[0]
+
+    assert torch.equal(plan.position_to_representative[0], torch.arange(3))
+    assert plan.representative_source_indices[:3].tolist() == [0, 1, 2]
+    assert model.last_frame_fusion_debug["reference_frame_index"] == 0
+    assert model.last_frame_fusion_debug["reference_frame_compression"] == "none"
+    assert model.last_frame_fusion_debug["attention_only"] is True
+    assert model.last_frame_fusion_debug["mlp_scope"] == "full_original_token_sequence"
+    assert model.last_frame_fusion_debug["batches"][0]["processed_frame_indices"] == [1, 2]
+    assert len(model.last_frame_fusion_debug["batches"][0]["frames"]) == 2
+    assert torch.equal(
+        plan.representative_weights,
+        torch.bincount(
+            plan.position_to_representative.reshape(-1),
+            minlength=plan.representative_source_indices.numel(),
+        ).float(),
+    )
+    assert bool(torch.all(plan.representative_weights >= 1).item())
+
+
+def test_adaptive_spatial_lambda_controls_representative_count():
+    generator = torch.Generator().manual_seed(11)
+    tokens = torch.randn((1, 3, 6, 4), generator=generator)
+    representative_counts = []
+    for lambda_cost in (1.0, 0.75, 0.5, 0.25):
+        model = Aggregator.__new__(Aggregator)
+        model.patch_token_start = 1
+        model.frame_fusion_mode = "adaptive-spatial-representative"
+        model.frame_fusion_lambda_cost = lambda_cost
+        model._build_adaptive_spatial_representative_plans(tokens, source_layer=-1)
+        representative_counts.append(
+            model.last_frame_fusion_debug["batches"][0]["frame_representative_counts"]
+        )
+
+    assert all(
+        lower[0] >= higher[0] and lower[1] >= higher[1]
+        for higher, lower in zip(representative_counts, representative_counts[1:])
+    )
+
+
 def test_layer_token_swap_patch_special_and_whole_scopes():
     model = Aggregator.__new__(Aggregator)
     model.patch_token_start = 2
@@ -686,3 +742,35 @@ def test_layer_token_swap_patch_special_and_whole_scopes():
     )
     assert torch.equal(whole_swapped[0, 0], tokens[0, 2])
     assert torch.equal(whole_swapped[0, 2], tokens[0, 0])
+
+
+@pytest.mark.parametrize("mode", ("h-m", "h-r", "u-m", "u-r"))
+def test_spatiotemporal_representative_modes_protect_frame_zero(mode):
+    model = Aggregator.__new__(Aggregator)
+    model.patch_token_start = 1
+    model.frame_fusion_mode = mode
+    model.frame_fusion_lambda_cost = 0.15
+    model.frame_fusion_min_keep_ratio = 0.4
+    model.frame_fusion_temporal_window = 1
+    model.frame_fusion_spatial_neighborhood = "N8"
+    model.frame_fusion_time_overlap = 0.5
+    model.frame_fusion_reassignment_candidates = 8
+    model.frame_fusion_max_group_size = 4 if mode.startswith("h") else 8
+    model.frame_fusion_representative_update = "parent"
+    model._frame_fusion_patch_grid_size = (2, 2)
+
+    tokens = torch.randn((1, 4, 5, 8), generator=torch.Generator().manual_seed(7))
+    plans = model._build_spatiotemporal_representative_plans(tokens, source_layer=-1)
+    plan = plans[0]
+
+    assert tuple(plan.position_to_representative.shape) == (4, 4)
+    assert torch.equal(
+        plan.representative_weights,
+        torch.bincount(
+            plan.position_to_representative.reshape(-1),
+            minlength=plan.representative_source_indices.numel(),
+        ).float(),
+    )
+    assert set(range(4)).issubset(set(plan.representative_source_indices.tolist()))
+    assert int(plan.position_to_representative.min()) >= 0
+    assert int(plan.position_to_representative.max()) < plan.representative_source_indices.numel()

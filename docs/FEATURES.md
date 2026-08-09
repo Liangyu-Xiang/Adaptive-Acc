@@ -1,5 +1,40 @@
 # Implemented Features
 
+## Standalone adaptive spatial representatives
+
+Set `frame_fusion_mode: adaptive-spatial-representative` with
+`merge_ratio: 0` to run the single-frame spatial scheme independently of the
+adaptive temporal scheme. Frame 0 remains a one-to-one reference frame. Each
+frame from index 1 onward selects a global spatial medoid, then adds the token
+with the largest mean distortion reduction. The selected prefix minimizes:
+
+```text
+D_S(k) + lambda_cost * k / P
+```
+
+Only global attention uses the representative sequence. Its attention
+residual is mapped back to every original patch position, after which the
+original full token sequence goes through the per-token MLP. The implementation
+is in `vggt_omega/models/aggregator.py` and is exposed by both paper evaluation
+scripts.
+
+## Adaptive spatiotemporal representatives
+
+The four independent schemes from the adaptive spatiotemporal token
+compression design are exposed as `h-m`, `h-r`, `u-m`, and `u-r`:
+
+- `h-m`: adaptive temporal representatives followed by local spatial whole-group merges;
+- `h-r`: adaptive temporal representatives followed by local spatial deletion and reassignment;
+- `u-m`: unified local time/space whole-group merges;
+- `u-r`: unified local deletion and reassignment.
+
+All four protect frame 0 and special tokens, operate only in global attention,
+restore the attention residual to the original token layout, and run the full
+per-token MLP afterward. Balanced defaults are N8, temporal window 1,
+overlap threshold 0.5, minimum active ratio 0.4, H group size 4, U group size
+8, and reassignment candidate limit 8. The evaluation scripts expose these as
+`--frame-fusion-*` options.
+
 ## Progressive Multi-Level Attention
 
 `progressive_attention` implements the exact token-pair semantic reference for
