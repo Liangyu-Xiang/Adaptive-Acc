@@ -275,7 +275,7 @@ def parse_args() -> argparse.Namespace:
         default=0.15,
         help="Lambda for adaptive temporal representative objective D_tilde + lambda*q.",
     )
-    parser.add_argument("--frame-fusion-min-keep-ratio", type=float, default=0.4)
+    parser.add_argument("--frame-fusion-min-keep-ratio", type=float, default=0.05)
     parser.add_argument("--frame-fusion-temporal-window", type=int, default=1)
     parser.add_argument(
         "--frame-fusion-spatial-neighborhood",
@@ -837,7 +837,7 @@ def load_model(
     frame_fusion_target_keep_seed: int = 33,
     frame_fusion_recompute_each_global: bool = False,
     frame_fusion_lambda_cost: float = 0.15,
-    frame_fusion_min_keep_ratio: float = 0.4,
+    frame_fusion_min_keep_ratio: float = 0.05,
     frame_fusion_temporal_window: int = 1,
     frame_fusion_spatial_neighborhood: str = "N8",
     frame_fusion_time_overlap: float = 0.5,

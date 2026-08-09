@@ -832,7 +832,7 @@ def test_unified_spatiotemporal_graph_excludes_frame_zero(reallocate):
 def test_unified_merge_path_does_not_use_min_keep_or_group_size_limits():
     model = Aggregator.__new__(Aggregator)
     model.patch_token_start = 1
-    model.frame_fusion_min_keep_ratio = 1.0
+    model.frame_fusion_min_keep_ratio = 0.05
     model.frame_fusion_max_group_size = 1
     model.frame_fusion_temporal_window = 1
     model.frame_fusion_spatial_neighborhood = "N8"
@@ -855,6 +855,29 @@ def test_unified_merge_path_does_not_use_min_keep_or_group_size_limits():
 
     assert plan.representative_source_indices.numel() < 4
     assert plan.position_to_representative[0, 0].item() == 0
+
+
+def test_unified_merge_path_honors_min_keep_ratio():
+    model = Aggregator.__new__(Aggregator)
+    model.patch_token_start = 1
+    model.frame_fusion_min_keep_ratio = 1.0
+    model.frame_fusion_max_group_size = 8
+    model.frame_fusion_temporal_window = 1
+    model.frame_fusion_spatial_neighborhood = "N8"
+    model.frame_fusion_representative_update = "parent"
+    model._frame_fusion_patch_grid_size = (1, 1)
+
+    tokens = torch.tensor(
+        [
+            [[0.0, 0.0], [0.0, 1.0]],
+            [[0.0, 0.0], [1.0, 0.0]],
+            [[0.0, 0.0], [1.0, 0.0]],
+            [[0.0, 0.0], [1.0, 0.0]],
+        ]
+    )
+    plan = model._build_unified_representative_plan(tokens, reallocate=False)
+
+    assert plan.representative_source_indices.numel() == 4
 
 
 def test_spatiotemporal_group_error_uses_true_weighted_reconstruction_loss():

@@ -164,7 +164,7 @@ class Aggregator(nn.Module):
         frame_fusion_target_keep_seed: int = 33,
         frame_fusion_recompute_each_global: bool = False,
         frame_fusion_lambda_cost: float = 0.15,
-        frame_fusion_min_keep_ratio: float = 0.4,
+        frame_fusion_min_keep_ratio: float = 0.05,
         frame_fusion_temporal_window: int = 1,
         frame_fusion_spatial_neighborhood: str = "N8",
         frame_fusion_time_overlap: float = 0.5,
@@ -630,7 +630,7 @@ class Aggregator(nn.Module):
         lambda_cost = float(lambda_cost)
         if lambda_cost < 0.0:
             raise ValueError(f"frame_fusion_lambda_cost must be non-negative, got {lambda_cost}")
-        min_keep_ratio = float(getattr(self, "frame_fusion_min_keep_ratio", 0.4))
+        min_keep_ratio = float(getattr(self, "frame_fusion_min_keep_ratio", 0.05))
         if not 0.0 < min_keep_ratio <= 1.0:
             raise ValueError(
                 f"frame_fusion_min_keep_ratio must be in (0, 1], got {min_keep_ratio}"
@@ -2368,6 +2368,8 @@ class Aggregator(nn.Module):
                 or group_protected[right_group]
             ):
                 continue
+            if min_keep is not None and active_counts[-1] - 1 < min_keep:
+                break
             merge_delta, new_rep, new_error, merged_sum = merge_statistics(left_group, right_group)
             merged_members = members[left_group] + members[right_group]
             new_group = len(members)
@@ -2416,8 +2418,6 @@ class Aggregator(nn.Module):
             total_error += merge_delta
             active_counts.append(count - len(records))
             distortions.append(total_error / max(float(initial_weights.sum()), 1.0))
-            if min_keep is not None and active_counts[-1] <= min_keep:
-                break
 
         if lambda_cost is not None:
             active_ratio = np.asarray(active_counts, dtype=np.float64) / max(float(count), 1.0)
@@ -2525,7 +2525,7 @@ class Aggregator(nn.Module):
                 protected=protected,
                 initial_weights=temporal_plan.representative_weights.detach().cpu().numpy(),
                 max_group_size=int(getattr(self, "frame_fusion_max_group_size", 4)),
-                min_keep_ratio=float(getattr(self, "frame_fusion_min_keep_ratio", 0.4)),
+                min_keep_ratio=float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)),
             )
             final_mapping = torch.as_tensor(
                 assignment[temporal_mapping.reshape(-1)].reshape(num_frames, patch_count),
@@ -2577,7 +2577,7 @@ class Aggregator(nn.Module):
                     removal_scores[rep_index] = float(
                         (1.0 - (candidate_tensor * rep).sum(dim=-1)).min().detach().cpu()
                     )
-            target = max(int(np.ceil(temporal_count * float(getattr(self, "frame_fusion_min_keep_ratio", 0.4)))), len(protected_indices))
+            target = max(int(np.ceil(temporal_count * float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)))), len(protected_indices))
             remove_count = max(0, temporal_count - target)
             remove_order = removable[np.argsort(removal_scores[removable], kind="stable")]
             active[remove_order[:remove_count]] = False
@@ -2676,7 +2676,7 @@ class Aggregator(nn.Module):
             # Deleting a singleton representative is cheap when its nearest
             # local candidate is similar.  Frame 0 is never removable.
             removable = np.flatnonzero(~protected)
-            target = max(int(np.ceil(total * float(getattr(self, "frame_fusion_min_keep_ratio", 0.4)))), patch_count)
+            target = max(int(np.ceil(total * float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)))), patch_count)
             keep = np.zeros(total, dtype=bool)
             keep[:patch_count] = True
             keep[removable[np.argsort(nearest[removable].detach().cpu().numpy())[-max(target - patch_count, 0) :]]] = True
@@ -2727,7 +2727,7 @@ class Aggregator(nn.Module):
                 edge_target,
                 protected=protected,
                 max_group_size=None,
-                min_keep_ratio=None,
+                min_keep_ratio=float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)),
                 lambda_cost=float(getattr(self, "frame_fusion_lambda_cost", 0.15)),
                 prefer_best_parent=True,
             )
@@ -2804,7 +2804,7 @@ class Aggregator(nn.Module):
             "temporal_window": getattr(self, "frame_fusion_temporal_window", 1),
             "time_overlap": getattr(self, "frame_fusion_time_overlap", 0.5),
             "minimum_keep_ratio": (
-                None if mode == "u-m" else getattr(self, "frame_fusion_min_keep_ratio", 0.4)
+                getattr(self, "frame_fusion_min_keep_ratio", 0.05)
             ),
             "max_group_size": (
                 None if mode == "u-m" else getattr(self, "frame_fusion_max_group_size", None)

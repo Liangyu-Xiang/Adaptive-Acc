@@ -246,7 +246,7 @@ def parse_args() -> argparse.Namespace:
         default=0.15,
         help="Lambda for adaptive temporal representative objective D_tilde + lambda*q.",
     )
-    parser.add_argument("--frame-fusion-min-keep-ratio", type=float, default=0.4)
+    parser.add_argument("--frame-fusion-min-keep-ratio", type=float, default=0.05)
     parser.add_argument("--frame-fusion-temporal-window", type=int, default=1)
     parser.add_argument(
         "--frame-fusion-spatial-neighborhood",

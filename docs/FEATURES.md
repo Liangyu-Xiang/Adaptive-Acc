@@ -36,11 +36,12 @@ original token layout, and run the full per-token MLP afterward. U-M builds
 the complete legal merge path with dynamic whole-group cosine reconstruction
 losses, chooses the better of the two parent representatives after each
 merge, and selects the operating point by
-`D_k + lambda_cost * active_k / total_k`. It does not use `min_keep_ratio` or
-`max_group_size`. The legacy limits remain available for H-M/H-R/U-R
-compatibility. Balanced defaults are N8, temporal window 1, overlap threshold
-0.5, minimum active ratio 0.4, H group size 4, and reassignment candidate
-limit 8. The evaluation scripts expose these as `--frame-fusion-*` options.
+`D_k + lambda_cost * active_k / total_k`, subject to the 5% minimum active
+ratio. It does not use `max_group_size`. The legacy limits remain available
+for H-M/H-R/U-R compatibility. Balanced defaults are N8, temporal window 1,
+overlap threshold 0.5, minimum active ratio 0.05, H group size 4, and
+reassignment candidate limit 8. The evaluation scripts expose these as
+`--frame-fusion-*` options.
 
 ## Progressive Multi-Level Attention
 
