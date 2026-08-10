@@ -637,7 +637,7 @@ def test_adaptive_temporal_plan_keeps_reference_frames_and_positive_weights():
     assert bool(torch.all(plan.representative_weights >= 1).item())
     assert float(plan.representative_weights.sum()) == float(mapping.numel())
     assert model.last_frame_fusion_debug["mapping_preserved"] is True
-    assert model.last_frame_fusion_debug["cost_model"] == "linear_active_token_count"
+    assert model.last_frame_fusion_debug["cost_model"] == "absolute_temporal_distortion_plus_lambda"
 
 
 def test_adaptive_temporal_lambda_controls_split_count():
@@ -763,6 +763,14 @@ def test_spatiotemporal_representative_modes_protect_frame_zero(mode):
     tokens = torch.randn((1, 4, 5, 8), generator=torch.Generator().manual_seed(7))
     plans = model._build_spatiotemporal_representative_plans(tokens, source_layer=-1)
     plan = plans[0]
+    debug = model.last_frame_fusion_debug
+
+    assert debug["lambda_cost"] == pytest.approx(0.15)
+    assert debug["cost_denominator"] == "(F - 1) * P"
+    assert debug["selection"] == "min(D_m + lambda_cost * M_m / ((F - 1) * P))"
+    assert debug["representative_update"] == (
+        "reassignment" if mode in {"h-r", "u-r"} else "best-of-parents"
+    )
 
     assert tuple(plan.position_to_representative.shape) == (4, 4)
     assert torch.equal(

@@ -435,6 +435,50 @@ class Aggregator(nn.Module):
             )
         return result
 
+    @staticmethod
+    def _select_reallocation_prefix(
+        removal_scores: np.ndarray,
+        removable: np.ndarray,
+        *,
+        protected_count: int,
+        min_keep: int,
+        lambda_cost: float,
+        cost_denominator: float | None = None,
+    ) -> tuple[int, float]:
+        """Select an R-mode deletion prefix with the same absolute objective.
+
+        R modes use deletion/reassignment rather than group merges.  The
+        deletion path is ordered by the exact current nearest-survivor cosine
+        error, and the selected prefix minimizes absolute accumulated
+        reassignment error plus the normalized number of non-reference
+        representatives.  The final mapping is still recomputed against the
+        selected survivor set.
+        """
+        scores = np.asarray(removal_scores, dtype=np.float64)
+        removable = np.asarray(removable, dtype=np.int64)
+        total = int(scores.size)
+        compressible = max(total - int(protected_count), 1)
+        cost_scale = max(
+            float(compressible if cost_denominator is None else cost_denominator),
+            1.0,
+        )
+        max_remove = max(0, int(removable.size) - max(int(min_keep) - int(protected_count), 0))
+        if max_remove == 0:
+            return 0, float(lambda_cost) * (compressible / cost_scale)
+        order = removable[np.argsort(scores[removable], kind="stable")[:max_remove]]
+        cumulative_error = 0.0
+        best_remove = 0
+        best_objective = float(lambda_cost) * (compressible / cost_scale)
+        for remove_count, source_index in enumerate(order, start=1):
+            cumulative_error += max(float(scores[source_index]), 0.0)
+            distortion = cumulative_error / cost_scale
+            active_cost = (compressible - remove_count) / cost_scale
+            objective = distortion + float(lambda_cost) * active_cost
+            if objective < best_objective:
+                best_objective = objective
+                best_remove = remove_count
+        return best_remove, best_objective
+
     def _frame_fusion_enabled(self) -> bool:
         return self.frame_fusion_mode != "none"
 
@@ -2307,6 +2351,7 @@ class Aggregator(nn.Module):
         max_group_size: int | None = None,
         min_keep_ratio: float | None = None,
         lambda_cost: float | None = None,
+        cost_denominator: float | None = None,
         prefer_best_parent: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
         """Greedy local whole-group merging used by H-M and U-M.
@@ -2438,7 +2483,8 @@ class Aggregator(nn.Module):
                 int(np.count_nonzero(protected)),
             )
         if lambda_cost is not None:
-            best_objective = float(lambda_cost)
+            cost_scale = max(float(count if cost_denominator is None else cost_denominator), 1.0)
+            best_objective = float(lambda_cost) * (count / cost_scale)
 
         while heap:
             _, _, queued_left, queued_right = heapq.heappop(heap)
@@ -2525,7 +2571,8 @@ class Aggregator(nn.Module):
             distortions.append(total_error / max(float(initial_weights.sum()), 1.0))
             if lambda_cost is not None:
                 current_objective = distortions[-1] + float(lambda_cost) * (
-                    active_counts[-1] / max(float(count), 1.0)
+                    active_counts[-1]
+                    / max(float(count if cost_denominator is None else cost_denominator), 1.0)
                 )
                 if current_objective < best_objective:
                     best_objective = current_objective
@@ -2537,7 +2584,7 @@ class Aggregator(nn.Module):
                 # avoids materializing the unused tail of the curve.
                 future_lower_bound = distortions[-1] + float(lambda_cost) * (
                     (min_keep if min_keep is not None else 0)
-                    / max(float(count), 1.0)
+                    / max(float(count if cost_denominator is None else cost_denominator), 1.0)
                 )
                 if best_objective <= future_lower_bound:
                     break
@@ -2581,6 +2628,11 @@ class Aggregator(nn.Module):
             "minimum_active_tokens": min_keep,
             "max_group_size": max_group_size,
             "lambda_cost": lambda_cost,
+            "cost_denominator": (
+                float(count if cost_denominator is None else cost_denominator)
+                if lambda_cost is not None
+                else None
+            ),
             "accepted_merges": len(records),
             "selected_merges": selected_merges,
             "knee_active_tokens": int(selected_sources.size),
@@ -2667,8 +2719,11 @@ class Aggregator(nn.Module):
                 search_edge_right,
                 protected=np.zeros(search_indices.size, dtype=bool),
                 initial_weights=temporal_weights[search_indices],
-                max_group_size=int(getattr(self, "frame_fusion_max_group_size", 4)),
+                max_group_size=None,
                 min_keep_ratio=float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)),
+                lambda_cost=float(getattr(self, "frame_fusion_lambda_cost", 0.15)),
+                cost_denominator=float(max((num_frames - 1) * patch_count, 1)),
+                prefer_best_parent=True,
             )
             temporal_to_final = np.full(temporal_count, -1, dtype=np.int64)
             temporal_to_final[protected_indices] = np.arange(protected_indices.size, dtype=np.int64)
@@ -2721,7 +2776,17 @@ class Aggregator(nn.Module):
                                     nr, nc = row + dr, col + dc
                                     if 0 <= nr < height and 0 <= nc < width:
                                         candidates.append(int(temporal_mapping[other_frame, nr * width + nc]))
-                    unique = list(dict.fromkeys(candidates))
+                    # Frame-0 representatives are fixed references.  They may
+                    # only serve frame 0 itself, never a later source token.
+                    unique = list(
+                        dict.fromkeys(
+                            candidate for candidate in candidates
+                            if not protected[candidate]
+                        )
+                    )
+                    current_rep = int(temporal_mapping[frame, position])
+                    if not protected[current_rep] and current_rep not in unique:
+                        unique.insert(0, current_rep)
                     candidate_lists.append(unique[: max(2, int(getattr(self, "frame_fusion_reassignment_candidates", 8)))])
             active = np.ones(temporal_count, dtype=bool)
             protected_indices = np.flatnonzero(protected)
@@ -2737,8 +2802,18 @@ class Aggregator(nn.Module):
                     removal_scores[rep_index] = float(
                         (1.0 - (candidate_tensor * rep).sum(dim=-1)).min().detach().cpu()
                     )
-            target = max(int(np.ceil(temporal_count * float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)))), len(protected_indices))
-            remove_count = max(0, temporal_count - target)
+            target_min = max(
+                int(np.ceil(temporal_count * float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)))),
+                len(protected_indices),
+            )
+            remove_count, reallocation_objective = self._select_reallocation_prefix(
+                removal_scores,
+                removable,
+                protected_count=len(protected_indices),
+                min_keep=target_min,
+                lambda_cost=float(getattr(self, "frame_fusion_lambda_cost", 0.15)),
+                cost_denominator=float(max((num_frames - 1) * patch_count, 1)),
+            )
             remove_order = removable[np.argsort(removal_scores[removable], kind="stable")]
             active[remove_order[:remove_count]] = False
             active[protected_indices] = True
@@ -2775,10 +2850,11 @@ class Aggregator(nn.Module):
             final_sources = source_index_tensor
             merge_debug = {
                 "initial_active_tokens": temporal_count,
-                "minimum_active_tokens": target,
+                "minimum_active_tokens": target_min,
                 "selected_merges": remove_count,
                 "knee_active_tokens": int(survivors.size),
                 "reassignment": True,
+                "selected_objective": float(reallocation_objective),
             }
         weights = torch.bincount(final_mapping.reshape(-1), minlength=int(final_sources.numel())).float()
         self._hybrid_debug = getattr(self, "_hybrid_debug", [])
@@ -2836,10 +2912,26 @@ class Aggregator(nn.Module):
             # Deleting a singleton representative is cheap when its nearest
             # local candidate is similar.  Frame 0 is never removable.
             removable = np.flatnonzero(~protected)
-            target = max(int(np.ceil(total * float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)))), patch_count)
             keep = np.zeros(total, dtype=bool)
             keep[:patch_count] = True
-            keep[removable[np.argsort(nearest[removable].detach().cpu().numpy())[-max(target - patch_count, 0) :]]] = True
+            nearest_np = nearest.detach().cpu().numpy()
+            target_min = max(
+                int(np.ceil(total * float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)))),
+                patch_count,
+            )
+            # Larger nearest-neighbor similarity means cheaper deletion, so
+            # use cosine distance as the monotone deletion-path error.
+            removal_scores = 1.0 - nearest_np
+            remove_count, reallocation_objective = self._select_reallocation_prefix(
+                removal_scores,
+                removable,
+                protected_count=patch_count,
+                min_keep=target_min,
+                lambda_cost=float(getattr(self, "frame_fusion_lambda_cost", 0.15)),
+                cost_denominator=float(max((num_frames - 1) * patch_count, 1)),
+            )
+            remove_order = removable[np.argsort(removal_scores[removable], kind="stable")]
+            keep[remove_order[remove_count:]] = True
             for index in range(patch_count, total):
                 if not any(
                     0 <= candidate < total
@@ -2868,10 +2960,11 @@ class Aggregator(nn.Module):
             selected_sources = keep_ids
             debug = {
                 "initial_active_tokens": total,
-                "minimum_active_tokens": target,
+                "minimum_active_tokens": target_min,
                 "knee_active_tokens": int(selected_sources.size),
                 "selected_merges": int(total - selected_sources.size),
                 "reassignment": True,
+                "selected_objective": float(reallocation_objective),
             }
         else:
             edge_source, edge_target = self._build_local_spatiotemporal_edges(
@@ -2898,6 +2991,7 @@ class Aggregator(nn.Module):
                 max_group_size=None,
                 min_keep_ratio=float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)),
                 lambda_cost=float(getattr(self, "frame_fusion_lambda_cost", 0.15)),
+                cost_denominator=float(max((num_frames - 1) * patch_count, 1)),
                 prefer_best_parent=True,
             )
             final_mapping = np.empty(total, dtype=np.int64)
@@ -2975,15 +3069,16 @@ class Aggregator(nn.Module):
                 )
         batch_debug = list(self._hybrid_debug)
         first = batch_debug[0] if batch_debug else {}
-        uses_lambda = mode == "u-m"
+        uses_lambda = mode in {"h-m", "h-r", "u-m", "u-r"}
+        is_reallocation = mode in {"h-r", "u-r"}
         self.last_frame_fusion_debug = {
             "mode": mode,
             "source_layer": source_layer,
             "mapping": "original_token_to_spatiotemporal_representative",
             "cost_model": (
                 "local_spatiotemporal_exact_distortion_plus_lambda"
-                if uses_lambda
-                else "local_spatiotemporal_exact_distortion_knee"
+                if not is_reallocation
+                else "local_spatiotemporal_reallocation_distortion_plus_lambda"
             ),
             "spatial_neighborhood": getattr(self, "frame_fusion_spatial_neighborhood", "N8"),
             "temporal_window": getattr(self, "frame_fusion_temporal_window", 1),
@@ -2992,7 +3087,7 @@ class Aggregator(nn.Module):
                 getattr(self, "frame_fusion_min_keep_ratio", 0.05)
             ),
             "max_group_size": (
-                None if mode == "u-m" else getattr(self, "frame_fusion_max_group_size", None)
+                None
             ),
             "lambda_cost": (
                 getattr(self, "frame_fusion_lambda_cost", 0.15)
@@ -3012,7 +3107,9 @@ class Aggregator(nn.Module):
             "cost_denominator": "(F - 1) * P" if uses_lambda else None,
             "reassignment_candidates": getattr(self, "frame_fusion_reassignment_candidates", 8),
             "representative_update": (
-                "best-of-parents"
+                "reassignment"
+                if is_reallocation
+                else "best-of-parents"
                 if uses_lambda
                 else getattr(self, "frame_fusion_representative_update", "parent")
             ),
@@ -3365,18 +3462,17 @@ class Aggregator(nn.Module):
                 push_best(position)
 
             max_split_count = patch_count * max(num_frames - 2, 0)
-            n0 = num_frames * self.patch_token_start + 2 * patch_count
-            n_max = num_frames * self.patch_token_start + num_frames * patch_count
-            # Use the requested token-count cost model C(N)=N. The quadratic
-            # attention cost is intentionally not used for knee selection.
-            c0 = float(n0)
-            c_max = float(n_max)
-            cost_span = max(c_max - c0, 1.0)
+            # The reference frame is fixed.  Lambda therefore charges only
+            # active non-reference patch representatives, normalized by the
+            # original non-reference patch-token count.
+            non_reference_denominator = float(max((num_frames - 1) * patch_count, 1))
             current_distortion = initial_distortion
             best_k = 0
-            best_objective = 1.0
+            best_objective = current_distortion + self.frame_fusion_lambda_cost * (
+                patch_count / non_reference_denominator
+            )
             best_score = best_objective
-            best_compute_saving = 1.0
+            best_compute_saving = 1.0 - patch_count / non_reference_denominator
             best_distortion = initial_distortion
 
             for split_count in range(1, max_split_count + 1):
@@ -3413,14 +3509,9 @@ class Aggregator(nn.Module):
                 push_best(segment_id)
                 push_best(new_segment_id)
 
-                active_tokens = n0 + split_count
-                q = float((active_tokens - c0) / cost_span)
-                distortion_ratio = (
-                    current_distortion / initial_distortion
-                    if initial_distortion > 1e-12
-                    else 0.0
-                )
-                objective = distortion_ratio + self.frame_fusion_lambda_cost * q
+                active_non_reference_tokens = patch_count + split_count
+                q = float(active_non_reference_tokens / non_reference_denominator)
+                objective = current_distortion + self.frame_fusion_lambda_cost * q
                 if objective < best_objective:
                     best_k = split_count
                     best_objective = objective
@@ -3521,9 +3612,9 @@ class Aggregator(nn.Module):
             "embed_dim": embed_dim,
             "mapping": "position_to_temporal_segment_representative",
             "weighting": "log_representative_occurrence_count_in_attention_logits",
-            "cost_model": "linear_active_token_count",
+            "cost_model": "absolute_temporal_distortion_plus_lambda",
             "lambda_cost": self.frame_fusion_lambda_cost,
-            "knee_selection": "min(normalized_distortion_k + lambda_cost*q_k)",
+            "selection": "min(D_t + lambda_cost * M_t / ((F - 1) * P))",
             "mapping_preserved": True,
             "selection_seconds": selection_seconds,
             "full_patch_tokens": int(num_frames * patch_count),

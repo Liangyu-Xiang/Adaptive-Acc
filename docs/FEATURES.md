@@ -32,14 +32,16 @@ All four strictly isolate frame 0 patch tokens: they remain one-to-one
 representatives, are excluded from candidate edges, and cannot represent
 tokens from later frames. Special tokens are always preserved. The schemes
 operate only in global attention, restore the attention residual to the
-original token layout, and run the full per-token MLP afterward. U-M builds
-the complete legal merge path with dynamic whole-group cosine reconstruction
-losses, chooses the better of the two parent representatives after each
-merge, and selects the operating point by
-`D_k + lambda_cost * active_k / total_k`, subject to the 5% minimum active
-ratio. It does not use `max_group_size`. The legacy limits remain available
-for H-M/H-R/U-R compatibility. Balanced defaults are N8, temporal window 1,
-overlap threshold 0.5, minimum active ratio 0.05, H group size 4, and
+original token layout, and run the full per-token MLP afterward. M modes use
+dynamic whole-group cosine reconstruction losses, maintain the complete
+post-merge group adjacency, choose the better parent representative, and do
+not use `max_group_size`. R modes use the same absolute reconstruction-plus-
+token-cost objective to select a deletion prefix, then perform one-pass
+reassignment to the surviving representatives without allowing reassigned
+tokens to become new representatives. Every mode uses
+`D + lambda_cost * M / ((F - 1) * P)` over non-reference patch tokens,
+subject to the 5% minimum active ratio. Balanced defaults are N4/N8,
+temporal window 1, overlap threshold 0.5, minimum active ratio 0.05, and
 reassignment candidate limit 8. The evaluation scripts expose these as
 `--frame-fusion-*` options.
 
