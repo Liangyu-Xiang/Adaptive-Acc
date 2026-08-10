@@ -2238,7 +2238,7 @@ class Aggregator(nn.Module):
             "embed_dim": embed_dim,
             "target_keep_threshold": threshold,
             "mapping": "position_to_temporal_representative",
-            "weighting": "log_representative_occurrence_count_in_attention_logits",
+            "weighting": "uniform_representative_keys",
             "mapping_preserved": True,
             "full_patch_tokens": int(num_frames * patch_count),
             "retained_patch_tokens": int(debug_batches[0]["representative_patch_tokens"])
@@ -3324,7 +3324,7 @@ class Aggregator(nn.Module):
             "patch_tokens_per_frame": patch_count,
             "embed_dim": embed_dim,
             "mapping": "frame_position_to_spatial_representative",
-            "weighting": "log_representative_occurrence_count_in_attention_logits",
+            "weighting": "uniform_representative_keys",
             "cost_model": "spatial_distortion_plus_lambda_k_over_P",
             "lambda_cost": self.frame_fusion_lambda_cost,
             "selection": "medoid_then_lazy_greedy_max_distortion_reduction",
@@ -3611,7 +3611,7 @@ class Aggregator(nn.Module):
             "patch_tokens_per_frame": patch_count,
             "embed_dim": embed_dim,
             "mapping": "position_to_temporal_segment_representative",
-            "weighting": "log_representative_occurrence_count_in_attention_logits",
+            "weighting": "uniform_representative_keys",
             "cost_model": "absolute_temporal_distortion_plus_lambda",
             "lambda_cost": self.frame_fusion_lambda_cost,
             "selection": "min(D_t + lambda_cost * M_t / ((F - 1) * P))",
@@ -3794,23 +3794,13 @@ class Aggregator(nn.Module):
                 plan.representative_source_indices.to(device=tokens.device),
             )
             compressed = torch.cat([special_tokens, representatives], dim=0).unsqueeze(0)
-            weights = torch.cat(
-                [
-                    torch.ones(
-                        special_tokens.shape[0],
-                        device=tokens.device,
-                        dtype=torch.float32,
-                    ),
-                    plan.representative_weights.to(device=tokens.device),
-                ],
-                dim=0,
-            )
-            key_log_weights = weights.clamp_min(1.0).log().to(dtype=compressed.dtype)
-            key_log_weights = key_log_weights.view(1, 1, 1, -1)
 
             block.attn.merge_random_seed = self.merge_random_seed
             normalized = block.norm1(compressed)
-            attention_output = block.attn(normalized, attn_bias=key_log_weights)
+            # Keep the representative keys uniform.  In particular, do not
+            # pass an additive key bias here: a non-null attn_mask disables
+            # FlashAttention in scaled_dot_product_attention.
+            attention_output = block.attn(normalized)
             attention_update = block.ls1(attention_output).squeeze(0)
 
             # Restore only the attention residual to the original full token
@@ -3863,23 +3853,12 @@ class Aggregator(nn.Module):
                 plan.representative_source_indices.to(device=tokens.device),
             )
             compressed = torch.cat([special_tokens, representatives], dim=0).unsqueeze(0)
-            weights = torch.cat(
-                [
-                    torch.ones(
-                        special_tokens.shape[0],
-                        device=tokens.device,
-                        dtype=torch.float32,
-                    ),
-                    plan.representative_weights.to(device=tokens.device),
-                ],
-                dim=0,
-            )
-            key_log_weights = weights.clamp_min(1.0).log().to(dtype=compressed.dtype)
-            key_log_weights = key_log_weights.view(1, 1, 1, -1)
 
             block.attn.merge_random_seed = self.merge_random_seed
             normalized = block.norm1(compressed)
-            attention_output = block.attn(normalized, attn_bias=key_log_weights)
+            # Keep the representative keys uniform so SDPA can select the
+            # FlashAttention kernel instead of falling back to a masked path.
+            attention_output = block.attn(normalized)
             attention_update = block.ls1(attention_output).squeeze(0)
 
             restored_special_update = attention_update[: special_tokens.shape[0]].view(
