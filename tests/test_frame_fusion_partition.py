@@ -637,7 +637,7 @@ def test_adaptive_temporal_plan_keeps_reference_frames_and_positive_weights():
     assert bool(torch.all(plan.representative_weights >= 1).item())
     assert float(plan.representative_weights.sum()) == float(mapping.numel())
     assert model.last_frame_fusion_debug["mapping_preserved"] is True
-    assert model.last_frame_fusion_debug["cost_model"] == "absolute_temporal_distortion_plus_lambda"
+    assert model.last_frame_fusion_debug["cost_model"] == "normalized_temporal_distortion_plus_lambda"
 
 
 def test_adaptive_temporal_lambda_controls_split_count():
@@ -767,7 +767,7 @@ def test_spatiotemporal_representative_modes_protect_frame_zero(mode):
 
     assert debug["lambda_cost"] == pytest.approx(0.15)
     assert debug["cost_denominator"] == "(F - 1) * P"
-    assert debug["selection"] == "min(D_m + lambda_cost * M_m / ((F - 1) * P))"
+    assert debug["selection"] == "min(D_m_normalized + lambda_cost * M_m_normalized)"
     assert debug["representative_update"] == (
         "reassignment" if mode in {"h-r", "u-r"} else "best-of-parents"
     )
@@ -911,7 +911,8 @@ def test_spatiotemporal_group_error_uses_true_weighted_reconstruction_loss():
     # Ward-style d * 2 * 1 / 3 approximation.
     assert selected_sources.tolist() == [0]
     assert debug["accepted_merges"] == 1
-    assert debug["selected_distortion"] == pytest.approx(0.2 / 3.0, abs=1e-6)
+    assert debug["selected_distortion"] == pytest.approx(0.2 / (2.0 * 3.0), abs=1e-6)
+    assert debug["distortion_normalization"] == "average_cosine_distance / 2"
 
 
 def test_unified_debug_uses_frame_count_for_attention_token_statistics():
@@ -929,9 +930,13 @@ def test_unified_debug_uses_frame_count_for_attention_token_statistics():
     debug = model.last_frame_fusion_debug
 
     assert debug["lambda_cost"] == pytest.approx(0.25)
-    assert debug["selection"] == "min(D_m + lambda_cost * M_m / ((F - 1) * P))"
+    assert debug["selection"] == "min(D_m_normalized + lambda_cost * M_m_normalized)"
     assert debug["cost_scope"] == "non_reference_patch_tokens"
     assert debug["cost_denominator"] == "(F - 1) * P"
+    assert debug["max_token_count"] == pytest.approx((3 - 1) * 1)
+    assert debug["token_count_normalization"] == (
+        "active_non_reference_tokens / ((F - 1) * P)"
+    )
     assert debug["representative_update"] == "best-of-parents"
     for batch_debug, plan in zip(debug["batches"], plans):
         assert batch_debug["attention_tokens"] == 3 + plan.representative_source_indices.numel()

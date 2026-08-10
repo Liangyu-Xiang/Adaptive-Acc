@@ -31,6 +31,11 @@ from vggt_omega.utils.reference_frame import resolve_first_frame_token_indices
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
+# Normalized features use d(x, y) = 1 - cos(x, y).  Its theoretical range is
+# [0, 2], so dividing the average reconstruction distance by this constant
+# puts every frame-fusion distortion curve on a common [0, 1] scale.
+_FRAME_FUSION_MAX_COSINE_DISTANCE = 2.0
+
 
 @dataclass(frozen=True)
 class FrameFusionSegment:
@@ -445,14 +450,14 @@ class Aggregator(nn.Module):
         lambda_cost: float,
         cost_denominator: float | None = None,
     ) -> tuple[int, float]:
-        """Select an R-mode deletion prefix with the same absolute objective.
+        """Select an R-mode deletion prefix with the normalized objective.
 
         R modes use deletion/reassignment rather than group merges.  The
         deletion path is ordered by the exact current nearest-survivor cosine
-        error, and the selected prefix minimizes absolute accumulated
-        reassignment error plus the normalized number of non-reference
-        representatives.  The final mapping is still recomputed against the
-        selected survivor set.
+        error, and the selected prefix minimizes accumulated average cosine
+        error normalized by its maximum value of 2, plus the normalized number
+        of non-reference representatives. The final mapping is still
+        recomputed against the selected survivor set.
         """
         scores = np.asarray(removal_scores, dtype=np.float64)
         removable = np.asarray(removable, dtype=np.int64)
@@ -471,7 +476,9 @@ class Aggregator(nn.Module):
         best_objective = float(lambda_cost) * (compressible / cost_scale)
         for remove_count, source_index in enumerate(order, start=1):
             cumulative_error += max(float(scores[source_index]), 0.0)
-            distortion = cumulative_error / cost_scale
+            distortion = cumulative_error / (
+                _FRAME_FUSION_MAX_COSINE_DISTANCE * cost_scale
+            )
             active_cost = (compressible - remove_count) / cost_scale
             objective = distortion + float(lambda_cost) * active_cost
             if objective < best_objective:
@@ -2316,15 +2323,24 @@ class Aggregator(nn.Module):
     def _spatiotemporal_knee_index(
         active_counts: list[int],
         distortions: list[float],
+        *,
+        max_token_count: float | None = None,
     ) -> int:
         if len(active_counts) <= 2:
             return 0
         x = np.asarray(active_counts, dtype=np.float64)
         y = np.asarray(distortions, dtype=np.float64)
-        x = (x - x[-1]) / max(x[0] - x[-1], 1.0)
-        # Keep the distortion in its fixed cosine-distance scale. Per-curve
-        # normalization would erase the absolute redundancy difference
-        # between sequences before the operating point is selected.
+        # The x axis is always normalized by the maximum possible number of
+        # compressible patch tokens, (F - 1) * P. It must not be normalized by
+        # the observed curve endpoint because that endpoint depends on the
+        # graph and on the stopping rule.
+        x = x / max(
+            float(max_token_count if max_token_count is not None else x.max()),
+            1.0,
+        )
+        # Distortions are already normalized by the theoretical maximum
+        # cosine distance. Only remove the common zero origin here; do not
+        # normalize each sequence independently.
         y = y - y[0]
         start = np.asarray([x[0], y[0]])
         end = np.asarray([x[-1], y[-1]])
@@ -2482,9 +2498,12 @@ class Aggregator(nn.Module):
                 int(np.ceil(count * float(min_keep_ratio))),
                 int(np.count_nonzero(protected)),
             )
+        max_token_count = max(
+            float(count if cost_denominator is None else cost_denominator),
+            1.0,
+        )
         if lambda_cost is not None:
-            cost_scale = max(float(count if cost_denominator is None else cost_denominator), 1.0)
-            best_objective = float(lambda_cost) * (count / cost_scale)
+            best_objective = float(lambda_cost) * (count / max_token_count)
 
         while heap:
             _, _, queued_left, queued_right = heapq.heappop(heap)
@@ -2568,12 +2587,14 @@ class Aggregator(nn.Module):
             records.append((left_group, right_group, new_group, new_rep))
             total_error += merge_delta
             active_counts.append(count - len(records))
-            distortions.append(total_error / max(float(initial_weights.sum()), 1.0))
+            normalized_distortion = total_error / (
+                _FRAME_FUSION_MAX_COSINE_DISTANCE
+                * max(float(initial_weights.sum()), 1.0)
+            )
+            distortions.append(float(np.clip(normalized_distortion, 0.0, 1.0)))
             if lambda_cost is not None:
-                current_objective = distortions[-1] + float(lambda_cost) * (
-                    active_counts[-1]
-                    / max(float(count if cost_denominator is None else cost_denominator), 1.0)
-                )
+                active_token_ratio = active_counts[-1] / max_token_count
+                current_objective = distortions[-1] + float(lambda_cost) * active_token_ratio
                 if current_objective < best_objective:
                     best_objective = current_objective
                     best_merges = len(records)
@@ -2584,7 +2605,7 @@ class Aggregator(nn.Module):
                 # avoids materializing the unused tail of the curve.
                 future_lower_bound = distortions[-1] + float(lambda_cost) * (
                     (min_keep if min_keep is not None else 0)
-                    / max(float(count if cost_denominator is None else cost_denominator), 1.0)
+                    / max_token_count
                 )
                 if best_objective <= future_lower_bound:
                     break
@@ -2594,7 +2615,11 @@ class Aggregator(nn.Module):
             selection = "min_distortion_plus_lambda_active_ratio"
             selected_objective = best_objective
         else:
-            selected_merges = self._spatiotemporal_knee_index(active_counts, distortions)
+            selected_merges = self._spatiotemporal_knee_index(
+                active_counts,
+                distortions,
+                max_token_count=max_token_count,
+            )
             selection = "geometric_knee"
             selected_objective = None
         selected_merges = min(selected_merges, len(records))
@@ -2633,11 +2658,17 @@ class Aggregator(nn.Module):
                 if lambda_cost is not None
                 else None
             ),
+            "max_token_count": float(max_token_count),
+            "token_count_normalization": "active_tokens / ((F - 1) * P)",
+            "distortion_normalization": "average_cosine_distance / 2",
             "accepted_merges": len(records),
             "selected_merges": selected_merges,
             "knee_active_tokens": int(selected_sources.size),
             "knee_distortion": float(distortions[selected_merges]),
             "selected_distortion": float(distortions[selected_merges]),
+            "selected_token_ratio": float(
+                active_counts[selected_merges] / max_token_count
+            ),
             "selected_objective": selected_objective,
             "selection": selection,
             "group_size_max": int(max(group_size, default=1)),
@@ -3076,9 +3107,9 @@ class Aggregator(nn.Module):
             "source_layer": source_layer,
             "mapping": "original_token_to_spatiotemporal_representative",
             "cost_model": (
-                "local_spatiotemporal_exact_distortion_plus_lambda"
+                "local_spatiotemporal_normalized_distortion_plus_lambda"
                 if not is_reallocation
-                else "local_spatiotemporal_reallocation_distortion_plus_lambda"
+                else "local_spatiotemporal_normalized_reallocation_distortion_plus_lambda"
             ),
             "spatial_neighborhood": getattr(self, "frame_fusion_spatial_neighborhood", "N8"),
             "temporal_window": getattr(self, "frame_fusion_temporal_window", 1),
@@ -3095,9 +3126,15 @@ class Aggregator(nn.Module):
                 else None
             ),
             "selection": (
-                "min(D_m + lambda_cost * M_m / ((F - 1) * P))"
+                "min(D_m_normalized + lambda_cost * M_m_normalized)"
                 if uses_lambda
                 else "geometric_knee"
+            ),
+            "distortion_normalization": "average_cosine_distance / 2",
+            "token_count_normalization": (
+                "active_non_reference_tokens / ((F - 1) * P)"
+                if uses_lambda
+                else None
             ),
             "cost_scope": (
                 "non_reference_patch_tokens"
@@ -3105,6 +3142,17 @@ class Aggregator(nn.Module):
                 else "all_candidate_patch_tokens"
             ),
             "cost_denominator": "(F - 1) * P" if uses_lambda else None,
+            "max_token_count": (
+                float(
+                    max(
+                        (tokens.shape[1] - 1)
+                        * (tokens.shape[2] - self.patch_token_start),
+                        1,
+                    )
+                )
+                if uses_lambda
+                else None
+            ),
             "reassignment_candidates": getattr(self, "frame_fusion_reassignment_candidates", 8),
             "representative_update": (
                 "reassignment"
@@ -3422,7 +3470,10 @@ class Aggregator(nn.Module):
             )
             denominator = float(max((num_frames - 1) * patch_count, 1))
             initial_error = prefix[:, 1, num_frames] - prefix[:, 1, 1]
-            initial_distortion = float(initial_error.sum() / denominator)
+            initial_distortion = float(
+                initial_error.sum()
+                / (_FRAME_FUSION_MAX_COSINE_DISTANCE * denominator)
+            )
 
             # Segment state is keyed by an id. Splitting keeps the old id for
             # the left segment and allocates one new id for the right segment.
@@ -3505,7 +3556,11 @@ class Aggregator(nn.Module):
                 )
 
                 gain = -neg_gain
-                current_distortion = max(0.0, current_distortion - gain / denominator)
+                current_distortion = max(
+                    0.0,
+                    current_distortion
+                    - gain / (_FRAME_FUSION_MAX_COSINE_DISTANCE * denominator),
+                )
                 push_best(segment_id)
                 push_best(new_segment_id)
 
@@ -3612,9 +3667,11 @@ class Aggregator(nn.Module):
             "embed_dim": embed_dim,
             "mapping": "position_to_temporal_segment_representative",
             "weighting": "uniform_representative_keys",
-            "cost_model": "absolute_temporal_distortion_plus_lambda",
+            "cost_model": "normalized_temporal_distortion_plus_lambda",
             "lambda_cost": self.frame_fusion_lambda_cost,
-            "selection": "min(D_t + lambda_cost * M_t / ((F - 1) * P))",
+            "selection": "min(D_t_normalized + lambda_cost * M_t_normalized)",
+            "distortion_normalization": "average_cosine_distance / 2",
+            "token_count_normalization": "active_non_reference_tokens / ((F - 1) * P)",
             "mapping_preserved": True,
             "selection_seconds": selection_seconds,
             "full_patch_tokens": int(num_frames * patch_count),
