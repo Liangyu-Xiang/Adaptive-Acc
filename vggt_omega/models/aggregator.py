@@ -163,6 +163,7 @@ class Aggregator(nn.Module):
         frame_fusion_target_keep_threshold: float = 0.0,
         frame_fusion_target_keep_seed: int = 33,
         frame_fusion_recompute_each_global: bool = False,
+        frame_fusion_recompute_layers: tuple[int, ...] | list[int] | str = (),
         frame_fusion_lambda_cost: float = 0.15,
         frame_fusion_min_keep_ratio: float = 0.05,
         frame_fusion_temporal_window: int = 1,
@@ -302,6 +303,9 @@ class Aggregator(nn.Module):
         self.frame_fusion_target_keep_threshold = float(frame_fusion_target_keep_threshold)
         self.frame_fusion_target_keep_seed = int(frame_fusion_target_keep_seed)
         self.frame_fusion_recompute_each_global = bool(frame_fusion_recompute_each_global)
+        self.frame_fusion_recompute_layers = self._normalize_frame_fusion_recompute_layers(
+            frame_fusion_recompute_layers
+        )
         self.frame_fusion_min_keep_ratio = float(frame_fusion_min_keep_ratio)
         self.frame_fusion_temporal_window = int(frame_fusion_temporal_window)
         self.frame_fusion_spatial_neighborhood = str(frame_fusion_spatial_neighborhood).upper()
@@ -384,6 +388,7 @@ class Aggregator(nn.Module):
             target_keep_threshold=frame_fusion_target_keep_threshold,
             target_keep_seed=frame_fusion_target_keep_seed,
             recompute_each_global=frame_fusion_recompute_each_global,
+            recompute_layers=frame_fusion_recompute_layers,
             lambda_cost=frame_fusion_lambda_cost,
         )
 
@@ -395,6 +400,40 @@ class Aggregator(nn.Module):
     @staticmethod
     def _merge_is_enabled(global_merging: bool, merging: int | None, merge_ratio: float) -> bool:
         return global_merging and merging is not None and merge_ratio > 0.0
+
+    @staticmethod
+    def _normalize_frame_fusion_recompute_layers(
+        layers: tuple[int, ...] | list[int] | str | int,
+    ) -> tuple[int, ...]:
+        """Normalize optional layer indices used for U-M plan refreshes."""
+        if isinstance(layers, str):
+            normalized = layers.strip().lower()
+            if not normalized or normalized == "none":
+                return ()
+            values: list[int] = []
+            for part in normalized.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" in part:
+                    start_text, end_text = part.split("-", 1)
+                    start, end = int(start_text), int(end_text)
+                    if end < start:
+                        raise ValueError(f"Invalid frame_fusion_recompute_layers range {part!r}")
+                    values.extend(range(start, end + 1))
+                else:
+                    values.append(int(part))
+            layers = values
+        elif isinstance(layers, int):
+            layers = (layers,)
+        result = tuple(sorted(set(int(layer) for layer in layers)))
+        invalid = [layer for layer in result if layer < 0]
+        if invalid:
+            raise ValueError(
+                "frame_fusion_recompute_layers must contain non-negative layer indices, "
+                f"got {invalid}"
+            )
+        return result
 
     def _frame_fusion_enabled(self) -> bool:
         return self.frame_fusion_mode != "none"
@@ -557,6 +596,7 @@ class Aggregator(nn.Module):
         target_keep_threshold: float = 0.0,
         target_keep_seed: int = 33,
         recompute_each_global: bool = False,
+        recompute_layers: tuple[int, ...] | list[int] | str | None = None,
         lambda_cost: float = 0.15,
     ) -> None:
         mode = mode.replace("_", "-")
@@ -627,6 +667,16 @@ class Aggregator(nn.Module):
             )
         target_keep_seed = int(target_keep_seed)
         recompute_each_global = bool(recompute_each_global)
+        if recompute_layers is not None:
+            recompute_layers = self._normalize_frame_fusion_recompute_layers(recompute_layers)
+        else:
+            recompute_layers = getattr(self, "frame_fusion_recompute_layers", ())
+        invalid_recompute_layers = [layer for layer in recompute_layers if layer >= self.depth]
+        if invalid_recompute_layers:
+            raise ValueError(
+                f"frame_fusion_recompute_layers must be in 0..{self.depth - 1}, "
+                f"got {invalid_recompute_layers}"
+            )
         lambda_cost = float(lambda_cost)
         if lambda_cost < 0.0:
             raise ValueError(f"frame_fusion_lambda_cost must be non-negative, got {lambda_cost}")
@@ -680,6 +730,8 @@ class Aggregator(nn.Module):
                 raise ValueError("target patch retention is only supported for pair-top-percent frame fusion")
             if recompute_each_global:
                 raise ValueError("per-global recomputation is only supported for pair-top-percent frame fusion")
+            if recompute_layers:
+                raise ValueError("layer-specific recomputation is only supported for spatiotemporal representative fusion")
         elif mode in {
             "pair-top-percent",
             "group-top-percent",
@@ -705,6 +757,8 @@ class Aggregator(nn.Module):
                 raise ValueError(
                     "per-global recomputation is only supported for pair-top-percent frame fusion"
                 )
+            if recompute_layers:
+                raise ValueError("layer-specific recomputation is only supported for spatiotemporal representative fusion")
         elif mode in {
             "temporal-representative",
             "adaptive-temporal-representative",
@@ -731,6 +785,8 @@ class Aggregator(nn.Module):
                 raise ValueError(
                     "per-global recomputation is only supported for pair-top-percent frame fusion"
                 )
+            if recompute_layers:
+                raise ValueError("layer-specific recomputation is only supported for spatiotemporal representative fusion")
         elif mode == "adaptive-spatial-representative":
             num_groups = None
             if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio):
@@ -750,6 +806,8 @@ class Aggregator(nn.Module):
                 raise ValueError(
                     "per-global recomputation is only supported for pair-top-percent frame fusion"
                 )
+            if recompute_layers:
+                raise ValueError("layer-specific recomputation is only supported for spatiotemporal representative fusion")
         elif mode in {"h-m", "h-r", "u-m", "u-r"}:
             num_groups = None
             if self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio):
@@ -768,6 +826,8 @@ class Aggregator(nn.Module):
                 raise ValueError(
                     "per-global recomputation is only supported for pair-top-percent frame fusion"
                 )
+            if recompute_layers and start_layer != -1:
+                raise ValueError("layer-specific recomputation requires frame_fusion_start_layer=-1")
         else:
             num_groups = None
             target_keep_policy = "none"
@@ -787,6 +847,7 @@ class Aggregator(nn.Module):
         self.frame_fusion_target_keep_threshold = target_keep_threshold
         self.frame_fusion_target_keep_seed = target_keep_seed
         self.frame_fusion_recompute_each_global = recompute_each_global
+        self.frame_fusion_recompute_layers = tuple(recompute_layers)
         self.frame_fusion_lambda_cost = lambda_cost
         self.frame_fusion_min_keep_ratio = min_keep_ratio
         self.frame_fusion_temporal_window = temporal_window
@@ -1270,6 +1331,10 @@ class Aggregator(nn.Module):
             }
             and self.frame_fusion_recompute_each_global
         )
+        recompute_spatiotemporal_layers = (
+            self.frame_fusion_mode in {"h-m", "h-r", "u-m", "u-r"}
+            and bool(self.frame_fusion_recompute_layers)
+        )
         if self.frame_fusion_mode == "dp-medoid" and self.frame_fusion_start_layer == -1:
             tokens, frame_fusion_restore_index = self._apply_frame_fusion(tokens, source_layer=-1)
             num_frames = tokens.shape[1]
@@ -1317,6 +1382,7 @@ class Aggregator(nn.Module):
         elif (
             self.frame_fusion_mode in {"h-m", "h-r", "u-m", "u-r"}
             and self.frame_fusion_start_layer == -1
+            and not recompute_spatiotemporal_layers
         ):
             spatiotemporal_representative_plans = (
                 self._build_spatiotemporal_representative_plans(
@@ -1412,6 +1478,17 @@ class Aggregator(nn.Module):
                     )
                 )
                 current_spatiotemporal_plans = spatiotemporal_representative_plans
+            if (
+                recompute_spatiotemporal_layers
+                and block_idx in self.frame_fusion_recompute_layers
+            ):
+                spatiotemporal_representative_plans = (
+                    self._build_spatiotemporal_representative_plans(
+                        frame_tokens,
+                        source_layer=block_idx,
+                    )
+                )
+                current_spatiotemporal_plans = spatiotemporal_representative_plans
             tokens = self._run_inter_frame_attention_block(
                 tokens,
                 batch_size,
@@ -1498,6 +1575,18 @@ class Aggregator(nn.Module):
             self.last_frame_fusion_debug["global_attention_seconds"] = float(
                 self._frame_fusion_global_attention_seconds
             )
+            if self.frame_fusion_recompute_layers:
+                self.last_frame_fusion_debug["recompute_layers"] = list(
+                    self.frame_fusion_recompute_layers
+                )
+                self.last_frame_fusion_debug["recomputed_source_layers"] = [
+                    int(layer["source_layer"])
+                    for layer in self._frame_fusion_debug_layers
+                ]
+                self.last_frame_fusion_debug["num_recomputed_layers"] = len(
+                    self._frame_fusion_debug_layers
+                )
+                self.last_frame_fusion_debug["layers"] = self._frame_fusion_debug_layers
         return outputs, self.patch_token_start
 
     def _apply_layer_token_swap(
@@ -2955,6 +3044,8 @@ class Aggregator(nn.Module):
         self.last_frame_fusion_debug["planning_seconds"] = float(
             self._frame_fusion_plan_seconds
         )
+        if source_layer in getattr(self, "frame_fusion_recompute_layers", ()):
+            self._frame_fusion_debug_layers.append(self.last_frame_fusion_debug.copy())
         return plans
 
     def _build_adaptive_spatial_representative_plans(

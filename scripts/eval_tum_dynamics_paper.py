@@ -270,6 +270,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--frame-fusion-recompute-layers",
+        default="",
+        help=(
+            "Comma-separated global layer indices at which to rebuild the U-M/H-M "
+            "representative plan after frame attention, e.g. '0,10,17'."
+        ),
+    )
+    parser.add_argument(
         "--frame-fusion-lambda-cost",
         type=float,
         default=0.15,
@@ -836,6 +844,7 @@ def load_model(
     frame_fusion_target_keep_threshold: float = 0.0,
     frame_fusion_target_keep_seed: int = 33,
     frame_fusion_recompute_each_global: bool = False,
+    frame_fusion_recompute_layers: str = "",
     frame_fusion_lambda_cost: float = 0.15,
     frame_fusion_min_keep_ratio: float = 0.05,
     frame_fusion_temporal_window: int = 1,
@@ -900,6 +909,7 @@ def load_model(
         "frame_fusion_target_keep_threshold": frame_fusion_target_keep_threshold,
         "frame_fusion_target_keep_seed": frame_fusion_target_keep_seed,
         "frame_fusion_recompute_each_global": frame_fusion_recompute_each_global,
+        "frame_fusion_recompute_layers": frame_fusion_recompute_layers,
         "frame_fusion_lambda_cost": frame_fusion_lambda_cost,
         "frame_fusion_min_keep_ratio": frame_fusion_min_keep_ratio,
         "frame_fusion_temporal_window": frame_fusion_temporal_window,
@@ -1281,6 +1291,7 @@ def main() -> int:
         frame_fusion_target_keep_threshold=args.frame_fusion_target_keep_threshold,
         frame_fusion_target_keep_seed=args.frame_fusion_target_keep_seed,
         frame_fusion_recompute_each_global=args.frame_fusion_recompute_each_global,
+        frame_fusion_recompute_layers=args.frame_fusion_recompute_layers,
         frame_fusion_lambda_cost=args.frame_fusion_lambda_cost,
         frame_fusion_min_keep_ratio=args.frame_fusion_min_keep_ratio,
         frame_fusion_temporal_window=args.frame_fusion_temporal_window,
@@ -1539,6 +1550,10 @@ def main() -> int:
                 "target_keep_patch_tokens_total"
             )
             row["frame_fusion_recompute_each_global"] = debug.get("recompute_each_global")
+            row["frame_fusion_recompute_layers"] = debug.get("recompute_layers")
+            row["frame_fusion_recomputed_source_layers"] = debug.get(
+                "recomputed_source_layers"
+            )
             row["frame_fusion_num_recomputed_layers"] = debug.get("num_recomputed_layers")
             row["frame_fusion_cost_model"] = debug.get("cost_model")
             row["frame_fusion_lambda_cost"] = debug.get(
@@ -1634,6 +1649,7 @@ def main() -> int:
                 "target_keep_threshold": args.frame_fusion_target_keep_threshold,
                 "target_keep_seed": args.frame_fusion_target_keep_seed,
                 "recompute_each_global": args.frame_fusion_recompute_each_global,
+                "recompute_layers": args.frame_fusion_recompute_layers,
                 "lambda_cost": args.frame_fusion_lambda_cost,
                 "min_keep_ratio": args.frame_fusion_min_keep_ratio,
                 "temporal_window": args.frame_fusion_temporal_window,
