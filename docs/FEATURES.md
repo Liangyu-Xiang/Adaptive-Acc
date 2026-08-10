@@ -32,15 +32,18 @@ All four strictly isolate frame 0 patch tokens: they remain one-to-one
 representatives, are excluded from candidate edges, and cannot represent
 tokens from later frames. Special tokens are always preserved. The schemes
 operate only in global attention, restore the attention residual to the
-original token layout, and run the full per-token MLP afterward. M modes use
-dynamic whole-group cosine reconstruction losses, maintain the complete
-post-merge group adjacency, choose the better parent representative, and do
-not use `max_group_size`. R modes use the same absolute reconstruction-plus-
-token-cost objective to select a deletion prefix, then perform one-pass
-reassignment to the surviving representatives without allowing reassigned
-tokens to become new representatives. Every mode uses
-`D + lambda_cost * M / ((F - 1) * P)` over non-reference patch tokens,
-subject to the 5% minimum active ratio. Balanced defaults are N4/N8,
+original token layout, and run the full per-token MLP afterward. H-M retains
+the dynamic whole-group cosine reconstruction curve. U-M now evaluates all
+current local edges in GPU batches, keeps only mutual nearest-neighbor group
+pairs, and accepts a pair directly when its exact increment satisfies
+`delta_E < 2 * lambda_cost`; disjoint accepted pairs are merged in parallel.
+Both M modes choose the better parent representative and do not use
+`max_group_size`. R modes use the same absolute reconstruction-plus-token-cost
+objective to select a deletion prefix, then perform one-pass reassignment to
+the surviving representatives without allowing reassigned tokens to become
+new representatives. The U-M cost is normalized as
+`E / (2 * ((F - 1) * P))` over non-reference patch tokens, subject to the 5%
+minimum active ratio. Balanced defaults are N4/N8,
 temporal window 1, overlap threshold 0.5, minimum active ratio 0.05, and
 reassignment candidate limit 8. The evaluation scripts expose these as
 `--frame-fusion-*` options.

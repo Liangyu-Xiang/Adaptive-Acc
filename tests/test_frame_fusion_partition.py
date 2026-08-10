@@ -767,7 +767,11 @@ def test_spatiotemporal_representative_modes_protect_frame_zero(mode):
 
     assert debug["lambda_cost"] == pytest.approx(0.15)
     assert debug["cost_denominator"] == "(F - 1) * P"
-    assert debug["selection"] == "min(D_m_normalized + lambda_cost * M_m_normalized)"
+    assert debug["selection"] == (
+        "mutual_nearest_neighbor_delta_E_lt_2_lambda"
+        if mode == "u-m"
+        else "min(D_m_normalized + lambda_cost * M_m_normalized)"
+    )
     assert debug["representative_update"] == (
         "reassignment" if mode in {"h-r", "u-r"} else "best-of-parents"
     )
@@ -915,6 +919,73 @@ def test_spatiotemporal_group_error_uses_true_weighted_reconstruction_loss():
     assert debug["distortion_normalization"] == "average_cosine_distance / 2"
 
 
+def test_unified_batch_merge_accepts_disjoint_mutual_pairs_in_one_round():
+    model = Aggregator.__new__(Aggregator)
+    features = torch.tensor(
+        [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
+    )
+
+    mapping, selected_sources, debug = model._batch_mutual_nearest_group_merge(
+        features,
+        np.arange(4, dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 3], dtype=np.int64),
+        protected=np.zeros(4, dtype=bool),
+        lambda_cost=0.1,
+        cost_denominator=4.0,
+    )
+
+    assert mapping.tolist() == [0, 0, 1, 1]
+    assert selected_sources.tolist() == [0, 2]
+    assert debug["parallel_rounds"] == 1
+    assert debug["mutual_pairs_seen"] == 2
+    assert debug["accepted_merges"] == 2
+    assert debug["selected_merges"] == debug["accepted_merges"]
+    assert debug["selection"] == "mutual_nearest_neighbor_delta_E_lt_2_lambda"
+    assert debug["stopping_rule"] == "delta_E < 2 * lambda_cost"
+
+
+def test_unified_batch_merge_stops_when_delta_exceeds_lambda_threshold():
+    model = Aggregator.__new__(Aggregator)
+    features = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    mapping, selected_sources, debug = model._batch_mutual_nearest_group_merge(
+        features,
+        np.arange(2, dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([1], dtype=np.int64),
+        protected=np.zeros(2, dtype=bool),
+        lambda_cost=0.1,
+        cost_denominator=2.0,
+    )
+
+    assert mapping.tolist() == [0, 1]
+    assert selected_sources.tolist() == [0, 1]
+    assert debug["accepted_merges"] == 0
+    assert debug["parallel_rounds"] == 0
+    assert debug["stop_reason"] == "minimum_delta_threshold"
+
+
+def test_unified_batch_merge_does_not_select_filtered_edges_as_mutual_pairs():
+    model = Aggregator.__new__(Aggregator)
+    features = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+
+    mapping, selected_sources, debug = model._batch_mutual_nearest_group_merge(
+        features,
+        np.arange(2, dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([1], dtype=np.int64),
+        protected=np.asarray([True, False]),
+        lambda_cost=0.1,
+        cost_denominator=2.0,
+    )
+
+    assert mapping.tolist() == [0, 1]
+    assert selected_sources.tolist() == [0, 1]
+    assert debug["accepted_merges"] == 0
+    assert debug["stop_reason"] == "no_mergeable_edges"
+
+
 def test_unified_debug_uses_frame_count_for_attention_token_statistics():
     model = Aggregator.__new__(Aggregator)
     model.patch_token_start = 1
@@ -930,7 +1001,7 @@ def test_unified_debug_uses_frame_count_for_attention_token_statistics():
     debug = model.last_frame_fusion_debug
 
     assert debug["lambda_cost"] == pytest.approx(0.25)
-    assert debug["selection"] == "min(D_m_normalized + lambda_cost * M_m_normalized)"
+    assert debug["selection"] == "mutual_nearest_neighbor_delta_E_lt_2_lambda"
     assert debug["cost_scope"] == "non_reference_patch_tokens"
     assert debug["cost_denominator"] == "(F - 1) * P"
     assert debug["max_token_count"] == pytest.approx((3 - 1) * 1)

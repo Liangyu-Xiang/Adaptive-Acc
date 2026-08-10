@@ -2355,6 +2355,309 @@ class Aggregator(nn.Module):
         # evaluated first; the knee then selects the operating point.
         return int(np.argmax(distances[1:]) + 1)
 
+    def _batch_mutual_nearest_group_merge(
+        self,
+        normalized_features: torch.Tensor,
+        source_indices: np.ndarray,
+        edge_source: np.ndarray,
+        edge_target: np.ndarray,
+        *,
+        protected: np.ndarray,
+        initial_weights: np.ndarray | None = None,
+        max_group_size: int | None = None,
+        min_keep_ratio: float | None = None,
+        lambda_cost: float,
+        cost_denominator: float | None = None,
+        prefer_best_parent: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+        """Batch U-M merges using mutual nearest-neighbor components.
+
+        Each round evaluates the exact whole-group merge increment on every
+        current graph edge, selects ``A-best(B)``/``B-best(A)`` pairs, and
+        accepts only pairs with ``delta_E < 2 * lambda_cost``.  Mutual pairs
+        are disjoint, so all accepted pairs can be merged in one vectorized
+        component update.  The graph is maintained as a compact edge tensor;
+        no Python adjacency sets or full merge curve are materialized.
+        """
+
+        count = int(source_indices.size)
+        if count == 0:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), {}
+        if initial_weights is None:
+            initial_weights = np.ones(count, dtype=np.float64)
+        initial_weights = np.asarray(initial_weights, dtype=np.float64)
+        if initial_weights.shape != (count,):
+            raise ValueError(
+                "initial_weights must have one value per source group, "
+                f"got shape {initial_weights.shape} for {count} groups"
+            )
+        if lambda_cost < 0.0:
+            raise ValueError("lambda_cost must be non-negative")
+
+        device = normalized_features.device
+        features = normalized_features.float()
+        feature_count = int(features.shape[1])
+        group_weights = torch.as_tensor(
+            initial_weights,
+            device=device,
+            dtype=features.dtype,
+        )
+        group_sums = features * group_weights[:, None]
+        group_representatives = torch.arange(count, device=device, dtype=torch.long)
+        group_sizes = torch.ones(count, device=device, dtype=torch.long)
+        group_protected = torch.as_tensor(protected, device=device, dtype=torch.bool)
+        labels = torch.arange(count, device=device, dtype=torch.long)
+        group_errors = torch.zeros(count, device=device, dtype=features.dtype)
+
+        edge_left = torch.as_tensor(edge_source, device=device, dtype=torch.long)
+        edge_right = torch.as_tensor(edge_target, device=device, dtype=torch.long)
+
+        def canonicalize_edges(
+            left: torch.Tensor,
+            right: torch.Tensor,
+            component_count: int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            valid = left != right
+            left = left[valid]
+            right = right[valid]
+            if left.numel() == 0:
+                return left, right
+            low = torch.minimum(left, right)
+            high = torch.maximum(left, right)
+            keys = low.to(torch.int64) * int(component_count) + high.to(torch.int64)
+            keys = torch.unique(keys, sorted=True)
+            return keys // int(component_count), keys % int(component_count)
+
+        edge_left, edge_right = canonicalize_edges(edge_left, edge_right, count)
+        min_keep = 0
+        if min_keep_ratio is not None:
+            min_keep = max(
+                int(np.ceil(count * float(min_keep_ratio))),
+                int(np.count_nonzero(protected)),
+            )
+        max_token_count = max(
+            float(count if cost_denominator is None else cost_denominator),
+            1.0,
+        )
+        merge_threshold = 2.0 * float(lambda_cost)
+        accepted_merges = 0
+        mutual_pairs_seen = 0
+        parallel_rounds = 0
+        total_error = 0.0
+        stop_reason = "graph_exhausted"
+        chunk_size = 131_072
+
+        while edge_left.numel():
+            component_count = int(group_weights.numel())
+            if component_count <= min_keep:
+                stop_reason = "minimum_keep_ratio"
+                break
+
+            edge_valid = (
+                ~group_protected[edge_left]
+                & ~group_protected[edge_right]
+            )
+            if max_group_size is not None:
+                edge_valid &= (
+                    group_sizes[edge_left] + group_sizes[edge_right]
+                    <= int(max_group_size)
+                )
+            if not bool(edge_valid.any().item()):
+                stop_reason = "no_mergeable_edges"
+                break
+
+            edge_cost = torch.full(
+                (edge_left.numel(),),
+                float("inf"),
+                device=device,
+                dtype=features.dtype,
+            )
+            for start in range(0, int(edge_left.numel()), chunk_size):
+                end = min(start + chunk_size, int(edge_left.numel()))
+                left = edge_left[start:end]
+                right = edge_right[start:end]
+                merged_sum = group_sums[left] + group_sums[right]
+                merged_weight = group_weights[left] + group_weights[right]
+                left_error = merged_weight - (
+                    merged_sum * features[group_representatives[left]]
+                ).sum(dim=-1)
+                right_error = merged_weight - (
+                    merged_sum * features[group_representatives[right]]
+                ).sum(dim=-1)
+                if prefer_best_parent:
+                    merged_error = torch.minimum(left_error, right_error)
+                else:
+                    merged_error = left_error
+                edge_cost[start:end] = (
+                    merged_error
+                    - group_errors[left]
+                    - group_errors[right]
+                ).masked_fill(~edge_valid[start:end], float("inf"))
+
+            # Find one deterministic minimum-cost neighbor for every current
+            # component.  The second scatter reduction resolves equal-cost
+            # ties by the smallest neighbor id.
+            directed_group = torch.cat((edge_left, edge_right), dim=0)
+            directed_neighbor = torch.cat((edge_right, edge_left), dim=0)
+            directed_cost = torch.cat((edge_cost, edge_cost), dim=0)
+            best_cost = torch.full(
+                (component_count,),
+                float("inf"),
+                device=device,
+                dtype=features.dtype,
+            )
+            best_cost.scatter_reduce_(
+                0,
+                directed_group,
+                directed_cost,
+                reduce="amin",
+                include_self=True,
+            )
+            tie_neighbor = torch.where(
+                torch.isfinite(directed_cost)
+                & (directed_cost == best_cost[directed_group]),
+                directed_neighbor,
+                torch.full_like(directed_neighbor, component_count),
+            )
+            best_neighbor = torch.full(
+                (component_count,),
+                component_count,
+                device=device,
+                dtype=torch.long,
+            )
+            best_neighbor.scatter_reduce_(
+                0,
+                directed_group,
+                tie_neighbor,
+                reduce="amin",
+                include_self=True,
+            )
+
+            ids = torch.arange(component_count, device=device, dtype=torch.long)
+            pair_left = ids[(ids < best_neighbor) & (best_neighbor < component_count)]
+            pair_right = best_neighbor[pair_left]
+            mutual = best_neighbor[pair_right] == pair_left
+            pair_left = pair_left[mutual]
+            pair_right = pair_right[mutual]
+            mutual_pairs_seen += int(pair_left.numel())
+            if pair_left.numel() == 0:
+                stop_reason = "no_mutual_nearest_pairs"
+                break
+
+            merged_sum = group_sums[pair_left] + group_sums[pair_right]
+            merged_weight = group_weights[pair_left] + group_weights[pair_right]
+            left_error = merged_weight - (
+                merged_sum * features[group_representatives[pair_left]]
+            ).sum(dim=-1)
+            right_error = merged_weight - (
+                merged_sum * features[group_representatives[pair_right]]
+            ).sum(dim=-1)
+            choose_right = prefer_best_parent & (right_error < left_error)
+            pair_delta = (
+                torch.minimum(left_error, right_error)
+                if prefer_best_parent
+                else left_error
+            ) - group_errors[pair_left] - group_errors[pair_right]
+            acceptable = pair_delta < merge_threshold
+            if min_keep:
+                available = max(component_count - min_keep, 0)
+                if int(acceptable.sum().item()) > available:
+                    accepted_ids = torch.nonzero(acceptable, as_tuple=False).flatten()
+                    order = torch.argsort(pair_delta[accepted_ids], stable=True)
+                    acceptable[accepted_ids[order[available:]]] = False
+            pair_left = pair_left[acceptable]
+            pair_right = pair_right[acceptable]
+            pair_delta = pair_delta[acceptable]
+            choose_right = choose_right[acceptable]
+            if pair_left.numel() == 0:
+                stop_reason = "minimum_delta_threshold"
+                break
+
+            old_to_new = torch.empty_like(ids)
+            pair_member = torch.zeros(component_count, device=device, dtype=torch.bool)
+            pair_member[pair_left] = True
+            pair_member[pair_right] = True
+            leader = ~pair_member
+            leader[pair_left] = True
+            leader_ids = torch.nonzero(leader, as_tuple=False).flatten()
+            new_ids = torch.cumsum(leader.to(torch.long), dim=0) - 1
+            old_to_new.copy_(new_ids)
+            old_to_new[pair_right] = new_ids[pair_left]
+            new_count = int(leader_ids.numel())
+
+            new_weights = torch.zeros(new_count, device=device, dtype=features.dtype)
+            new_weights.index_add_(0, old_to_new, group_weights)
+            new_sums = torch.zeros(
+                (new_count, feature_count),
+                device=device,
+                dtype=features.dtype,
+            )
+            new_sums.index_add_(0, old_to_new, group_sums)
+            new_sizes = torch.zeros(new_count, device=device, dtype=torch.long)
+            new_sizes.index_add_(0, old_to_new, group_sizes)
+            new_representatives = group_representatives[leader_ids].clone()
+            chosen_representatives = torch.where(
+                choose_right,
+                group_representatives[pair_right],
+                group_representatives[pair_left],
+            )
+            new_representatives[new_ids[pair_left]] = chosen_representatives
+            new_protected = group_protected[leader_ids]
+            new_errors = new_weights - (
+                new_sums * features[new_representatives]
+            ).sum(dim=-1)
+
+            labels = old_to_new[labels]
+            edge_left = old_to_new[edge_left]
+            edge_right = old_to_new[edge_right]
+            edge_left, edge_right = canonicalize_edges(
+                edge_left,
+                edge_right,
+                new_count,
+            )
+            group_weights = new_weights
+            group_sums = new_sums
+            group_sizes = new_sizes
+            group_representatives = new_representatives
+            group_protected = new_protected
+            group_errors = new_errors
+            accepted_count = int(pair_left.numel())
+            accepted_merges += accepted_count
+            parallel_rounds += 1
+            total_error += float(pair_delta.sum().detach().cpu())
+
+        final_mapping = labels.detach().cpu().numpy()
+        final_representatives = group_representatives.detach().cpu().numpy()
+        selected_sources = source_indices[final_representatives]
+        final_active = int(group_weights.numel())
+        final_distortion = total_error / (2.0 * max(float(initial_weights.sum()), 1.0))
+        final_ratio = final_active / max_token_count
+        final_objective = final_distortion + float(lambda_cost) * final_ratio
+        debug = {
+            "initial_active_tokens": count,
+            "minimum_active_tokens": min_keep,
+            "max_group_size": max_group_size,
+            "lambda_cost": float(lambda_cost),
+            "cost_denominator": float(max_token_count),
+            "max_token_count": float(max_token_count),
+            "token_count_normalization": "active_tokens / ((F - 1) * P)",
+            "distortion_normalization": "E / (2 * M0)",
+            "accepted_merges": accepted_merges,
+            "selected_merges": accepted_merges,
+            "knee_active_tokens": final_active,
+            "knee_distortion": float(final_distortion),
+            "selected_distortion": float(final_distortion),
+            "selected_token_ratio": float(final_ratio),
+            "selected_objective": float(final_objective),
+            "selection": "mutual_nearest_neighbor_delta_E_lt_2_lambda",
+            "stopping_rule": "delta_E < 2 * lambda_cost",
+            "stop_reason": stop_reason,
+            "parallel_rounds": parallel_rounds,
+            "mutual_pairs_seen": mutual_pairs_seen,
+            "group_size_max": int(group_sizes.max().item()) if group_sizes.numel() else 0,
+        }
+        return final_mapping, selected_sources, debug
+
     def _greedy_spatiotemporal_group_merge(
         self,
         normalized_features: torch.Tensor,
@@ -3013,7 +3316,7 @@ class Aggregator(nn.Module):
                 0,
                 torch.as_tensor(search_indices, device=tokens.device, dtype=torch.long),
             )
-            search_mapping, search_sources, debug = self._greedy_spatiotemporal_group_merge(
+            search_mapping, search_sources, debug = self._batch_mutual_nearest_group_merge(
                 search_features,
                 search_indices,
                 search_edge_source,
@@ -3126,7 +3429,16 @@ class Aggregator(nn.Module):
                 else None
             ),
             "selection": (
-                "min(D_m_normalized + lambda_cost * M_m_normalized)"
+                "mutual_nearest_neighbor_delta_E_lt_2_lambda"
+                if mode == "u-m"
+                else "min(D_m_normalized + lambda_cost * M_m_normalized)"
+                if uses_lambda
+                else "geometric_knee"
+            ),
+            "stopping_rule": (
+                "delta_E < 2 * lambda_cost"
+                if mode == "u-m"
+                else "full_curve_selection"
                 if uses_lambda
                 else "geometric_knee"
             ),
