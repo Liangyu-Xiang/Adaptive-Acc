@@ -1584,14 +1584,12 @@ def main() -> int:
                 row["frame_fusion_layer_retention"] = [
                     {
                         "source_layer": layer_debug.get("source_layer"),
-                        "representative_count": (layer_debug.get("batches") or [{}])[0].get(
+                        "representative_count": (layer_batch := (layer_debug.get("batches") or [{}])[0]).get(
                             "representative_count"
                         ),
-                        "full_patch_tokens": (layer_debug.get("batches") or [{}])[0].get(
-                            "full_patch_tokens"
-                        ),
+                        "full_patch_tokens": layer_batch.get("full_patch_tokens"),
                         "patch_token_retention_percent": 100.0
-                        * float(layer_debug.get("patch_token_retention_vs_full", 0.0)),
+                        * float(layer_batch.get("patch_token_retention_vs_full", 0.0)),
                     }
                     for layer_debug in (debug.get("layers") or [])
                 ]
