@@ -1581,6 +1581,20 @@ def main() -> int:
                 )
                 row["frame_fusion_mapping_checksum"] = first_batch.get("mapping_checksum")
                 row["frame_fusion_mapping_shape"] = first_batch.get("mapping_shape")
+                row["frame_fusion_layer_retention"] = [
+                    {
+                        "source_layer": layer_debug.get("source_layer"),
+                        "representative_count": (layer_debug.get("batches") or [{}])[0].get(
+                            "representative_count"
+                        ),
+                        "full_patch_tokens": (layer_debug.get("batches") or [{}])[0].get(
+                            "full_patch_tokens"
+                        ),
+                        "patch_token_retention_percent": 100.0
+                        * float(layer_debug.get("patch_token_retention_vs_full", 0.0)),
+                    }
+                    for layer_debug in (debug.get("layers") or [])
+                ]
         fastvggt_debug = model.aggregator.last_fastvggt_debug
         row["fastvggt_actual_merge_ratio"] = fastvggt_debug.get("requested_merge_ratio")
         row["fastvggt_actual_merge_layers"] = fastvggt_debug.get("num_merge_layers")
