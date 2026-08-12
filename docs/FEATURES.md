@@ -37,14 +37,21 @@ the dynamic whole-group cosine reconstruction curve. U-M now evaluates all
 current local edges in GPU batches, keeps only mutual nearest-neighbor group
 pairs, and accepts a pair directly when its exact increment satisfies
 `delta_E < 2 * lambda_cost`; disjoint accepted pairs are merged in parallel.
+On CUDA, the edge objective is fused into one Triton kernel so the four
+indexed `[edges, channels]` intermediates are not written to device memory;
+set `VGGT_UM_TRITON=0` to use the chunked PyTorch reference implementation.
 Both M modes choose the better parent representative and do not use
 `max_group_size`. R modes use the same absolute reconstruction-plus-token-cost
 objective to select a deletion prefix, then perform one-pass reassignment to
 the surviving representatives without allowing reassigned tokens to become
 new representatives. The U-M cost is normalized as
 `E / (2 * ((F - 1) * P))` over non-reference patch tokens, subject to the 5%
-minimum active ratio. Balanced defaults are N4/N8,
-temporal window 1, overlap threshold 0.5, minimum active ratio 0.05, and
+minimum active ratio. U-M refreshes its representative plan after frame
+attention at layers 0, 10, and 17 by default; pass `none` explicitly to disable
+these refreshes. U-M's candidate cube is defined only by spatial radius `r`
+and temporal window `t`: every token uses a `(2r+1) x (2r+1)` spatial window
+over the next `t` frames. The legacy N4/N8 label does not affect U-M's cube.
+Other balanced defaults are temporal window 1, overlap threshold 0.5, minimum active ratio 0.05, and
 reassignment candidate limit 8. The evaluation scripts expose these as
 `--frame-fusion-*` options.
 

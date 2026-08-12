@@ -6,6 +6,7 @@
 
 from pathlib import Path
 import heapq
+import os
 import time
 from dataclasses import dataclass
 
@@ -25,6 +26,7 @@ from vggt_omega.models.progressive_attention import (
     progressive_config_from_dict,
     resolve_progressive_schedule,
 )
+from vggt_omega.models.um_triton import fused_um_edge_cost
 from vggt_omega.utils.reference_frame import resolve_first_frame_token_indices
 
 
@@ -169,7 +171,7 @@ class Aggregator(nn.Module):
         frame_fusion_target_keep_threshold: float = 0.0,
         frame_fusion_target_keep_seed: int = 33,
         frame_fusion_recompute_each_global: bool = False,
-        frame_fusion_recompute_layers: tuple[int, ...] | list[int] | str = (),
+        frame_fusion_recompute_layers: tuple[int, ...] | list[int] | str | None = None,
         frame_fusion_lambda_cost: float = 0.15,
         frame_fusion_merge_top_similarity_percent: float = 100.0,
         frame_fusion_layer_lambdas: tuple[float, ...] | list[float] | dict[int, float] | str | None = None,
@@ -316,6 +318,12 @@ class Aggregator(nn.Module):
         self.frame_fusion_target_keep_threshold = float(frame_fusion_target_keep_threshold)
         self.frame_fusion_target_keep_seed = int(frame_fusion_target_keep_seed)
         self.frame_fusion_recompute_each_global = bool(frame_fusion_recompute_each_global)
+        if frame_fusion_recompute_layers is None:
+            frame_fusion_recompute_layers = (
+                (0, 10, 17)
+                if str(frame_fusion_mode).replace("_", "-").lower() == "u-m"
+                else ()
+            )
         self.frame_fusion_recompute_layers = self._normalize_frame_fusion_recompute_layers(
             frame_fusion_recompute_layers
         )
@@ -345,6 +353,9 @@ class Aggregator(nn.Module):
         self._frame_fusion_global_attention_seconds = 0.0
         self._frame_fusion_attention_error_stats: dict[str, dict[str, float]] = {}
         self._frame_fusion_attention_error_comparisons = 0
+        self._frame_fusion_edge_tensor_cache: dict[
+            tuple[object, ...], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self.last_fastvggt_debug: dict[str, object] = {}
         self._fastvggt_merge_debug_layers: list[dict[str, object]] = []
         self.layer_token_swap_layer: int | None = None
@@ -810,6 +821,8 @@ class Aggregator(nn.Module):
         recompute_each_global = bool(recompute_each_global)
         if recompute_layers is not None:
             recompute_layers = self._normalize_frame_fusion_recompute_layers(recompute_layers)
+        elif mode == "u-m":
+            recompute_layers = (0, 10, 17)
         else:
             recompute_layers = getattr(self, "frame_fusion_recompute_layers", ())
         invalid_recompute_layers = [layer for layer in recompute_layers if layer >= self.depth]
@@ -1012,6 +1025,7 @@ class Aggregator(nn.Module):
         self._frame_fusion_plan_seconds = 0.0
         self._frame_fusion_global_attention_seconds = 0.0
         self._frame_fusion_attention_error_comparisons = 0
+        self._frame_fusion_edge_tensor_cache.clear()
         self.last_fastvggt_debug.clear()
         self._fastvggt_merge_debug_layers.clear()
 
@@ -2439,6 +2453,22 @@ class Aggregator(nn.Module):
             for delta_col in range(-spatial_radius, spatial_radius + 1)
         )
 
+    @staticmethod
+    def _spatiotemporal_cube_undirected_spatial_offsets(
+        spatial_radius: int = 1,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return one half of a square spatial window for undirected edges."""
+
+        spatial_radius = int(spatial_radius)
+        if spatial_radius <= 0:
+            raise ValueError("spatial_radius must be positive")
+        return tuple(
+            (delta_row, delta_col)
+            for delta_row in range(-spatial_radius, spatial_radius + 1)
+            for delta_col in range(-spatial_radius, spatial_radius + 1)
+            if (delta_row > 0 or (delta_row == 0 and delta_col > 0))
+        )
+
     def _build_local_spatiotemporal_edges(
         self,
         num_frames: int,
@@ -2446,6 +2476,7 @@ class Aggregator(nn.Module):
         *,
         include_temporal_spatial: bool,
         exclude_frame_zero: bool = False,
+        use_spatiotemporal_cube: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Build local candidate edges without an N-by-N distance matrix.
 
@@ -2455,55 +2486,170 @@ class Aggregator(nn.Module):
         ``include_temporal_spatial=False`` path.
         """
 
+        source, target = self._build_local_spatiotemporal_edge_tensors(
+            num_frames,
+            patch_count,
+            include_temporal_spatial=include_temporal_spatial,
+            exclude_frame_zero=exclude_frame_zero,
+            use_spatiotemporal_cube=use_spatiotemporal_cube,
+            device=torch.device("cpu"),
+            use_cache=False,
+        )
+        return source.numpy(), target.numpy()
+
+    def _build_local_spatiotemporal_edge_tensors(
+        self,
+        num_frames: int,
+        patch_count: int,
+        *,
+        include_temporal_spatial: bool,
+        exclude_frame_zero: bool = False,
+        use_spatiotemporal_cube: bool = False,
+        device: torch.device,
+        use_cache: bool = True,
+        index_offset: int = 0,
+        canonical_order: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build and optionally cache the immutable local topology on-device.
+
+        The topology depends only on the sequence/grid configuration, not on
+        token values or the source layer.  Each spatial offset is expanded as
+        one tensor operation instead of appending one Python integer per edge.
+        """
+
+        device = torch.device(device)
         height, width = getattr(self, "_frame_fusion_patch_grid_size", (1, patch_count))
         if height * width != patch_count:
             height, width = 1, patch_count
-        offsets = self._spatiotemporal_neighbor_offsets(
-            getattr(self, "frame_fusion_spatial_neighborhood", "N8"),
-            int(getattr(self, "frame_fusion_spatial_radius", 1)),
-        )
         spatial_radius = int(getattr(self, "frame_fusion_spatial_radius", 1))
         neighborhood = str(
             getattr(self, "frame_fusion_spatial_neighborhood", "N8")
         ).upper()
-        temporal_offsets = (
-            self._spatiotemporal_cube_spatial_offsets(spatial_radius)
-            if neighborhood == "N4"
-            else offsets
-            if include_temporal_spatial
-            else ((0, 0),)
-        )
         temporal_window = int(getattr(self, "frame_fusion_temporal_window", 1))
-        source: list[int] = []
-        target: list[int] = []
-        for frame in range(num_frames):
-            if exclude_frame_zero and frame == 0:
-                continue
-            for row in range(height):
-                for col in range(width):
-                    position = row * width + col
-                    current = frame * patch_count + position
-                    for dr, dc in offsets:
-                        nr, nc = row + dr, col + dc
-                        if nr < 0 or nr >= height or nc < 0 or nc >= width:
-                            continue
-                        source.append(current)
-                        target.append(frame * patch_count + nr * width + nc)
-                    for delta in range(1, temporal_window + 1):
-                        if frame + delta < num_frames:
-                            for dr, dc in temporal_offsets:
-                                nr, nc = row + dr, col + dc
-                                if 0 <= nr < height and 0 <= nc < width:
-                                    source.append(current)
-                                    target.append(
-                                        (frame + delta) * patch_count
-                                        + nr * width
-                                        + nc
-                                    )
-        return (
-            np.asarray(source, dtype=np.int64),
-            np.asarray(target, dtype=np.int64),
+        cache_key = (
+            int(num_frames),
+            int(patch_count),
+            int(height),
+            int(width),
+            neighborhood,
+            spatial_radius,
+            temporal_window,
+            bool(include_temporal_spatial),
+            bool(exclude_frame_zero),
+            bool(use_spatiotemporal_cube),
+            int(index_offset),
+            bool(canonical_order),
+            device.type,
+            device.index,
         )
+        cache = getattr(self, "_frame_fusion_edge_tensor_cache", None)
+        if use_cache and cache is not None and cache_key in cache:
+            return cache[cache_key]
+
+        if use_spatiotemporal_cube:
+            # U-M's cube is controlled solely by spatial_radius and
+            # temporal_window. Legacy N4/N8 neighborhood labels must not
+            # alter this topology.
+            offsets = self._spatiotemporal_cube_undirected_spatial_offsets(
+                spatial_radius
+            )
+            temporal_offsets = self._spatiotemporal_cube_spatial_offsets(
+                spatial_radius
+            )
+        else:
+            offsets = self._spatiotemporal_neighbor_offsets(
+                neighborhood,
+                spatial_radius,
+            )
+            temporal_offsets = (
+                self._spatiotemporal_cube_spatial_offsets(spatial_radius)
+                if neighborhood == "N4"
+                else offsets
+                if include_temporal_spatial
+                else ((0, 0),)
+            )
+        first_frame = 1 if exclude_frame_zero else 0
+        # (first frame, exclusive last frame, temporal delta, dr, dc)
+        edge_specs: list[tuple[int, int, int, int, int]] = []
+        for dr, dc in offsets:
+            edge_specs.append((first_frame, num_frames, 0, dr, dc))
+        for delta in range(1, temporal_window + 1):
+            if first_frame < num_frames - delta:
+                for dr, dc in temporal_offsets:
+                    edge_specs.append(
+                        (first_frame, num_frames - delta, delta, dr, dc)
+                    )
+
+        spec_sizes: list[int] = []
+        for frame_begin, frame_end, _, dr, dc in edge_specs:
+            valid_rows = max(height - abs(dr), 0)
+            valid_cols = max(width - abs(dc), 0)
+            spec_sizes.append(
+                max(frame_end - frame_begin, 0) * valid_rows * valid_cols
+            )
+        edge_count = sum(spec_sizes)
+        source = torch.empty(edge_count, device=device, dtype=torch.long)
+        target = torch.empty(edge_count, device=device, dtype=torch.long)
+        position_grid = torch.arange(
+            patch_count,
+            device=device,
+            dtype=torch.long,
+        ).view(height, width)
+        write_offset = 0
+        for spec, spec_size in zip(edge_specs, spec_sizes):
+            if spec_size == 0:
+                continue
+            frame_begin, frame_end, delta, dr, dc = spec
+            row_begin = max(-dr, 0)
+            row_end = min(height - dr, height)
+            col_begin = max(-dc, 0)
+            col_end = min(width - dc, width)
+            source_positions = position_grid[
+                row_begin:row_end,
+                col_begin:col_end,
+            ].reshape(-1)
+            target_positions = position_grid[
+                row_begin + dr : row_end + dr,
+                col_begin + dc : col_end + dc,
+            ].reshape(-1)
+            frames = torch.arange(
+                frame_begin,
+                frame_end,
+                device=device,
+                dtype=torch.long,
+            )
+            end_offset = write_offset + spec_size
+            source[write_offset:end_offset] = (
+                frames[:, None] * patch_count
+                + source_positions[None, :]
+                - int(index_offset)
+            ).reshape(-1)
+            target[write_offset:end_offset] = (
+                (frames[:, None] + delta) * patch_count
+                + target_positions[None, :]
+                - int(index_offset)
+            ).reshape(-1)
+            write_offset = end_offset
+        if write_offset != edge_count:
+            raise RuntimeError(
+                f"spatiotemporal edge construction wrote {write_offset} of {edge_count} edges"
+            )
+        if canonical_order and edge_count:
+            # Match canonicalize_edges' lexicographic order once when the
+            # immutable topology is created.  The cached tensor then avoids
+            # repeating the much more expensive unique/sort at every plan.
+            local_count = num_frames * patch_count - int(index_offset)
+            keys = source.to(torch.int64) * int(local_count) + target.to(torch.int64)
+            order = torch.argsort(keys, stable=True)
+            source = source[order]
+            target = target[order]
+        if use_cache and cache is not None:
+            # A model processes one spatial/temporal layout at a time.  Keep
+            # only the current topology so changing resolution cannot retain
+            # several hundred MiB of stale CUDA edge tensors.
+            cache.clear()
+            cache[cache_key] = (source, target)
+        return source, target
 
     @staticmethod
     def _spatiotemporal_knee_index(
@@ -2545,8 +2691,8 @@ class Aggregator(nn.Module):
         self,
         normalized_features: torch.Tensor,
         source_indices: np.ndarray,
-        edge_source: np.ndarray,
-        edge_target: np.ndarray,
+        edge_source: np.ndarray | torch.Tensor,
+        edge_target: np.ndarray | torch.Tensor,
         *,
         protected: np.ndarray,
         initial_weights: np.ndarray | None = None,
@@ -2556,6 +2702,7 @@ class Aggregator(nn.Module):
         cost_denominator: float | None = None,
         prefer_best_parent: bool = True,
         merge_top_similarity_percent: float = 100.0,
+        initial_edges_are_unique: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
         """Batch U-M merges using mutual nearest-neighbor components.
 
@@ -2605,6 +2752,28 @@ class Aggregator(nn.Module):
         edge_left = torch.as_tensor(edge_source, device=device, dtype=torch.long)
         edge_right = torch.as_tensor(edge_target, device=device, dtype=torch.long)
 
+        profile_cuda = (
+            device.type == "cuda"
+            and os.environ.get("VGGT_UM_PLANNER_PROFILE", "0") == "1"
+        )
+        profile_events: dict[
+            str, list[tuple[torch.cuda.Event, torch.cuda.Event]]
+        ] = {}
+
+        def profile_start() -> torch.cuda.Event | None:
+            if not profile_cuda:
+                return None
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            return event
+
+        def profile_end(name: str, start: torch.cuda.Event | None) -> None:
+            if start is None:
+                return
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            profile_events.setdefault(name, []).append((start, end))
+
         def canonicalize_edges(
             left: torch.Tensor,
             right: torch.Tensor,
@@ -2621,7 +2790,10 @@ class Aggregator(nn.Module):
             keys = torch.unique(keys, sorted=True)
             return keys // int(component_count), keys % int(component_count)
 
-        edge_left, edge_right = canonicalize_edges(edge_left, edge_right, count)
+        profile_event = profile_start()
+        if not initial_edges_are_unique:
+            edge_left, edge_right = canonicalize_edges(edge_left, edge_right, count)
+        profile_end("initial_canonicalize", profile_event)
         min_keep = 0
         if min_keep_ratio is not None:
             min_keep = max(
@@ -2648,9 +2820,10 @@ class Aggregator(nn.Module):
         # history.
         stable_group_ids = np.arange(count, dtype=np.int64)
         next_stable_group_id = count
-        total_error = 0.0
+        total_error = torch.zeros((), device=device, dtype=features.dtype)
         stop_reason = "graph_exhausted"
         chunk_size = 131_072
+        edge_score_backend = "pytorch"
 
         while edge_left.numel():
             component_count = int(group_weights.numel())
@@ -2667,41 +2840,54 @@ class Aggregator(nn.Module):
                     group_sizes[edge_left] + group_sizes[edge_right]
                     <= int(max_group_size)
                 )
-            if not bool(edge_valid.any().item()):
-                stop_reason = "no_mergeable_edges"
-                break
-
-            edge_cost = torch.full(
-                (edge_left.numel(),),
-                float("inf"),
-                device=device,
-                dtype=features.dtype,
+            profile_event = profile_start()
+            edge_cost = fused_um_edge_cost(
+                group_sums,
+                group_weights,
+                group_representatives,
+                group_errors,
+                features,
+                edge_left,
+                edge_right,
+                edge_valid,
+                prefer_best_parent=prefer_best_parent,
             )
-            for start in range(0, int(edge_left.numel()), chunk_size):
-                end = min(start + chunk_size, int(edge_left.numel()))
-                left = edge_left[start:end]
-                right = edge_right[start:end]
-                merged_sum = group_sums[left] + group_sums[right]
-                merged_weight = group_weights[left] + group_weights[right]
-                left_error = merged_weight - (
-                    merged_sum * features[group_representatives[left]]
-                ).sum(dim=-1)
-                right_error = merged_weight - (
-                    merged_sum * features[group_representatives[right]]
-                ).sum(dim=-1)
-                if prefer_best_parent:
-                    merged_error = torch.minimum(left_error, right_error)
-                else:
-                    merged_error = left_error
-                edge_cost[start:end] = (
-                    merged_error
-                    - group_errors[left]
-                    - group_errors[right]
-                ).masked_fill(~edge_valid[start:end], float("inf"))
+            if edge_cost is None:
+                edge_cost = torch.full(
+                    (edge_left.numel(),),
+                    float("inf"),
+                    device=device,
+                    dtype=features.dtype,
+                )
+                for start in range(0, int(edge_left.numel()), chunk_size):
+                    end = min(start + chunk_size, int(edge_left.numel()))
+                    left = edge_left[start:end]
+                    right = edge_right[start:end]
+                    merged_sum = group_sums[left] + group_sums[right]
+                    merged_weight = group_weights[left] + group_weights[right]
+                    left_error = merged_weight - (
+                        merged_sum * features[group_representatives[left]]
+                    ).sum(dim=-1)
+                    right_error = merged_weight - (
+                        merged_sum * features[group_representatives[right]]
+                    ).sum(dim=-1)
+                    if prefer_best_parent:
+                        merged_error = torch.minimum(left_error, right_error)
+                    else:
+                        merged_error = left_error
+                    edge_cost[start:end] = (
+                        merged_error
+                        - group_errors[left]
+                        - group_errors[right]
+                    ).masked_fill(~edge_valid[start:end], float("inf"))
+            else:
+                edge_score_backend = "triton_fused"
+            profile_end("edge_score", profile_event)
 
             # Find one deterministic minimum-cost neighbor for every current
             # component.  The second scatter reduction resolves equal-cost
             # ties by the smallest neighbor id.
+            profile_event = profile_start()
             directed_group = torch.cat((edge_left, edge_right), dim=0)
             directed_neighbor = torch.cat((edge_right, edge_left), dim=0)
             directed_cost = torch.cat((edge_cost, edge_cost), dim=0)
@@ -2737,7 +2923,9 @@ class Aggregator(nn.Module):
                 reduce="amin",
                 include_self=True,
             )
+            profile_end("best_neighbor", profile_event)
 
+            profile_event = profile_start()
             ids = torch.arange(component_count, device=device, dtype=torch.long)
             pair_left = ids[(ids < best_neighbor) & (best_neighbor < component_count)]
             pair_right = best_neighbor[pair_left]
@@ -2746,37 +2934,47 @@ class Aggregator(nn.Module):
             pair_right = pair_right[mutual]
             mutual_pairs_seen += int(pair_left.numel())
             if pair_left.numel() == 0:
-                stop_reason = "no_mutual_nearest_pairs"
+                # Preserve the diagnostic distinction without synchronizing
+                # edge_valid on every successful round.
+                stop_reason = (
+                    "no_mergeable_edges"
+                    if not bool(edge_valid.any().item())
+                    else "no_mutual_nearest_pairs"
+                )
+                profile_end("mutual_and_filter", profile_event)
                 break
 
             # Limit each parallel round to the most similar mutual pairs.
             # Similarity is measured between the current parent
             # representatives, and stable sorting makes ties deterministic.
-            pair_similarity = (
-                features[group_representatives[pair_left]]
-                * features[group_representatives[pair_right]]
-            ).sum(dim=-1)
-            similarity_pairs_seen += int(pair_similarity.numel())
-            keep_count = max(
-                1,
-                int(
-                    np.ceil(
-                        pair_similarity.numel()
-                        * merge_top_similarity_percent
-                        / 100.0
-                    )
-                ),
-            )
-            similarity_keep = torch.ones_like(pair_similarity, dtype=torch.bool)
-            if keep_count < pair_similarity.numel():
+            pair_count = int(pair_left.numel())
+            similarity_pairs_seen += pair_count
+            similarity_keep: torch.Tensor | None = None
+            keep_count = pair_count
+            if merge_top_similarity_percent < 100.0:
+                pair_similarity = (
+                    features[group_representatives[pair_left]]
+                    * features[group_representatives[pair_right]]
+                ).sum(dim=-1)
+                keep_count = max(
+                    1,
+                    int(
+                        np.ceil(
+                            pair_count
+                            * merge_top_similarity_percent
+                            / 100.0
+                        )
+                    ),
+                )
                 similarity_order = torch.argsort(
                     pair_similarity,
                     descending=True,
                     stable=True,
                 )
+                similarity_keep = torch.ones_like(pair_similarity, dtype=torch.bool)
                 similarity_keep[similarity_order[keep_count:]] = False
-            similarity_pairs_kept += int(similarity_keep.sum().item())
-            similarity_pairs_filtered += int((~similarity_keep).sum().item())
+            similarity_pairs_kept += keep_count
+            similarity_pairs_filtered += pair_count - keep_count
 
             merged_sum = group_sums[pair_left] + group_sums[pair_right]
             merged_weight = group_weights[pair_left] + group_weights[pair_right]
@@ -2792,20 +2990,28 @@ class Aggregator(nn.Module):
                 if prefer_best_parent
                 else left_error
             ) - group_errors[pair_left] - group_errors[pair_right]
-            acceptable = (pair_delta < merge_threshold) & similarity_keep
+            acceptable = pair_delta < merge_threshold
+            if similarity_keep is not None:
+                acceptable &= similarity_keep
             if min_keep:
                 available = max(component_count - min_keep, 0)
-                if int(acceptable.sum().item()) > available:
+                # Mutual pairs are disjoint.  In the common case their total
+                # count already fits above the floor, avoiding a GPU scalar
+                # synchronization merely to count the acceptable subset.
+                if pair_count > available:
                     accepted_ids = torch.nonzero(acceptable, as_tuple=False).flatten()
-                    order = torch.argsort(pair_delta[accepted_ids], stable=True)
-                    acceptable[accepted_ids[order[available:]]] = False
+                    if int(accepted_ids.numel()) > available:
+                        order = torch.argsort(pair_delta[accepted_ids], stable=True)
+                        acceptable[accepted_ids[order[available:]]] = False
             pair_left = pair_left[acceptable]
             pair_right = pair_right[acceptable]
             pair_delta = pair_delta[acceptable]
             choose_right = choose_right[acceptable]
             if pair_left.numel() == 0:
                 stop_reason = "minimum_delta_threshold"
+                profile_end("mutual_and_filter", profile_event)
                 break
+            profile_end("mutual_and_filter", profile_event)
 
             trace_pair_data: list[tuple[int, int, int, int, int, int, float, float, float, int]] = []
             if trace_merges is not None:
@@ -2838,6 +3044,7 @@ class Aggregator(nn.Module):
                         )
                     )
 
+            profile_event = profile_start()
             old_to_new = torch.empty_like(ids)
             pair_member = torch.zeros(component_count, device=device, dtype=torch.bool)
             pair_member[pair_left] = True
@@ -2871,6 +3078,7 @@ class Aggregator(nn.Module):
             new_errors = new_weights - (
                 new_sums * features[new_representatives]
             ).sum(dim=-1)
+            profile_end("group_update", profile_event)
 
             if trace_merges is not None:
                 leader_ids_cpu = leader_ids.detach().cpu().numpy()
@@ -2898,6 +3106,7 @@ class Aggregator(nn.Module):
                     )
                 stable_group_ids = new_stable_ids
 
+            profile_event = profile_start()
             labels = old_to_new[labels]
             edge_left = old_to_new[edge_left]
             edge_right = old_to_new[edge_right]
@@ -2906,6 +3115,7 @@ class Aggregator(nn.Module):
                 edge_right,
                 new_count,
             )
+            profile_end("graph_rebuild", profile_event)
             group_weights = new_weights
             group_sums = new_sums
             group_sizes = new_sizes
@@ -2915,13 +3125,16 @@ class Aggregator(nn.Module):
             accepted_count = int(pair_left.numel())
             accepted_merges += accepted_count
             parallel_rounds += 1
-            total_error += float(pair_delta.sum().detach().cpu())
+            total_error += pair_delta.sum()
 
         final_mapping = labels.detach().cpu().numpy()
         final_representatives = group_representatives.detach().cpu().numpy()
         selected_sources = source_indices[final_representatives]
         final_active = int(group_weights.numel())
-        final_distortion = total_error / (2.0 * max(float(initial_weights.sum()), 1.0))
+        total_error_value = float(total_error.detach().cpu())
+        final_distortion = total_error_value / (
+            2.0 * max(float(initial_weights.sum()), 1.0)
+        )
         final_ratio = final_active / max_token_count
         final_objective = final_distortion + float(lambda_cost) * final_ratio
         debug = {
@@ -2949,8 +3162,18 @@ class Aggregator(nn.Module):
             "similarity_pairs_seen": similarity_pairs_seen,
             "similarity_pairs_kept": similarity_pairs_kept,
             "similarity_pairs_filtered": similarity_pairs_filtered,
+            "edge_score_backend": edge_score_backend,
             "group_size_max": int(group_sizes.max().item()) if group_sizes.numel() else 0,
         }
+        if profile_cuda and profile_events:
+            last_end = list(profile_events.values())[-1][-1][1]
+            last_end.synchronize()
+            profile_ms = {
+                name: float(sum(start.elapsed_time(end) for start, end in pairs))
+                for name, pairs in profile_events.items()
+            }
+            profile_ms["total_profiled"] = float(sum(profile_ms.values()))
+            debug["planner_cuda_profile_ms"] = profile_ms
         if trace_merges is not None:
             debug["merge_trace"] = trace_merges
         return final_mapping, selected_sources, debug
@@ -3611,21 +3834,23 @@ class Aggregator(nn.Module):
                 "selected_objective": float(reallocation_objective),
             }
         else:
-            edge_source, edge_target = self._build_local_spatiotemporal_edges(
+            edge_source, edge_target = self._build_local_spatiotemporal_edge_tensors(
                 num_frames,
                 patch_count,
                 include_temporal_spatial=False,
                 exclude_frame_zero=True,
+                use_spatiotemporal_cube=True,
+                device=tokens.device,
+                index_offset=patch_count,
+                canonical_order=True,
             )
-            search_indices = np.flatnonzero(~protected).astype(np.int64)
-            local_index = np.full(total, -1, dtype=np.int64)
-            local_index[search_indices] = np.arange(search_indices.size, dtype=np.int64)
-            search_edge_source = local_index[edge_source]
-            search_edge_target = local_index[edge_target]
-            search_features = normalized.index_select(
-                0,
-                torch.as_tensor(search_indices, device=tokens.device, dtype=torch.long),
-            )
+            # Frame zero is a contiguous protected prefix.  Removing it from
+            # global edge ids is therefore an on-device scalar subtraction;
+            # no NumPy lookup table or host-to-device edge copy is needed.
+            search_indices = np.arange(patch_count, total, dtype=np.int64)
+            search_edge_source = edge_source
+            search_edge_target = edge_target
+            search_features = normalized[patch_count:]
             search_mapping, search_sources, debug = self._batch_mutual_nearest_group_merge(
                 search_features,
                 search_indices,
@@ -3640,6 +3865,7 @@ class Aggregator(nn.Module):
                 merge_top_similarity_percent=float(
                     getattr(self, "frame_fusion_merge_top_similarity_percent", 100.0)
                 ),
+                initial_edges_are_unique=True,
             )
             final_mapping = np.empty(total, dtype=np.int64)
             final_mapping[:patch_count] = np.arange(patch_count, dtype=np.int64)
@@ -3730,7 +3956,16 @@ class Aggregator(nn.Module):
                 if not is_reallocation
                 else "local_spatiotemporal_normalized_reallocation_distortion_plus_lambda"
             ),
-            "spatial_neighborhood": getattr(self, "frame_fusion_spatial_neighborhood", "N8"),
+            "candidate_topology": (
+                "spatiotemporal_cube_by_radius_and_window"
+                if mode == "u-m"
+                else "legacy_spatial_neighborhood"
+            ),
+            "spatial_neighborhood": (
+                None
+                if mode == "u-m"
+                else getattr(self, "frame_fusion_spatial_neighborhood", "N8")
+            ),
             "temporal_window": getattr(self, "frame_fusion_temporal_window", 1),
             "time_overlap": getattr(self, "frame_fusion_time_overlap", 0.5),
             "minimum_keep_ratio": (

@@ -87,7 +87,7 @@ class VGGTOmega(nn.Module):
         frame_fusion_target_keep_threshold: float = 0.0,
         frame_fusion_target_keep_seed: int = 33,
         frame_fusion_recompute_each_global: bool = False,
-        frame_fusion_recompute_layers: tuple[int, ...] | list[int] | str = (),
+        frame_fusion_recompute_layers: tuple[int, ...] | list[int] | str | None = None,
         frame_fusion_lambda_cost: float = 0.15,
         frame_fusion_merge_top_similarity_percent: float = 100.0,
         frame_fusion_layer_lambdas: tuple[float, ...] | list[float] | dict[int, float] | str | None = None,

@@ -271,10 +271,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--frame-fusion-recompute-layers",
-        default="",
+        default=None,
         help=(
             "Comma-separated global layer indices at which to rebuild the U-M/H-M "
-            "representative plan after frame attention, e.g. '0,9,16'."
+            "representative plan after frame attention. U-M defaults to '0,10,17'; "
+            "pass 'none' to disable refreshes."
         ),
     )
     parser.add_argument(
@@ -296,7 +297,7 @@ def parse_args() -> argparse.Namespace:
         "--frame-fusion-layer-lambdas",
         default="",
         help=(
-            "Optional per-recompute-layer U-M lambdas, as '0:0.1,9:0.1,16:0.1' "
+            "Optional per-recompute-layer U-M lambdas, as '0:0.1,10:0.1,17:0.1' "
             "or three comma-separated values in recompute-layer order."
         ),
     )
@@ -878,7 +879,7 @@ def load_model(
     frame_fusion_target_keep_threshold: float = 0.0,
     frame_fusion_target_keep_seed: int = 33,
     frame_fusion_recompute_each_global: bool = False,
-    frame_fusion_recompute_layers: str = "",
+    frame_fusion_recompute_layers: str | None = None,
     frame_fusion_lambda_cost: float = 0.15,
     frame_fusion_merge_top_similarity_percent: float = 100.0,
     frame_fusion_layer_lambdas: str = "",
@@ -1115,6 +1116,10 @@ def depth_sums(
 
 def main() -> int:
     args = parse_args()
+    if args.frame_fusion_recompute_layers is None:
+        args.frame_fusion_recompute_layers = (
+            "0,10,17" if args.frame_fusion_mode == "u-m" else ""
+        )
     if args.num_frames < 2:
         raise ValueError("--num-frames must be at least 2")
     resolved_reference_frame_index = resolve_reference_frame_index(
@@ -1588,6 +1593,12 @@ def main() -> int:
             row["frame_fusion_group_size_min"] = first_batch.get("group_size_min")
             row["frame_fusion_group_size_max"] = first_batch.get("group_size_max")
             row["frame_fusion_group_size_mean"] = first_batch.get("group_size_mean")
+            row["frame_fusion_planner_cuda_profile_ms"] = first_batch.get(
+                "planner_cuda_profile_ms"
+            )
+            row["frame_fusion_edge_score_backend"] = first_batch.get(
+                "edge_score_backend"
+            )
             row["frame_fusion_group_partition"] = first_batch.get("group_partition")
             row["frame_fusion_full_partition"] = first_batch.get("full_partition")
             row["frame_fusion_full_partition_groups"] = first_batch.get("full_partition_groups")
@@ -1739,7 +1750,16 @@ def main() -> int:
                 "min_keep_ratio": args.frame_fusion_min_keep_ratio,
                 "temporal_window": args.frame_fusion_temporal_window,
                 "spatial_radius": args.frame_fusion_spatial_radius,
-                "spatial_neighborhood": args.frame_fusion_spatial_neighborhood,
+                "candidate_topology": (
+                    "spatiotemporal_cube_by_radius_and_window"
+                    if args.frame_fusion_mode == "u-m"
+                    else "legacy_spatial_neighborhood"
+                ),
+                "spatial_neighborhood": (
+                    None
+                    if args.frame_fusion_mode == "u-m"
+                    else args.frame_fusion_spatial_neighborhood
+                ),
                 "time_overlap": args.frame_fusion_time_overlap,
                 "reassignment_candidates": args.frame_fusion_reassignment_candidates,
                 "representative_update": args.frame_fusion_representative_update,

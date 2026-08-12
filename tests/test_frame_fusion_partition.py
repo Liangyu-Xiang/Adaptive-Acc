@@ -16,6 +16,7 @@ from vggt_omega.models.aggregator import (
     _connected_frame_fusion_groups,
     _sequential_frame_fusion_groups,
 )
+from vggt_omega.models.um_triton import fused_um_edge_cost
 
 
 def test_frame_fusion_partition_finds_low_cost_contiguous_groups():
@@ -160,6 +161,113 @@ def test_n4_spacetime_cube_supports_five_by_five_space_and_four_frame_time_radiu
     }
     assert center_to_next == set(range(25))
     assert corner_to_next == {0, 1, 2, 5, 6, 7, 10, 11, 12}
+
+
+def test_tensorized_spacetime_cube_matches_numpy_api_and_reuses_cache():
+    aggregator = Aggregator.__new__(Aggregator)
+    aggregator._frame_fusion_patch_grid_size = (3, 4)
+    aggregator.frame_fusion_spatial_neighborhood = "N4"
+    aggregator.frame_fusion_spatial_radius = 1
+    aggregator.frame_fusion_temporal_window = 2
+    aggregator._frame_fusion_edge_tensor_cache = {}
+
+    tensor_source, tensor_target = (
+        aggregator._build_local_spatiotemporal_edge_tensors(
+            num_frames=4,
+            patch_count=12,
+            include_temporal_spatial=False,
+            exclude_frame_zero=True,
+            device=torch.device("cpu"),
+        )
+    )
+    cached_source, cached_target = (
+        aggregator._build_local_spatiotemporal_edge_tensors(
+            num_frames=4,
+            patch_count=12,
+            include_temporal_spatial=False,
+            exclude_frame_zero=True,
+            device=torch.device("cpu"),
+        )
+    )
+    numpy_source, numpy_target = aggregator._build_local_spatiotemporal_edges(
+        num_frames=4,
+        patch_count=12,
+        include_temporal_spatial=False,
+        exclude_frame_zero=True,
+    )
+    local_source, local_target = aggregator._build_local_spatiotemporal_edge_tensors(
+        num_frames=4,
+        patch_count=12,
+        include_temporal_spatial=False,
+        exclude_frame_zero=True,
+        device=torch.device("cpu"),
+        use_cache=False,
+        index_offset=12,
+    )
+
+    assert cached_source.data_ptr() == tensor_source.data_ptr()
+    assert cached_target.data_ptr() == tensor_target.data_ptr()
+    assert np.array_equal(tensor_source.numpy(), numpy_source)
+    assert np.array_equal(tensor_target.numpy(), numpy_target)
+    assert torch.equal(local_source, tensor_source - 12)
+    assert torch.equal(local_target, tensor_target - 12)
+    assert len(aggregator._frame_fusion_edge_tensor_cache) == 1
+
+
+def test_tensorized_spacetime_cube_canonical_order_matches_unique_keys():
+    aggregator = Aggregator.__new__(Aggregator)
+    aggregator._frame_fusion_patch_grid_size = (3, 4)
+    aggregator.frame_fusion_spatial_neighborhood = "N4"
+    aggregator.frame_fusion_spatial_radius = 1
+    aggregator.frame_fusion_temporal_window = 2
+    aggregator._frame_fusion_edge_tensor_cache = {}
+
+    source, target = aggregator._build_local_spatiotemporal_edge_tensors(
+        num_frames=4,
+        patch_count=12,
+        include_temporal_spatial=False,
+        exclude_frame_zero=True,
+        device=torch.device("cpu"),
+        index_offset=12,
+        canonical_order=True,
+    )
+    keys = source * 36 + target
+
+    assert torch.equal(keys, torch.unique(keys, sorted=True))
+
+
+def test_um_cube_depends_only_on_radius_and_temporal_window():
+    aggregator = Aggregator.__new__(Aggregator)
+    aggregator._frame_fusion_patch_grid_size = (5, 5)
+    aggregator.frame_fusion_spatial_radius = 2
+    aggregator.frame_fusion_temporal_window = 4
+    aggregator._frame_fusion_edge_tensor_cache = {}
+
+    topologies = []
+    for neighborhood in ("N4", "N8", "N8-R2"):
+        aggregator.frame_fusion_spatial_neighborhood = neighborhood
+        source, target = aggregator._build_local_spatiotemporal_edge_tensors(
+            num_frames=5,
+            patch_count=25,
+            include_temporal_spatial=False,
+            use_spatiotemporal_cube=True,
+            device=torch.device("cpu"),
+            use_cache=False,
+        )
+        topologies.append(torch.stack((source, target), dim=1))
+
+    assert torch.equal(topologies[0], topologies[1])
+    assert torch.equal(topologies[1], topologies[2])
+    center_to_four_future_frames = {
+        (int(right) // 25, int(right) % 25)
+        for left, right in topologies[0].tolist()
+        if left == 12 and right // 25 > 0
+    }
+    assert center_to_four_future_frames == {
+        (frame, position)
+        for frame in range(1, 5)
+        for position in range(25)
+    }
 
 
 def test_select_frame_fusion_pairs_uses_nearest_neighbor_deduplicated_pairs():
@@ -1027,6 +1135,90 @@ def test_unified_batch_merge_accepts_disjoint_mutual_pairs_in_one_round():
     assert debug["selected_merges"] == debug["accepted_merges"]
     assert debug["selection"] == "mutual_nearest_neighbor_delta_E_lt_2_lambda"
     assert debug["stopping_rule"] == "delta_E < 2 * lambda_cost"
+
+
+def test_fused_um_edge_cost_falls_back_on_cpu():
+    features = torch.eye(2, dtype=torch.float32)
+    result = fused_um_edge_cost(
+        features,
+        torch.ones(2),
+        torch.arange(2),
+        torch.zeros(2),
+        features,
+        torch.tensor([0]),
+        torch.tensor([1]),
+        torch.tensor([True]),
+        prefer_best_parent=True,
+    )
+
+    assert result is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_um_edge_cost_matches_pytorch_reference_on_cuda(monkeypatch):
+    monkeypatch.setenv("VGGT_UM_TRITON", "1")
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    group_count = 37
+    feature_dim = 1024
+    edge_count = 257
+    features = torch.nn.functional.normalize(
+        torch.randn(
+            group_count,
+            feature_dim,
+            generator=generator,
+            device="cuda",
+        ),
+        dim=-1,
+    )
+    group_weights = torch.rand(
+        group_count,
+        generator=generator,
+        device="cuda",
+    ) * 4.0 + 1.0
+    group_sums = features * group_weights[:, None]
+    group_representatives = torch.arange(group_count, device="cuda")
+    group_errors = group_weights - (group_sums * features).sum(dim=-1)
+    edge_left = torch.randint(
+        group_count,
+        (edge_count,),
+        generator=generator,
+        device="cuda",
+    )
+    edge_right = torch.randint(
+        group_count,
+        (edge_count,),
+        generator=generator,
+        device="cuda",
+    )
+    edge_valid = edge_left != edge_right
+
+    actual = fused_um_edge_cost(
+        group_sums,
+        group_weights,
+        group_representatives,
+        group_errors,
+        features,
+        edge_left,
+        edge_right,
+        edge_valid,
+        prefer_best_parent=True,
+    )
+    assert actual is not None
+    merged_sum = group_sums[edge_left] + group_sums[edge_right]
+    merged_weight = group_weights[edge_left] + group_weights[edge_right]
+    left_error = merged_weight - (
+        merged_sum * features[group_representatives[edge_left]]
+    ).sum(dim=-1)
+    right_error = merged_weight - (
+        merged_sum * features[group_representatives[edge_right]]
+    ).sum(dim=-1)
+    expected = (
+        torch.minimum(left_error, right_error)
+        - group_errors[edge_left]
+        - group_errors[edge_right]
+    ).masked_fill(~edge_valid, float("inf"))
+
+    assert torch.allclose(actual, expected, atol=2e-6, rtol=1e-6)
 
 
 def test_unified_batch_merge_keeps_only_top_similarity_pairs_per_round():
