@@ -329,6 +329,85 @@ class SelfAttention(nn.Module):
         x_flat = self.proj(x_flat)
         return uncat_with_shapes(x_flat, shapes, num_tokens)
 
+    def project_qkv(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Project one token sequence into attention-ready Q, K, and V tensors."""
+
+        return self._prepare_qkv(self.qkv(x))
+
+    def _prepare_qkv(self, qkv: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        batch_size, token_count, _ = qkv.shape
+        embed_dim = self.qkv.in_features
+        qkv = qkv.reshape(
+            batch_size,
+            token_count,
+            3,
+            self.num_heads,
+            embed_dim // self.num_heads,
+        )
+        q, k, v = torch.unbind(qkv, 2)
+        q, k, v = [tensor.transpose(1, 2) for tensor in (q, k, v)]
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        return q, k, v
+
+    def attention_from_qkv(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        attn_bias=None,
+    ) -> Tensor:
+        """Run SDPA for possibly different query and key/value lengths."""
+
+        attended = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_bias,
+        )
+        return attended.transpose(1, 2).reshape(
+            q.shape[0],
+            q.shape[2],
+            self.qkv.in_features,
+        )
+
+    def attention_from_qkv_with_log_key_weights(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        log_key_weights: Tensor,
+    ) -> Tensor:
+        """Run attention with a log multiplicity correction on compressed keys.
+
+        A representative key can stand for multiple original tokens. Adding
+        ``log(group_size)`` to its attention logit approximates the sum of the
+        corresponding dense-token probabilities. This explicit-logit path is
+        separate because its additive correction cannot use FlashAttention.
+        """
+
+        # The explicit bias prevents FlashAttention. Keep the fallback
+        # memory-bounded by chunking queries; a full [Q, K] logits tensor is
+        # prohibitively large for 300-frame sequences.
+        key_log_weights = log_key_weights.to(device=q.device, dtype=torch.float32)
+        key_transposed = k.float().transpose(-2, -1)
+        value_float = v.float()
+        query_chunk_size = 256
+        attended_chunks = []
+        for query_start in range(0, q.shape[2], query_chunk_size):
+            query_chunk = q[:, :, query_start : query_start + query_chunk_size].float()
+            logits = torch.matmul(query_chunk, key_transposed) * self.scale
+            logits = logits + key_log_weights
+            probabilities = logits.softmax(dim=-1)
+            attended_chunks.append(torch.matmul(probabilities, value_float))
+        attended = torch.cat(attended_chunks, dim=2).to(dtype=v.dtype)
+        return attended.transpose(1, 2).reshape(
+            q.shape[0],
+            q.shape[2],
+            self.qkv.in_features,
+        )
+
     def compute_attention(
         self,
         qkv: Tensor,
@@ -610,7 +689,7 @@ class SelfAttention(nn.Module):
                 r=r,
                 no_rand=False,
                 generator=generator,
-                enable_protection=True,
+                enable_protection=getattr(self, "fastvggt_protect_tokens", True),
                 num_special_tokens=num_special_tokens,
                 merge_eligible_mask=getattr(self, "merge_eligible_mask", None),
             )

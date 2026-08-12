@@ -264,9 +264,9 @@ def parse_args() -> argparse.Namespace:
         "--frame-fusion-recompute-each-global",
         action="store_true",
         help=(
-            "For pair-top-percent fusion, recompute frame pairs and target kept "
-            "patches after every frame-attention block, immediately before each "
-            "global inter-frame attention block."
+            "Recompute the frame-fusion plan after every frame-attention block "
+            "immediately before each global inter-frame attention block. "
+            "Supported by pair-top-percent and U-M/H-M/U-R/H-R representative fusion."
         ),
     )
     parser.add_argument(
@@ -274,7 +274,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Comma-separated global layer indices at which to rebuild the U-M/H-M "
-            "representative plan after frame attention, e.g. '0,10,17'."
+            "representative plan after frame attention, e.g. '0,9,16'."
         ),
     )
     parser.add_argument(
@@ -283,8 +283,26 @@ def parse_args() -> argparse.Namespace:
         default=0.15,
         help="Lambda for adaptive temporal representative objective D_tilde + lambda*q.",
     )
+    parser.add_argument(
+        "--frame-fusion-merge-top-similarity-percent",
+        type=float,
+        default=100.0,
+        help=(
+            "Per-round percentage of mutual-nearest merge pairs retained by "
+            "representative-token cosine similarity."
+        ),
+    )
+    parser.add_argument(
+        "--frame-fusion-layer-lambdas",
+        default="",
+        help=(
+            "Optional per-recompute-layer U-M lambdas, as '0:0.1,9:0.1,16:0.1' "
+            "or three comma-separated values in recompute-layer order."
+        ),
+    )
     parser.add_argument("--frame-fusion-min-keep-ratio", type=float, default=0.05)
     parser.add_argument("--frame-fusion-temporal-window", type=int, default=1)
+    parser.add_argument("--frame-fusion-spatial-radius", type=int, default=1)
     parser.add_argument(
         "--frame-fusion-spatial-neighborhood",
         choices=("N4", "N8", "N8-R2"),
@@ -296,6 +314,17 @@ def parse_args() -> argparse.Namespace:
         "--frame-fusion-representative-update",
         choices=("parent", "exact-medoid"),
         default="parent",
+    )
+    parser.add_argument(
+        "--frame-fusion-attention-variant",
+        choices=("representative", "representative-log", "kv-only", "replicated"),
+        default="representative",
+        help=(
+            "U-M attention variant. 'representative-log' restores log group-size "
+            "weights; 'kv-only' keeps all queries and compresses "
+            "only keys/values; 'replicated' copies representatives to a full "
+            "length sequence; default preserves the base path."
+        ),
     )
     parser.add_argument(
         "--sampling-pool",
@@ -311,6 +340,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.9,
         help="Global-attention token merge ratio in [0, 1].",
+    )
+    parser.add_argument(
+        "--fastvggt-disable-protection",
+        action="store_true",
+        help="Disable FastVGGT's default deterministic 10%% protected-token subset.",
     )
     parser.add_argument("--sparse-attention", action="store_true", help="Use block-sparse inter-frame global attention.")
     parser.add_argument(
@@ -846,12 +880,16 @@ def load_model(
     frame_fusion_recompute_each_global: bool = False,
     frame_fusion_recompute_layers: str = "",
     frame_fusion_lambda_cost: float = 0.15,
+    frame_fusion_merge_top_similarity_percent: float = 100.0,
+    frame_fusion_layer_lambdas: str = "",
     frame_fusion_min_keep_ratio: float = 0.05,
     frame_fusion_temporal_window: int = 1,
+    frame_fusion_spatial_radius: int = 1,
     frame_fusion_spatial_neighborhood: str = "N8",
     frame_fusion_time_overlap: float = 0.5,
     frame_fusion_reassignment_candidates: int = 8,
     frame_fusion_representative_update: str = "parent",
+    frame_fusion_attention_variant: str = "representative",
     sparse_attention: bool = False,
     sparse_ratio: float | None = None,
     sparse_cdf_threshold: float | None = None,
@@ -889,11 +927,13 @@ def load_model(
     adaptive_anchor_random_seed: int = 33,
     adaptive_anchor_debug: bool = False,
     adaptive_anchor_debug_dir: Path = Path("outputs/debug_register_mediated_anchor"),
+    fastvggt_protect_tokens: bool = True,
 ) -> VGGTOmega:
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
     model_kwargs = {
         "merge_ratio": merge_ratio,
+        "fastvggt_protect_tokens": fastvggt_protect_tokens,
         "first_frame_token_indices": first_frame_token_indices,
         "frame_fusion_mode": frame_fusion_mode,
         "frame_fusion_k": frame_fusion_k,
@@ -911,12 +951,16 @@ def load_model(
         "frame_fusion_recompute_each_global": frame_fusion_recompute_each_global,
         "frame_fusion_recompute_layers": frame_fusion_recompute_layers,
         "frame_fusion_lambda_cost": frame_fusion_lambda_cost,
+        "frame_fusion_merge_top_similarity_percent": frame_fusion_merge_top_similarity_percent,
+        "frame_fusion_layer_lambdas": frame_fusion_layer_lambdas,
         "frame_fusion_min_keep_ratio": frame_fusion_min_keep_ratio,
         "frame_fusion_temporal_window": frame_fusion_temporal_window,
+        "frame_fusion_spatial_radius": frame_fusion_spatial_radius,
         "frame_fusion_spatial_neighborhood": frame_fusion_spatial_neighborhood,
         "frame_fusion_time_overlap": frame_fusion_time_overlap,
         "frame_fusion_reassignment_candidates": frame_fusion_reassignment_candidates,
         "frame_fusion_representative_update": frame_fusion_representative_update,
+        "frame_fusion_attention_variant": frame_fusion_attention_variant,
         "sparse_attention": sparse_attention,
         "sparse_ratio": sparse_ratio,
         "sparse_cdf_threshold": sparse_cdf_threshold,
@@ -1093,10 +1137,16 @@ def main() -> int:
         raise ValueError("--merge-ratio must be in [0, 1]")
     if args.frame_fusion_lambda_cost < 0.0:
         raise ValueError("--frame-fusion-lambda-cost must be non-negative")
+    if not 0.0 < args.frame_fusion_merge_top_similarity_percent <= 100.0:
+        raise ValueError(
+            "--frame-fusion-merge-top-similarity-percent must be in (0, 100]"
+        )
     if not 0.0 < args.frame_fusion_min_keep_ratio <= 1.0:
         raise ValueError("--frame-fusion-min-keep-ratio must be in (0, 1]")
     if args.frame_fusion_temporal_window <= 0:
         raise ValueError("--frame-fusion-temporal-window must be positive")
+    if args.frame_fusion_spatial_radius <= 0:
+        raise ValueError("--frame-fusion-spatial-radius must be positive")
     if not 0.0 <= args.frame_fusion_time_overlap <= 1.0:
         raise ValueError("--frame-fusion-time-overlap must be in [0, 1]")
     if args.frame_fusion_reassignment_candidates <= 0:
@@ -1144,8 +1194,17 @@ def main() -> int:
             raise ValueError("--frame-fusion-target-keep-threshold must be in [-1, 1]")
         if not -1.0 <= args.frame_fusion_group_similarity_threshold <= 1.0:
             raise ValueError("--frame-fusion-group-similarity-threshold must be in [-1, 1]")
-    if args.frame_fusion_recompute_each_global and args.frame_fusion_mode != "pair-top-percent":
-        raise ValueError("--frame-fusion-recompute-each-global requires --frame-fusion-mode pair-top-percent")
+    if args.frame_fusion_recompute_each_global and args.frame_fusion_mode not in {
+        "pair-top-percent",
+        "h-m",
+        "h-r",
+        "u-m",
+        "u-r",
+    }:
+        raise ValueError(
+            "--frame-fusion-recompute-each-global requires pair-top-percent or "
+            "a spatiotemporal representative mode"
+        )
     if args.frame_fusion_mode != "none":
         temporal_modes = {
             "temporal-representative",
@@ -1293,12 +1352,16 @@ def main() -> int:
         frame_fusion_recompute_each_global=args.frame_fusion_recompute_each_global,
         frame_fusion_recompute_layers=args.frame_fusion_recompute_layers,
         frame_fusion_lambda_cost=args.frame_fusion_lambda_cost,
+        frame_fusion_merge_top_similarity_percent=args.frame_fusion_merge_top_similarity_percent,
+        frame_fusion_layer_lambdas=args.frame_fusion_layer_lambdas,
         frame_fusion_min_keep_ratio=args.frame_fusion_min_keep_ratio,
         frame_fusion_temporal_window=args.frame_fusion_temporal_window,
+        frame_fusion_spatial_radius=args.frame_fusion_spatial_radius,
         frame_fusion_spatial_neighborhood=args.frame_fusion_spatial_neighborhood,
         frame_fusion_time_overlap=args.frame_fusion_time_overlap,
         frame_fusion_reassignment_candidates=args.frame_fusion_reassignment_candidates,
         frame_fusion_representative_update=args.frame_fusion_representative_update,
+        frame_fusion_attention_variant=args.frame_fusion_attention_variant,
         sparse_attention=args.sparse_attention,
         sparse_ratio=args.sparse_ratio,
         sparse_cdf_threshold=args.sparse_cdf_threshold,
@@ -1336,6 +1399,7 @@ def main() -> int:
         adaptive_anchor_random_seed=args.adaptive_anchor_random_seed,
         adaptive_anchor_debug=args.adaptive_anchor_debug,
         adaptive_anchor_debug_dir=args.adaptive_anchor_debug_dir,
+        fastvggt_protect_tokens=not args.fastvggt_disable_protection,
     )
     if args.attention_mode == "register-only-zero-shot":
         model.aggregator.inter_frame_attention_types = ["register"] * model.aggregator.depth
@@ -1502,6 +1566,12 @@ def main() -> int:
             row["frame_fusion_global_attention_seconds"] = debug.get(
                 "global_attention_seconds"
             )
+            row["frame_fusion_attention_variant"] = debug.get(
+                "attention_variant", args.frame_fusion_attention_variant
+            )
+            row["frame_fusion_attention_error_by_token_type"] = debug.get(
+                "attention_error_by_token_type"
+            )
             batches = debug.get("batches") or []
             first_batch = batches[0] if batches else {}
             row["frame_fusion_selected_pairs"] = debug.get(
@@ -1646,6 +1716,7 @@ def main() -> int:
             "resize_mode": args.resize_mode,
             "image_resolution": args.image_resolution,
             "merge_ratio": args.merge_ratio,
+            "fastvggt_protect_tokens": not args.fastvggt_disable_protection,
             "frame_fusion": {
                 "mode": args.frame_fusion_mode,
                 "k": args.frame_fusion_k,
@@ -1663,12 +1734,16 @@ def main() -> int:
                 "recompute_each_global": args.frame_fusion_recompute_each_global,
                 "recompute_layers": args.frame_fusion_recompute_layers,
                 "lambda_cost": args.frame_fusion_lambda_cost,
+                "merge_top_similarity_percent": args.frame_fusion_merge_top_similarity_percent,
+                "layer_lambdas": args.frame_fusion_layer_lambdas,
                 "min_keep_ratio": args.frame_fusion_min_keep_ratio,
                 "temporal_window": args.frame_fusion_temporal_window,
+                "spatial_radius": args.frame_fusion_spatial_radius,
                 "spatial_neighborhood": args.frame_fusion_spatial_neighborhood,
                 "time_overlap": args.frame_fusion_time_overlap,
                 "reassignment_candidates": args.frame_fusion_reassignment_candidates,
                 "representative_update": args.frame_fusion_representative_update,
+                "attention_variant": args.frame_fusion_attention_variant,
             },
             "sparse_attention": args.sparse_attention,
             "sparse_ratio": args.sparse_ratio,

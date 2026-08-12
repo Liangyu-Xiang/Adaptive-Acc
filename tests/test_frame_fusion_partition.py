@@ -78,6 +78,90 @@ def test_pooled_frame_representations_use_size_two_average_pooling():
     assert torch.allclose(representations, torch.tensor([[[4.0], [5.0]]]))
 
 
+def test_n4_spacetime_cube_edges_cover_all_cross_frame_positions_once():
+    aggregator = Aggregator.__new__(Aggregator)
+    aggregator._frame_fusion_patch_grid_size = (3, 3)
+    aggregator.frame_fusion_spatial_neighborhood = "N4"
+    aggregator.frame_fusion_temporal_window = 2
+
+    source, target = aggregator._build_local_spatiotemporal_edges(
+        num_frames=3,
+        patch_count=9,
+        include_temporal_spatial=False,
+    )
+
+    edges = list(zip(source.tolist(), target.tolist()))
+    undirected = {(min(left, right), max(left, right)) for left, right in edges}
+    assert len(edges) == len(undirected)
+
+    same_frame = [
+        (left, right)
+        for left, right in edges
+        if left // 9 == right // 9
+    ]
+    cross_frame = [
+        (left, right)
+        for left, right in edges
+        if left // 9 != right // 9
+    ]
+    # A 3x3 frame has 20 undirected edges in the four-direction half of an
+    # 8-neighborhood.  The temporal cube contributes 49 valid edges for each
+    # frame pair and each positive time delta.  With three frames and a
+    # two-frame window, that gives three frame-pair/delta combinations.
+    assert len(same_frame) == 3 * 20
+    assert len(cross_frame) == 3 * 49
+
+    center_to_next = {
+        right % 9
+        for left, right in edges
+        if left == 4 and right // 9 == 1
+    }
+    center_to_two_ahead = {
+        right % 9
+        for left, right in edges
+        if left == 4 and right // 9 == 2
+    }
+    assert center_to_next == set(range(9))
+    assert center_to_two_ahead == set(range(9))
+
+    corner_to_next = {
+        right % 9
+        for left, right in edges
+        if left == 0 and right // 9 == 1
+    }
+    assert corner_to_next == {0, 1, 3, 4}
+
+
+def test_n4_spacetime_cube_supports_five_by_five_space_and_four_frame_time_radius():
+    aggregator = Aggregator.__new__(Aggregator)
+    aggregator._frame_fusion_patch_grid_size = (5, 5)
+    aggregator.frame_fusion_spatial_neighborhood = "N4"
+    aggregator.frame_fusion_spatial_radius = 2
+    aggregator.frame_fusion_temporal_window = 4
+
+    source, target = aggregator._build_local_spatiotemporal_edges(
+        num_frames=2,
+        patch_count=25,
+        include_temporal_spatial=False,
+    )
+    edges = list(zip(source.tolist(), target.tolist()))
+    undirected = {(min(left, right), max(left, right)) for left, right in edges}
+    assert len(edges) == len(undirected)
+
+    center_to_next = {
+        right % 25
+        for left, right in edges
+        if left == 12 and right // 25 == 1
+    }
+    corner_to_next = {
+        right % 25
+        for left, right in edges
+        if left == 0 and right // 25 == 1
+    }
+    assert center_to_next == set(range(25))
+    assert corner_to_next == {0, 1, 2, 5, 6, 7, 10, 11, 12}
+
+
 def test_select_frame_fusion_pairs_uses_nearest_neighbor_deduplicated_pairs():
     similarity = torch.tensor(
         [
@@ -945,6 +1029,34 @@ def test_unified_batch_merge_accepts_disjoint_mutual_pairs_in_one_round():
     assert debug["stopping_rule"] == "delta_E < 2 * lambda_cost"
 
 
+def test_unified_batch_merge_keeps_only_top_similarity_pairs_per_round():
+    model = Aggregator.__new__(Aggregator)
+    angles = torch.tensor([0.0, 0.2, 0.4, 0.6, 1.4], dtype=torch.float32)
+    pair_features = torch.stack((angles.cos(), angles.sin()), dim=1)
+    features = pair_features.repeat_interleave(2, dim=0)
+    pair_starts = np.arange(0, 10, 2, dtype=np.int64)
+
+    mapping, selected_sources, debug = model._batch_mutual_nearest_group_merge(
+        features,
+        np.arange(10, dtype=np.int64),
+        pair_starts,
+        pair_starts + 1,
+        protected=np.zeros(10, dtype=bool),
+        min_keep_ratio=0.6,
+        lambda_cost=2.0,
+        cost_denominator=10.0,
+        merge_top_similarity_percent=80.0,
+    )
+
+    assert mapping[:8].reshape(4, 2).tolist() == [[0, 0], [1, 1], [2, 2], [3, 3]]
+    assert mapping[8:].tolist() == [4, 5]
+    assert selected_sources.tolist() == [0, 2, 4, 6, 8, 9]
+    assert debug["merge_top_similarity_percent"] == pytest.approx(80.0)
+    assert debug["similarity_pairs_seen"] == 5
+    assert debug["similarity_pairs_kept"] == 4
+    assert debug["similarity_pairs_filtered"] == 1
+
+
 def test_unified_batch_merge_stops_when_delta_exceeds_lambda_threshold():
     model = Aggregator.__new__(Aggregator)
     features = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
@@ -1009,5 +1121,29 @@ def test_unified_debug_uses_frame_count_for_attention_token_statistics():
         "active_non_reference_tokens / ((F - 1) * P)"
     )
     assert debug["representative_update"] == "best-of-parents"
+    assert debug["representative_value_aggregation"] == "group-mean"
     for batch_debug, plan in zip(debug["batches"], plans):
         assert batch_debug["attention_tokens"] == 3 + plan.representative_source_indices.numel()
+
+
+def test_unified_mean_representatives_average_every_token_in_final_group():
+    patch_tokens = torch.tensor(
+        [
+            [1.0, 0.0],
+            [3.0, 2.0],
+            [-1.0, 4.0],
+            [5.0, 0.0],
+        ]
+    )
+    mapping = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+
+    representatives = Aggregator._mean_group_representatives(
+        patch_tokens,
+        mapping,
+        representative_count=2,
+    )
+
+    assert torch.allclose(
+        representatives,
+        torch.tensor([[2.0, 1.0], [2.0, 2.0]]),
+    )

@@ -111,6 +111,7 @@ class Aggregator(nn.Module):
         merging: int | None = 0,
         merge_ratio: float = 0.9,
         merge_random_seed: int = 33,
+        fastvggt_protect_tokens: bool = True,
         first_frame_token_indices: tuple[int, ...] | list[int] | str = (0,),
         register_patch_inter_frame_mode: str = "none",
         register_patch_inter_frame_percent: float = 0.0,
@@ -170,12 +171,16 @@ class Aggregator(nn.Module):
         frame_fusion_recompute_each_global: bool = False,
         frame_fusion_recompute_layers: tuple[int, ...] | list[int] | str = (),
         frame_fusion_lambda_cost: float = 0.15,
+        frame_fusion_merge_top_similarity_percent: float = 100.0,
+        frame_fusion_layer_lambdas: tuple[float, ...] | list[float] | dict[int, float] | str | None = None,
         frame_fusion_min_keep_ratio: float = 0.05,
         frame_fusion_temporal_window: int = 1,
+        frame_fusion_spatial_radius: int = 1,
         frame_fusion_spatial_neighborhood: str = "N8",
         frame_fusion_time_overlap: float = 0.5,
         frame_fusion_reassignment_candidates: int = 8,
         frame_fusion_representative_update: str = "parent",
+        frame_fusion_attention_variant: str = "representative",
     ) -> None:
         super().__init__()
 
@@ -239,6 +244,9 @@ class Aggregator(nn.Module):
         self.merging = merging
         self.merge_ratio = merge_ratio
         self.merge_random_seed = merge_random_seed
+        self.fastvggt_protect_tokens = bool(fastvggt_protect_tokens)
+        for block in (*self.frame_blocks, *self.inter_frame_blocks):
+            block.attn.fastvggt_protect_tokens = self.fastvggt_protect_tokens
         self.first_frame_token_indices = first_frame_token_indices
         self.register_patch_inter_frame_mode = "none"
         self.register_patch_inter_frame_percent = 0.0
@@ -313,14 +321,30 @@ class Aggregator(nn.Module):
         )
         self.frame_fusion_min_keep_ratio = float(frame_fusion_min_keep_ratio)
         self.frame_fusion_temporal_window = int(frame_fusion_temporal_window)
+        self.frame_fusion_spatial_radius = int(frame_fusion_spatial_radius)
         self.frame_fusion_spatial_neighborhood = str(frame_fusion_spatial_neighborhood).upper()
         self.frame_fusion_time_overlap = float(frame_fusion_time_overlap)
         self.frame_fusion_reassignment_candidates = int(frame_fusion_reassignment_candidates)
         self.frame_fusion_representative_update = str(frame_fusion_representative_update)
+        frame_fusion_attention_variant = str(frame_fusion_attention_variant).replace("_", "-").lower()
+        if frame_fusion_attention_variant not in {
+            "representative",
+            "representative-log",
+            "kv-only",
+            "replicated",
+        }:
+            raise ValueError(
+                "frame_fusion_attention_variant must be representative, representative-log, "
+                "kv-only, or replicated, "
+                f"got {frame_fusion_attention_variant!r}"
+            )
+        self.frame_fusion_attention_variant = frame_fusion_attention_variant
         self.last_frame_fusion_debug: dict[str, object] = {}
         self._frame_fusion_debug_layers: list[dict[str, object]] = []
         self._frame_fusion_plan_seconds = 0.0
         self._frame_fusion_global_attention_seconds = 0.0
+        self._frame_fusion_attention_error_stats: dict[str, dict[str, float]] = {}
+        self._frame_fusion_attention_error_comparisons = 0
         self.last_fastvggt_debug: dict[str, object] = {}
         self._fastvggt_merge_debug_layers: list[dict[str, object]] = []
         self.layer_token_swap_layer: int | None = None
@@ -395,6 +419,9 @@ class Aggregator(nn.Module):
             recompute_each_global=frame_fusion_recompute_each_global,
             recompute_layers=frame_fusion_recompute_layers,
             lambda_cost=frame_fusion_lambda_cost,
+            merge_top_similarity_percent=frame_fusion_merge_top_similarity_percent,
+            layer_lambdas=frame_fusion_layer_lambdas,
+            spatial_radius=frame_fusion_spatial_radius,
         )
 
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
@@ -439,6 +466,66 @@ class Aggregator(nn.Module):
                 f"got {invalid}"
             )
         return result
+
+    @staticmethod
+    def _normalize_frame_fusion_layer_lambdas(
+        layer_lambdas: tuple[float, ...] | list[float] | dict[int, float] | str | None,
+        recompute_layers: tuple[int, ...],
+    ) -> dict[int, float]:
+        """Normalize optional per-recompute-layer lambda overrides."""
+
+        if layer_lambdas is None:
+            return {}
+        if isinstance(layer_lambdas, dict):
+            values = {int(layer): float(value) for layer, value in layer_lambdas.items()}
+        elif isinstance(layer_lambdas, str):
+            text = layer_lambdas.strip()
+            if not text or text.lower() == "none":
+                return {}
+            parts = [part.strip() for part in text.split(",") if part.strip()]
+            if any(":" in part for part in parts):
+                values = {}
+                for part in parts:
+                    layer_text, value_text = part.split(":", 1)
+                    values[int(layer_text.strip())] = float(value_text.strip())
+            else:
+                if len(parts) != len(recompute_layers):
+                    raise ValueError(
+                        "frame_fusion_layer_lambdas without layer prefixes must provide "
+                        f"one value for each recompute layer {recompute_layers}, got {parts}"
+                    )
+                values = {
+                    int(layer): float(value)
+                    for layer, value in zip(recompute_layers, parts)
+                }
+        else:
+            if len(layer_lambdas) != len(recompute_layers):
+                raise ValueError(
+                    "frame_fusion_layer_lambdas must provide one value for each "
+                    f"recompute layer {recompute_layers}, got {layer_lambdas}"
+                )
+            values = {
+                int(layer): float(value)
+                for layer, value in zip(recompute_layers, layer_lambdas)
+            }
+        invalid = [layer for layer in values if layer < 0]
+        if invalid:
+            raise ValueError(f"frame_fusion_layer_lambdas has invalid layers {invalid}")
+        negative = {layer: value for layer, value in values.items() if value < 0.0}
+        if negative:
+            raise ValueError(
+                "frame_fusion_layer_lambdas must be non-negative, "
+                f"got {negative}"
+            )
+        return values
+
+    def _frame_fusion_lambda_for_layer(self, source_layer: int) -> float:
+        return float(
+            getattr(self, "frame_fusion_lambda_cost_by_layer", {}).get(
+                int(source_layer),
+                getattr(self, "frame_fusion_lambda_cost", 0.15),
+            )
+        )
 
     @staticmethod
     def _select_reallocation_prefix(
@@ -649,6 +736,9 @@ class Aggregator(nn.Module):
         recompute_each_global: bool = False,
         recompute_layers: tuple[int, ...] | list[int] | str | None = None,
         lambda_cost: float = 0.15,
+        merge_top_similarity_percent: float = 100.0,
+        layer_lambdas: tuple[float, ...] | list[float] | dict[int, float] | str | None = None,
+        spatial_radius: int = 1,
     ) -> None:
         mode = mode.replace("_", "-")
         valid_modes = {
@@ -731,6 +821,12 @@ class Aggregator(nn.Module):
         lambda_cost = float(lambda_cost)
         if lambda_cost < 0.0:
             raise ValueError(f"frame_fusion_lambda_cost must be non-negative, got {lambda_cost}")
+        merge_top_similarity_percent = float(merge_top_similarity_percent)
+        if not 0.0 < merge_top_similarity_percent <= 100.0:
+            raise ValueError(
+                "frame_fusion_merge_top_similarity_percent must be in (0, 100], "
+                f"got {merge_top_similarity_percent}"
+            )
         min_keep_ratio = float(getattr(self, "frame_fusion_min_keep_ratio", 0.05))
         if not 0.0 < min_keep_ratio <= 1.0:
             raise ValueError(
@@ -739,6 +835,9 @@ class Aggregator(nn.Module):
         temporal_window = int(getattr(self, "frame_fusion_temporal_window", 1))
         if temporal_window <= 0:
             raise ValueError("frame_fusion_temporal_window must be positive")
+        spatial_radius = int(spatial_radius)
+        if spatial_radius <= 0:
+            raise ValueError("frame_fusion_spatial_radius must be positive")
         spatial_neighborhood = str(
             getattr(self, "frame_fusion_spatial_neighborhood", "N8")
         ).upper()
@@ -834,7 +933,7 @@ class Aggregator(nn.Module):
                 )
             if recompute_each_global:
                 raise ValueError(
-                    "per-global recomputation is only supported for pair-top-percent frame fusion"
+                    "per-global recomputation is not supported for temporal-only representative fusion"
                 )
             if recompute_layers:
                 raise ValueError("layer-specific recomputation is only supported for spatiotemporal representative fusion")
@@ -873,10 +972,6 @@ class Aggregator(nn.Module):
                 raise ValueError("frame fusion and inter-frame-only attention are mutually exclusive")
             if self.use_adaptive_kv_anchor and self.adaptive_anchor_layers:
                 raise ValueError("frame fusion and adaptive K/V anchors are mutually exclusive")
-            if recompute_each_global:
-                raise ValueError(
-                    "per-global recomputation is only supported for pair-top-percent frame fusion"
-                )
             if recompute_layers and start_layer != -1:
                 raise ValueError("layer-specific recomputation requires frame_fusion_start_layer=-1")
         else:
@@ -900,8 +995,14 @@ class Aggregator(nn.Module):
         self.frame_fusion_recompute_each_global = recompute_each_global
         self.frame_fusion_recompute_layers = tuple(recompute_layers)
         self.frame_fusion_lambda_cost = lambda_cost
+        self.frame_fusion_merge_top_similarity_percent = merge_top_similarity_percent
+        self.frame_fusion_lambda_cost_by_layer = self._normalize_frame_fusion_layer_lambdas(
+            layer_lambdas,
+            self.frame_fusion_recompute_layers,
+        )
         self.frame_fusion_min_keep_ratio = min_keep_ratio
         self.frame_fusion_temporal_window = temporal_window
+        self.frame_fusion_spatial_radius = spatial_radius
         self.frame_fusion_spatial_neighborhood = spatial_neighborhood
         self.frame_fusion_time_overlap = time_overlap
         self.frame_fusion_reassignment_candidates = reassignment_candidates
@@ -910,6 +1011,7 @@ class Aggregator(nn.Module):
         self._frame_fusion_debug_layers.clear()
         self._frame_fusion_plan_seconds = 0.0
         self._frame_fusion_global_attention_seconds = 0.0
+        self._frame_fusion_attention_error_comparisons = 0
         self.last_fastvggt_debug.clear()
         self._fastvggt_merge_debug_layers.clear()
 
@@ -1361,6 +1463,7 @@ class Aggregator(nn.Module):
         self.last_adaptive_pair_scope_debug.clear()
         self.last_frame_fusion_debug.clear()
         self._frame_fusion_debug_layers.clear()
+        self._frame_fusion_attention_error_stats.clear()
         self.last_fastvggt_debug.clear()
         self._fastvggt_merge_debug_layers.clear()
 
@@ -1385,6 +1488,10 @@ class Aggregator(nn.Module):
         recompute_spatiotemporal_layers = (
             self.frame_fusion_mode in {"h-m", "h-r", "u-m", "u-r"}
             and bool(self.frame_fusion_recompute_layers)
+        )
+        recompute_spatiotemporal_each_global = (
+            self.frame_fusion_mode in {"h-m", "h-r", "u-m", "u-r"}
+            and self.frame_fusion_recompute_each_global
         )
         if self.frame_fusion_mode == "dp-medoid" and self.frame_fusion_start_layer == -1:
             tokens, frame_fusion_restore_index = self._apply_frame_fusion(tokens, source_layer=-1)
@@ -1434,6 +1541,7 @@ class Aggregator(nn.Module):
             self.frame_fusion_mode in {"h-m", "h-r", "u-m", "u-r"}
             and self.frame_fusion_start_layer == -1
             and not recompute_spatiotemporal_layers
+            and not recompute_spatiotemporal_each_global
         ):
             spatiotemporal_representative_plans = (
                 self._build_spatiotemporal_representative_plans(
@@ -1540,6 +1648,17 @@ class Aggregator(nn.Module):
                     )
                 )
                 current_spatiotemporal_plans = spatiotemporal_representative_plans
+            elif (
+                recompute_spatiotemporal_each_global
+                and self.inter_frame_attention_types[block_idx] == "global"
+            ):
+                spatiotemporal_representative_plans = (
+                    self._build_spatiotemporal_representative_plans(
+                        frame_tokens,
+                        source_layer=block_idx,
+                    )
+                )
+                current_spatiotemporal_plans = spatiotemporal_representative_plans
             tokens = self._run_inter_frame_attention_block(
                 tokens,
                 batch_size,
@@ -1608,6 +1727,7 @@ class Aggregator(nn.Module):
             "enabled": bool(
                 self._merge_is_enabled(self.global_merging, self.merging, self.merge_ratio)
             ),
+            "protect_tokens": bool(self.fastvggt_protect_tokens),
             "requested_merge_ratio": float(self.merge_ratio),
             "merge_start_layer": int(self.merging) if self.merging is not None else None,
             "full_attention_tokens_per_layer": int(batch_size * original_num_frames * num_tokens),
@@ -1620,6 +1740,7 @@ class Aggregator(nn.Module):
             "layers": merge_layers,
         }
         if self.last_frame_fusion_debug:
+            self.last_frame_fusion_debug["attention_variant"] = self.frame_fusion_attention_variant
             self.last_frame_fusion_debug["planning_seconds"] = float(
                 self._frame_fusion_plan_seconds
             )
@@ -1638,6 +1759,25 @@ class Aggregator(nn.Module):
                     self._frame_fusion_debug_layers
                 )
                 self.last_frame_fusion_debug["layers"] = self._frame_fusion_debug_layers
+            if self.frame_fusion_recompute_each_global and self.frame_fusion_mode in {
+                "h-m",
+                "h-r",
+                "u-m",
+                "u-r",
+            }:
+                self.last_frame_fusion_debug["recompute_each_global"] = True
+                self.last_frame_fusion_debug["recomputed_source_layers"] = [
+                    int(layer["source_layer"])
+                    for layer in self._frame_fusion_debug_layers
+                ]
+                self.last_frame_fusion_debug["num_recomputed_layers"] = len(
+                    self._frame_fusion_debug_layers
+                )
+                self.last_frame_fusion_debug["layers"] = self._frame_fusion_debug_layers
+            if self._frame_fusion_attention_error_stats:
+                self.last_frame_fusion_debug["attention_error_by_token_type"] = (
+                    self._finalize_attention_error_stats()
+                )
         return outputs, self.patch_token_start
 
     def _apply_layer_token_swap(
@@ -2259,14 +2399,45 @@ class Aggregator(nn.Module):
         return plans
 
     @staticmethod
-    def _spatiotemporal_neighbor_offsets(neighborhood: str) -> tuple[tuple[int, int], ...]:
+    def _spatiotemporal_neighbor_offsets(
+        neighborhood: str,
+        spatial_radius: int = 1,
+    ) -> tuple[tuple[int, int], ...]:
         neighborhood = neighborhood.upper()
-        offsets = [(0, 1), (1, 0)]
-        if neighborhood in {"N8", "N8-R2"}:
-            offsets.extend([(1, 1), (1, -1)])
+        spatial_radius = int(spatial_radius)
+        if spatial_radius <= 0:
+            raise ValueError("spatial_radius must be positive")
+        # Undirected same-frame edges use one half of the spatial cube.  The
+        # four offsets cover right, down, and the two downward diagonals;
+        # reverse directions are generated implicitly by graph symmetrization.
+        if neighborhood == "N4":
+            offsets = [
+                (delta_row, delta_col)
+                for delta_row in range(-spatial_radius, spatial_radius + 1)
+                for delta_col in range(-spatial_radius, spatial_radius + 1)
+                if (delta_row > 0 or (delta_row == 0 and delta_col > 0))
+                and (delta_row != 0 or delta_col != 0)
+            ]
+        else:
+            offsets = [(0, 1), (1, 0), (1, 1), (1, -1)]
         if neighborhood == "N8-R2":
             offsets.extend([(0, 2), (2, 0)])
         return tuple(offsets)
+
+    @staticmethod
+    def _spatiotemporal_cube_spatial_offsets(
+        spatial_radius: int = 1,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return all spatial offsets in a square cube slice."""
+
+        spatial_radius = int(spatial_radius)
+        if spatial_radius <= 0:
+            raise ValueError("spatial_radius must be positive")
+        return tuple(
+            (delta_row, delta_col)
+            for delta_row in range(-spatial_radius, spatial_radius + 1)
+            for delta_col in range(-spatial_radius, spatial_radius + 1)
+        )
 
     def _build_local_spatiotemporal_edges(
         self,
@@ -2276,13 +2447,31 @@ class Aggregator(nn.Module):
         include_temporal_spatial: bool,
         exclude_frame_zero: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Build the local candidate graph without an N-by-N distance matrix."""
+        """Build local candidate edges without an N-by-N distance matrix.
+
+        Same-frame edges use a half-neighborhood, so each undirected spatial
+        edge is emitted once. N4 uses the complete 3x3 spatial cube for every
+        positive temporal offset, including when the caller uses the legacy
+        ``include_temporal_spatial=False`` path.
+        """
 
         height, width = getattr(self, "_frame_fusion_patch_grid_size", (1, patch_count))
         if height * width != patch_count:
             height, width = 1, patch_count
         offsets = self._spatiotemporal_neighbor_offsets(
+            getattr(self, "frame_fusion_spatial_neighborhood", "N8"),
+            int(getattr(self, "frame_fusion_spatial_radius", 1)),
+        )
+        spatial_radius = int(getattr(self, "frame_fusion_spatial_radius", 1))
+        neighborhood = str(
             getattr(self, "frame_fusion_spatial_neighborhood", "N8")
+        ).upper()
+        temporal_offsets = (
+            self._spatiotemporal_cube_spatial_offsets(spatial_radius)
+            if neighborhood == "N4"
+            else offsets
+            if include_temporal_spatial
+            else ((0, 0),)
         )
         temporal_window = int(getattr(self, "frame_fusion_temporal_window", 1))
         source: list[int] = []
@@ -2302,18 +2491,15 @@ class Aggregator(nn.Module):
                         target.append(frame * patch_count + nr * width + nc)
                     for delta in range(1, temporal_window + 1):
                         if frame + delta < num_frames:
-                            source.append(current)
-                            target.append((frame + delta) * patch_count + position)
-                            if include_temporal_spatial:
-                                for dr, dc in offsets:
-                                    nr, nc = row + dr, col + dc
-                                    if 0 <= nr < height and 0 <= nc < width:
-                                        source.append(current)
-                                        target.append(
-                                            (frame + delta) * patch_count
-                                            + nr * width
-                                            + nc
-                                        )
+                            for dr, dc in temporal_offsets:
+                                nr, nc = row + dr, col + dc
+                                if 0 <= nr < height and 0 <= nc < width:
+                                    source.append(current)
+                                    target.append(
+                                        (frame + delta) * patch_count
+                                        + nr * width
+                                        + nc
+                                    )
         return (
             np.asarray(source, dtype=np.int64),
             np.asarray(target, dtype=np.int64),
@@ -2369,6 +2555,7 @@ class Aggregator(nn.Module):
         lambda_cost: float,
         cost_denominator: float | None = None,
         prefer_best_parent: bool = True,
+        merge_top_similarity_percent: float = 100.0,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
         """Batch U-M merges using mutual nearest-neighbor components.
 
@@ -2393,6 +2580,12 @@ class Aggregator(nn.Module):
             )
         if lambda_cost < 0.0:
             raise ValueError("lambda_cost must be non-negative")
+        merge_top_similarity_percent = float(merge_top_similarity_percent)
+        if not 0.0 < merge_top_similarity_percent <= 100.0:
+            raise ValueError(
+                "merge_top_similarity_percent must be in (0, 100], "
+                f"got {merge_top_similarity_percent}"
+            )
 
         device = normalized_features.device
         features = normalized_features.float()
@@ -2442,7 +2635,19 @@ class Aggregator(nn.Module):
         merge_threshold = 2.0 * float(lambda_cost)
         accepted_merges = 0
         mutual_pairs_seen = 0
+        similarity_pairs_seen = 0
+        similarity_pairs_kept = 0
+        similarity_pairs_filtered = 0
         parallel_rounds = 0
+        trace_merges: list[dict[str, object]] | None = (
+            [] if getattr(self, "_frame_fusion_trace_merges", False) else None
+        )
+        # Stable IDs are used only by the optional diagnostic trace. The
+        # active tensors below are compacted every parallel round, so their
+        # transient indices cannot by themselves describe a replayable merge
+        # history.
+        stable_group_ids = np.arange(count, dtype=np.int64)
+        next_stable_group_id = count
         total_error = 0.0
         stop_reason = "graph_exhausted"
         chunk_size = 131_072
@@ -2544,6 +2749,35 @@ class Aggregator(nn.Module):
                 stop_reason = "no_mutual_nearest_pairs"
                 break
 
+            # Limit each parallel round to the most similar mutual pairs.
+            # Similarity is measured between the current parent
+            # representatives, and stable sorting makes ties deterministic.
+            pair_similarity = (
+                features[group_representatives[pair_left]]
+                * features[group_representatives[pair_right]]
+            ).sum(dim=-1)
+            similarity_pairs_seen += int(pair_similarity.numel())
+            keep_count = max(
+                1,
+                int(
+                    np.ceil(
+                        pair_similarity.numel()
+                        * merge_top_similarity_percent
+                        / 100.0
+                    )
+                ),
+            )
+            similarity_keep = torch.ones_like(pair_similarity, dtype=torch.bool)
+            if keep_count < pair_similarity.numel():
+                similarity_order = torch.argsort(
+                    pair_similarity,
+                    descending=True,
+                    stable=True,
+                )
+                similarity_keep[similarity_order[keep_count:]] = False
+            similarity_pairs_kept += int(similarity_keep.sum().item())
+            similarity_pairs_filtered += int((~similarity_keep).sum().item())
+
             merged_sum = group_sums[pair_left] + group_sums[pair_right]
             merged_weight = group_weights[pair_left] + group_weights[pair_right]
             left_error = merged_weight - (
@@ -2558,7 +2792,7 @@ class Aggregator(nn.Module):
                 if prefer_best_parent
                 else left_error
             ) - group_errors[pair_left] - group_errors[pair_right]
-            acceptable = pair_delta < merge_threshold
+            acceptable = (pair_delta < merge_threshold) & similarity_keep
             if min_keep:
                 available = max(component_count - min_keep, 0)
                 if int(acceptable.sum().item()) > available:
@@ -2572,6 +2806,37 @@ class Aggregator(nn.Module):
             if pair_left.numel() == 0:
                 stop_reason = "minimum_delta_threshold"
                 break
+
+            trace_pair_data: list[tuple[int, int, int, int, int, int, float, float, float, int]] = []
+            if trace_merges is not None:
+                pair_left_cpu = pair_left.detach().cpu().numpy()
+                pair_right_cpu = pair_right.detach().cpu().numpy()
+                pair_delta_cpu = pair_delta.detach().float().cpu().numpy()
+                choose_right_cpu = choose_right.detach().cpu().numpy()
+                left_error_cpu = left_error[acceptable].detach().float().cpu().numpy()
+                right_error_cpu = right_error[acceptable].detach().float().cpu().numpy()
+                for index in range(pair_left_cpu.size):
+                    left_current = int(pair_left_cpu[index])
+                    right_current = int(pair_right_cpu[index])
+                    new_stable = next_stable_group_id
+                    next_stable_group_id += 1
+                    left_rep = int(group_representatives[left_current].item())
+                    right_rep = int(group_representatives[right_current].item())
+                    selected_rep = right_rep if bool(choose_right_cpu[index]) else left_rep
+                    trace_pair_data.append(
+                        (
+                            int(stable_group_ids[left_current]),
+                            int(stable_group_ids[right_current]),
+                            new_stable,
+                            left_rep,
+                            right_rep,
+                            selected_rep,
+                            float(group_sizes[left_current].item()),
+                            float(group_sizes[right_current].item()),
+                            float(pair_delta_cpu[index]),
+                            int(parallel_rounds),
+                        )
+                    )
 
             old_to_new = torch.empty_like(ids)
             pair_member = torch.zeros(component_count, device=device, dtype=torch.bool)
@@ -2606,6 +2871,32 @@ class Aggregator(nn.Module):
             new_errors = new_weights - (
                 new_sums * features[new_representatives]
             ).sum(dim=-1)
+
+            if trace_merges is not None:
+                leader_ids_cpu = leader_ids.detach().cpu().numpy()
+                new_ids_cpu = new_ids.detach().cpu().numpy()
+                new_stable_ids = stable_group_ids[leader_ids_cpu].copy()
+                for pair_index, data in enumerate(trace_pair_data):
+                    new_stable = data[2]
+                    new_stable_ids[int(new_ids_cpu[int(pair_left_cpu[pair_index])])] = new_stable
+                    left_stable, right_stable, _, left_rep, right_rep, selected_rep, left_size, right_size, delta, round_index = data
+                    merged_size = left_size + right_size
+                    trace_merges.append(
+                        {
+                            "round": round_index,
+                            "left_group": left_stable,
+                            "right_group": right_stable,
+                            "new_group": new_stable,
+                            "left_representative": int(source_indices[left_rep]),
+                            "right_representative": int(source_indices[right_rep]),
+                            "new_representative": int(source_indices[selected_rep]),
+                            "left_size": int(left_size),
+                            "right_size": int(right_size),
+                            "new_size": int(merged_size),
+                            "merge_delta": float(delta),
+                        }
+                    )
+                stable_group_ids = new_stable_ids
 
             labels = old_to_new[labels]
             edge_left = old_to_new[edge_left]
@@ -2654,8 +2945,14 @@ class Aggregator(nn.Module):
             "stop_reason": stop_reason,
             "parallel_rounds": parallel_rounds,
             "mutual_pairs_seen": mutual_pairs_seen,
+            "merge_top_similarity_percent": float(merge_top_similarity_percent),
+            "similarity_pairs_seen": similarity_pairs_seen,
+            "similarity_pairs_kept": similarity_pairs_kept,
+            "similarity_pairs_filtered": similarity_pairs_filtered,
             "group_size_max": int(group_sizes.max().item()) if group_sizes.numel() else 0,
         }
+        if trace_merges is not None:
+            debug["merge_trace"] = trace_merges
         return final_mapping, selected_sources, debug
 
     def _greedy_spatiotemporal_group_merge(
@@ -3006,7 +3303,8 @@ class Aggregator(nn.Module):
         if not reallocate:
             height, width = getattr(self, "_frame_fusion_patch_grid_size", (1, patch_count))
             offsets = self._spatiotemporal_neighbor_offsets(
-                getattr(self, "frame_fusion_spatial_neighborhood", "N8")
+                getattr(self, "frame_fusion_spatial_neighborhood", "N8"),
+                int(getattr(self, "frame_fusion_spatial_radius", 1)),
             )
             index_by_frame_position: dict[tuple[int, int], int] = {
                 (int(frame), int(position)): index
@@ -3088,7 +3386,16 @@ class Aggregator(nn.Module):
             candidate_lists: list[list[int]] = []
             height, width = getattr(self, "_frame_fusion_patch_grid_size", (1, patch_count))
             offsets = self._spatiotemporal_neighbor_offsets(
-                getattr(self, "frame_fusion_spatial_neighborhood", "N8")
+                getattr(self, "frame_fusion_spatial_neighborhood", "N8"),
+                int(getattr(self, "frame_fusion_spatial_radius", 1)),
+            )
+            temporal_offsets = (
+                self._spatiotemporal_cube_spatial_offsets(
+                    int(getattr(self, "frame_fusion_spatial_radius", 1))
+                )
+                if str(getattr(self, "frame_fusion_spatial_neighborhood", "N8")).upper()
+                == "N4"
+                else offsets
             )
             for frame in range(num_frames):
                 for position in range(patch_count):
@@ -3106,7 +3413,7 @@ class Aggregator(nn.Module):
                         for other_frame in (frame - delta, frame + delta):
                             if 1 <= other_frame < num_frames:
                                 candidates.extend(int(value) for value in temporal_mapping[other_frame, position : position + 1])
-                                for dr, dc in offsets:
+                                for dr, dc in temporal_offsets:
                                     nr, nc = row + dr, col + dc
                                     if 0 <= nr < height and 0 <= nc < width:
                                         candidates.append(int(temporal_mapping[other_frame, nr * width + nc]))
@@ -3204,12 +3511,15 @@ class Aggregator(nn.Module):
         tokens: torch.Tensor,
         *,
         reallocate: bool,
+        lambda_cost: float | None = None,
     ) -> TemporalRepresentativeBatchPlan:
         """Build U-M/U-R plans on the local time/space candidate graph."""
 
         num_frames, num_tokens, embed_dim = tokens.shape
         patch_count = num_tokens - self.patch_token_start
         patch_tokens = tokens[:, self.patch_token_start :].reshape(-1, embed_dim)
+        if lambda_cost is None:
+            lambda_cost = self._frame_fusion_lambda_for_layer(-1)
         normalized = torch.nn.functional.normalize(patch_tokens.float(), p=2, dim=-1, eps=1e-8)
         total = num_frames * patch_count
         protected = np.zeros(total, dtype=bool)
@@ -3261,7 +3571,7 @@ class Aggregator(nn.Module):
                 removable,
                 protected_count=patch_count,
                 min_keep=target_min,
-                lambda_cost=float(getattr(self, "frame_fusion_lambda_cost", 0.15)),
+                lambda_cost=float(lambda_cost),
                 cost_denominator=float(max((num_frames - 1) * patch_count, 1)),
             )
             remove_order = removable[np.argsort(removal_scores[removable], kind="stable")]
@@ -3324,9 +3634,12 @@ class Aggregator(nn.Module):
                 protected=np.zeros(search_indices.size, dtype=bool),
                 max_group_size=None,
                 min_keep_ratio=float(getattr(self, "frame_fusion_min_keep_ratio", 0.05)),
-                lambda_cost=float(getattr(self, "frame_fusion_lambda_cost", 0.15)),
+                lambda_cost=float(lambda_cost),
                 cost_denominator=float(max((num_frames - 1) * patch_count, 1)),
                 prefer_best_parent=True,
+                merge_top_similarity_percent=float(
+                    getattr(self, "frame_fusion_merge_top_similarity_percent", 100.0)
+                ),
             )
             final_mapping = np.empty(total, dtype=np.int64)
             final_mapping[:patch_count] = np.arange(patch_count, dtype=np.int64)
@@ -3382,6 +3695,7 @@ class Aggregator(nn.Module):
         self._hybrid_debug = []
         plans: list[TemporalRepresentativeBatchPlan] = []
         mode = self.frame_fusion_mode
+        layer_lambda = self._frame_fusion_lambda_for_layer(source_layer)
         if mode in {"h-m", "h-r"}:
             temporal_plans = self._build_adaptive_temporal_representative_plans(
                 tokens, source_layer=source_layer
@@ -3398,7 +3712,9 @@ class Aggregator(nn.Module):
             for batch_index in range(tokens.shape[0]):
                 plans.append(
                     self._build_unified_representative_plan(
-                        tokens[batch_index], reallocate=mode == "u-r"
+                        tokens[batch_index],
+                        reallocate=mode == "u-r",
+                        lambda_cost=layer_lambda,
                     )
                 )
         batch_debug = list(self._hybrid_debug)
@@ -3424,10 +3740,17 @@ class Aggregator(nn.Module):
                 None
             ),
             "lambda_cost": (
-                getattr(self, "frame_fusion_lambda_cost", 0.15)
+                layer_lambda
                 if uses_lambda
                 else None
             ),
+            "merge_top_similarity_percent": float(
+                getattr(self, "frame_fusion_merge_top_similarity_percent", 100.0)
+            ),
+            "lambda_cost_by_layer": {
+                str(layer): float(value)
+                for layer, value in getattr(self, "frame_fusion_lambda_cost_by_layer", {}).items()
+            },
             "selection": (
                 "mutual_nearest_neighbor_delta_E_lt_2_lambda"
                 if mode == "u-m"
@@ -3473,6 +3796,9 @@ class Aggregator(nn.Module):
                 if uses_lambda
                 else getattr(self, "frame_fusion_representative_update", "parent")
             ),
+            "representative_value_aggregation": (
+                "group-mean" if mode == "u-m" else "source-token"
+            ),
             "attention_only": True,
             "mlp_scope": "full_original_token_sequence",
             "batches": [
@@ -3501,7 +3827,17 @@ class Aggregator(nn.Module):
         self.last_frame_fusion_debug["planning_seconds"] = float(
             self._frame_fusion_plan_seconds
         )
-        if source_layer in getattr(self, "frame_fusion_recompute_layers", ()):
+        if (
+            source_layer in getattr(self, "frame_fusion_recompute_layers", ())
+            or (
+                getattr(self, "frame_fusion_recompute_each_global", False)
+                and self.frame_fusion_mode in {"h-m", "h-r", "u-m", "u-r"}
+                and (
+                    source_layer < 0
+                    or self.inter_frame_attention_types[source_layer] == "global"
+                )
+            )
+        ):
             self._frame_fusion_debug_layers.append(self.last_frame_fusion_debug.copy())
         return plans
 
@@ -4136,6 +4472,106 @@ class Aggregator(nn.Module):
             )
         return torch.stack(keep_rows, dim=0)
 
+    @staticmethod
+    def _attention_error_query_indices(
+        *,
+        num_frames: int,
+        num_tokens: int,
+        patch_token_start: int,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Select all special queries and ten uniformly spaced patch queries per frame."""
+
+        special_count = num_frames * patch_token_start
+        frame_offsets = torch.arange(num_frames, device=device, dtype=torch.long) * patch_token_start
+        indices = {
+            "camera": frame_offsets,
+            "register": (
+                frame_offsets[:, None]
+                + torch.arange(1, patch_token_start, device=device, dtype=torch.long)[None, :]
+            ).reshape(-1),
+        }
+        patch_count = num_tokens - patch_token_start
+        patch_sample_count = min(10, patch_count)
+        patch_positions = torch.linspace(
+            0,
+            max(patch_count - 1, 0),
+            patch_sample_count,
+            device=device,
+        ).round().to(dtype=torch.long).unique()
+        indices["patch"] = (
+            special_count
+            + torch.arange(num_frames, device=device, dtype=torch.long)[:, None] * patch_count
+            + patch_positions[None, :]
+        ).reshape(-1)
+        return indices
+
+    def _record_attention_error(
+        self,
+        dense_attention: torch.Tensor,
+        compressed_attention: torch.Tensor,
+        *,
+        num_frames: int,
+        num_tokens: int,
+        patch_token_start: int,
+    ) -> None:
+        """Accumulate dense-vs-compressed attention errors by query token type."""
+
+        dense_attention = dense_attention.detach().float().squeeze(0)
+        compressed_attention = compressed_attention.detach().float().squeeze(0)
+        query_indices = self._attention_error_query_indices(
+            num_frames=num_frames,
+            num_tokens=num_tokens,
+            patch_token_start=patch_token_start,
+            device=dense_attention.device,
+        )
+        for token_type, indices in query_indices.items():
+            dense = dense_attention.index_select(0, indices)
+            compressed = compressed_attention.index_select(0, indices)
+            difference = compressed - dense
+            stats = self._frame_fusion_attention_error_stats.setdefault(
+                token_type,
+                {
+                    "sum_abs": 0.0,
+                    "sum_squared": 0.0,
+                    "sum_reference_squared": 0.0,
+                    "max_abs": 0.0,
+                    "query_tokens": 0.0,
+                    "values": 0.0,
+                },
+            )
+            stats["sum_abs"] += float(difference.abs().sum().item())
+            stats["sum_squared"] += float(difference.square().sum().item())
+            stats["sum_reference_squared"] += float(dense.square().sum().item())
+            stats["max_abs"] = max(stats["max_abs"], float(difference.abs().max().item()))
+            stats["query_tokens"] += float(indices.numel())
+            stats["values"] += float(difference.numel())
+        self._frame_fusion_attention_error_comparisons += 1
+
+    def _finalize_attention_error_stats(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "comparison": "pre_projection_attention_value",
+            "query_sampling": "all_camera_and_register; 10_uniform_patch_queries_per_frame",
+            "num_comparisons": int(self._frame_fusion_attention_error_comparisons),
+            "token_types": {},
+        }
+        token_types = result["token_types"]
+        assert isinstance(token_types, dict)
+        for token_type, stats in self._frame_fusion_attention_error_stats.items():
+            values = max(stats["values"], 1.0)
+            token_types[token_type] = {
+                "query_tokens": int(stats["query_tokens"]),
+                "mean_absolute_error": stats["sum_abs"] / values,
+                "rmse": (stats["sum_squared"] / values) ** 0.5,
+                "relative_l2": (
+                    stats["sum_squared"]
+                    / max(stats["sum_reference_squared"], 1.0e-12)
+                )
+                ** 0.5,
+                "max_absolute_error": stats["max_abs"],
+            }
+        return result
+
     def _run_temporal_representative_global_attention_block(
         self,
         tokens: torch.Tensor,
@@ -4158,18 +4594,130 @@ class Aggregator(nn.Module):
             frame_tokens = tokens[batch_index]
             special_tokens = frame_tokens[:, :patch_start].reshape(-1, embed_dim)
             patch_tokens = frame_tokens[:, patch_start:].reshape(-1, embed_dim)
-            representatives = patch_tokens.index_select(
-                0,
-                plan.representative_source_indices.to(device=tokens.device),
-            )
+            if self.frame_fusion_mode == "u-m":
+                # Keep the final U-M partition fixed, but summarize each
+                # group with all of its current tokens instead of one parent.
+                representatives = self._mean_group_representatives(
+                    patch_tokens,
+                    plan.position_to_representative.to(device=tokens.device).reshape(-1),
+                    representative_count=plan.representative_source_indices.numel(),
+                )
+            else:
+                representatives = patch_tokens.index_select(
+                    0,
+                    plan.representative_source_indices.to(device=tokens.device),
+                )
             compressed = torch.cat([special_tokens, representatives], dim=0).unsqueeze(0)
 
             block.attn.merge_random_seed = self.merge_random_seed
-            normalized = block.norm1(compressed)
-            # Keep the representative keys uniform.  In particular, do not
-            # pass an additive key bias here: a non-null attn_mask disables
-            # FlashAttention in scaled_dot_product_attention.
-            attention_output = block.attn(normalized)
+            if self.frame_fusion_attention_variant == "kv-only":
+                # Match the compressed path's stable layout: all camera/
+                # register tokens first, followed by all patch tokens. This
+                # keeps the residual restoration map aligned with Q output.
+                full_input = torch.cat([special_tokens, patch_tokens], dim=0).unsqueeze(0)
+                normalized_full = block.norm1(full_input)
+                normalized_compressed = block.norm1(compressed)
+                full_q, full_k, full_v = block.attn.project_qkv(normalized_full)
+                _, compressed_k, compressed_v = block.attn.project_qkv(normalized_compressed)
+                dense_attention = block.attn.attention_from_qkv(full_q, full_k, full_v)
+                compressed_attention = block.attn.attention_from_qkv(
+                    full_q,
+                    compressed_k,
+                    compressed_v,
+                )
+                self._record_attention_error(
+                    dense_attention,
+                    compressed_attention,
+                    num_frames=num_frames,
+                    num_tokens=num_tokens,
+                    patch_token_start=patch_start,
+                )
+                # Keep the representative keys uniform. In particular, do
+                # not pass an additive key bias: a non-null attn_mask disables
+                # FlashAttention in scaled_dot_product_attention.
+                attention_output = block.attn.proj(compressed_attention)
+                attention_output = block.attn.proj_drop(attention_output)
+            elif self.frame_fusion_attention_variant == "representative-log":
+                full_input = torch.cat([special_tokens, patch_tokens], dim=0).unsqueeze(0)
+                normalized_full = block.norm1(full_input)
+                normalized_compressed = block.norm1(compressed)
+                full_q, full_k, full_v = block.attn.project_qkv(normalized_full)
+                compressed_q, compressed_k, compressed_v = block.attn.project_qkv(
+                    normalized_compressed
+                )
+                dense_attention = block.attn.attention_from_qkv(full_q, full_k, full_v)
+                mapping = plan.position_to_representative.to(device=tokens.device).reshape(-1)
+                group_sizes = torch.bincount(
+                    mapping,
+                    minlength=representatives.shape[0],
+                ).to(device=tokens.device, dtype=compressed_k.dtype)
+                log_key_weights = torch.cat(
+                    [
+                        torch.zeros(
+                            special_tokens.shape[0],
+                            device=tokens.device,
+                            dtype=compressed_k.dtype,
+                        ),
+                        group_sizes.clamp_min(1).log(),
+                    ]
+                ).view(1, 1, 1, -1)
+                compressed_attention = block.attn.attention_from_qkv_with_log_key_weights(
+                    compressed_q,
+                    compressed_k,
+                    compressed_v,
+                    log_key_weights,
+                )
+                expanded_attention_for_error = torch.cat(
+                    [
+                        compressed_attention[:, : special_tokens.shape[0]],
+                        compressed_attention[:, special_tokens.shape[0] :].index_select(
+                            1,
+                            mapping,
+                        ),
+                    ],
+                    dim=1,
+                )
+                self._record_attention_error(
+                    dense_attention,
+                    expanded_attention_for_error,
+                    num_frames=num_frames,
+                    num_tokens=num_tokens,
+                    patch_token_start=patch_start,
+                )
+                attention_output = block.attn.proj(compressed_attention)
+                attention_output = block.attn.proj_drop(attention_output)
+            elif self.frame_fusion_attention_variant == "replicated":
+                expanded_patch = representatives.index_select(
+                    0,
+                    plan.position_to_representative.to(device=tokens.device).reshape(-1),
+                )
+                expanded = torch.cat([special_tokens, expanded_patch], dim=0).unsqueeze(0)
+                full_input = torch.cat([special_tokens, patch_tokens], dim=0).unsqueeze(0)
+                normalized_full = block.norm1(full_input)
+                normalized_expanded = block.norm1(expanded)
+                full_q, full_k, full_v = block.attn.project_qkv(normalized_full)
+                expanded_q, expanded_k, expanded_v = block.attn.project_qkv(normalized_expanded)
+                dense_attention = block.attn.attention_from_qkv(full_q, full_k, full_v)
+                expanded_attention = block.attn.attention_from_qkv(
+                    expanded_q,
+                    expanded_k,
+                    expanded_v,
+                )
+                self._record_attention_error(
+                    dense_attention,
+                    expanded_attention,
+                    num_frames=num_frames,
+                    num_tokens=num_tokens,
+                    patch_token_start=patch_start,
+                )
+                attention_output = block.attn.proj(expanded_attention)
+                attention_output = block.attn.proj_drop(attention_output)
+            else:
+                normalized = block.norm1(compressed)
+                # Keep the representative keys uniform. In particular, do not
+                # pass an additive key bias here: a non-null attn_mask disables
+                # FlashAttention in scaled_dot_product_attention.
+                attention_output = block.attn(normalized)
             attention_update = block.ls1(attention_output).squeeze(0)
 
             # Restore only the attention residual to the original full token
@@ -4195,6 +4743,31 @@ class Aggregator(nn.Module):
         result = torch.stack(outputs, dim=0)
         self._frame_fusion_global_attention_seconds += time.perf_counter() - started
         return result
+
+    @staticmethod
+    def _mean_group_representatives(
+        patch_tokens: torch.Tensor,
+        position_to_representative: torch.Tensor,
+        *,
+        representative_count: int,
+    ) -> torch.Tensor:
+        """Construct one mean token for every final representative group."""
+
+        representative_sums = torch.zeros(
+            (representative_count, patch_tokens.shape[-1]),
+            device=patch_tokens.device,
+            dtype=patch_tokens.dtype,
+        )
+        representative_sums.index_add_(
+            0,
+            position_to_representative,
+            patch_tokens,
+        )
+        counts = torch.bincount(
+            position_to_representative,
+            minlength=representative_count,
+        ).to(device=patch_tokens.device, dtype=patch_tokens.dtype)
+        return representative_sums / counts.clamp_min(1).unsqueeze(-1)
 
     def _run_adaptive_spatial_representative_global_attention_block(
         self,

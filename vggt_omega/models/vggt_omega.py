@@ -28,6 +28,7 @@ class VGGTOmega(nn.Module):
         merging: int | None = 0,
         merge_ratio: float = 0.9,
         merge_random_seed: int = 33,
+        fastvggt_protect_tokens: bool = True,
         first_frame_token_indices: tuple[int, ...] | list[int] | str = (0,),
         register_patch_inter_frame_mode: str = "none",
         register_patch_inter_frame_percent: float = 0.0,
@@ -88,12 +89,16 @@ class VGGTOmega(nn.Module):
         frame_fusion_recompute_each_global: bool = False,
         frame_fusion_recompute_layers: tuple[int, ...] | list[int] | str = (),
         frame_fusion_lambda_cost: float = 0.15,
+        frame_fusion_merge_top_similarity_percent: float = 100.0,
+        frame_fusion_layer_lambdas: tuple[float, ...] | list[float] | dict[int, float] | str | None = None,
         frame_fusion_min_keep_ratio: float = 0.4,
         frame_fusion_temporal_window: int = 1,
+        frame_fusion_spatial_radius: int = 1,
         frame_fusion_spatial_neighborhood: str = "N8",
         frame_fusion_time_overlap: float = 0.5,
         frame_fusion_reassignment_candidates: int = 8,
         frame_fusion_representative_update: str = "parent",
+        frame_fusion_attention_variant: str = "representative",
     ) -> None:
         super().__init__()
         if use_register_mediated_anchor is not None:
@@ -106,6 +111,7 @@ class VGGTOmega(nn.Module):
             merging=merging,
             merge_ratio=merge_ratio,
             merge_random_seed=merge_random_seed,
+            fastvggt_protect_tokens=fastvggt_protect_tokens,
             first_frame_token_indices=first_frame_token_indices,
             register_patch_inter_frame_mode=register_patch_inter_frame_mode,
             register_patch_inter_frame_percent=register_patch_inter_frame_percent,
@@ -165,12 +171,16 @@ class VGGTOmega(nn.Module):
             frame_fusion_recompute_each_global=frame_fusion_recompute_each_global,
             frame_fusion_recompute_layers=frame_fusion_recompute_layers,
             frame_fusion_lambda_cost=frame_fusion_lambda_cost,
+            frame_fusion_merge_top_similarity_percent=frame_fusion_merge_top_similarity_percent,
+            frame_fusion_layer_lambdas=frame_fusion_layer_lambdas,
             frame_fusion_min_keep_ratio=frame_fusion_min_keep_ratio,
             frame_fusion_temporal_window=frame_fusion_temporal_window,
+            frame_fusion_spatial_radius=frame_fusion_spatial_radius,
             frame_fusion_spatial_neighborhood=frame_fusion_spatial_neighborhood,
             frame_fusion_time_overlap=frame_fusion_time_overlap,
             frame_fusion_reassignment_candidates=frame_fusion_reassignment_candidates,
             frame_fusion_representative_update=frame_fusion_representative_update,
+            frame_fusion_attention_variant=frame_fusion_attention_variant,
         )
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None

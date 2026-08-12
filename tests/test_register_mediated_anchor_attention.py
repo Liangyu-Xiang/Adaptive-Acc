@@ -5,6 +5,7 @@ import tempfile
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 
 from vggt_omega.models.aggregator import Aggregator
 from vggt_omega.models.layers.attention import SelfAttention
@@ -28,6 +29,20 @@ def _run_attention(attention: SelfAttention, x: torch.Tensor, **kwargs) -> torch
     assert out.shape == x.shape
     assert torch.isfinite(out).all()
     return out
+
+
+def test_attention_from_qkv_supports_full_query_and_compressed_key_value_lengths():
+    attention = _make_attention()
+    query_input = torch.randn((1, 7, 32), generator=torch.Generator().manual_seed(1))
+    key_value_input = torch.randn((1, 4, 32), generator=torch.Generator().manual_seed(2))
+
+    q, _, _ = attention.project_qkv(query_input)
+    _, k, v = attention.project_qkv(key_value_input)
+    actual = attention.attention_from_qkv(q, k, v)
+    expected = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(1, 7, 32)
+
+    assert actual.shape == (1, 7, 32)
+    assert torch.allclose(actual, expected)
 
 
 def test_adaptive_anchor_disabled_matches_dense_path():
