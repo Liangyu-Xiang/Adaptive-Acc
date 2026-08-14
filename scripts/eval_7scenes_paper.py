@@ -74,6 +74,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/7scenes_paper"))
+    parser.add_argument(
+        "--acceleration-method",
+        choices=("none", "da-vggt", "sparse-vggt", "fastvggt", "u-m"),
+        default="none",
+        help="Unified interface label; DA-VGGT enables anchor-chunk inference.",
+    )
+    parser.add_argument(
+        "--da-chunk-size", type=int, default=50,
+        help="Frames per anchor chunk for the DA-VGGT adapter.",
+    )
     parser.add_argument("--device", default="cuda:5")
     parser.add_argument(
         "--attention-mode",
@@ -114,6 +124,8 @@ def parse_args() -> argparse.Namespace:
             "keeps the paper-style seeded protocol."
         ),
     )
+    parser.add_argument("--sampling-pool-frames", type=int, default=0,
+                        help="Uniformly form this many source candidates, then use their first --num-frames; short sequences use source first frames.")
     parser.add_argument(
         "--reference-frame-index",
         type=int,
@@ -800,10 +812,11 @@ def sample_records(
     num_frames: int,
     seed: int,
     strategy: str = "uniform",
+    sampling_pool_frames: int = 0,
 ) -> tuple[dict[str, list[FrameRecord]], dict[str, list[int]]]:
     # The random strategy matches np.random.seed(seed) followed by sequential
     # np.random.choice calls, as used by public VGGT/Pi3 evaluation loaders.
-    return sample_record_pools(pools, num_frames, seed, strategy=strategy)
+    return sample_record_pools(pools, num_frames, seed, strategy=strategy, sampling_pool_frames=sampling_pool_frames)
 
 
 def load_model(
@@ -980,6 +993,11 @@ def load_model(
     model.load_state_dict(state, strict=True)
     del state
     return model.to(device).eval()
+
+
+def da_forward(model: VGGTOmega, images: torch.Tensor, chunk_size: int) -> dict[str, torch.Tensor]:
+    """Full DA-VGGT: cached visual tokens and pose-weighted re-chunking."""
+    return model.forward_da_vggt(images, chunk_size=chunk_size)
 
 
 def to_homogeneous_w2c(extrinsics: torch.Tensor) -> np.ndarray:
@@ -1246,6 +1264,7 @@ def main() -> int:
         args.num_frames,
         args.seed,
         strategy=args.sampling_strategy,
+        sampling_pool_frames=args.sampling_pool_frames,
     )
     sampled_input_pool_indices = {
         name: [sampled_pool_indices[name][index] for index in input_order_from_sample]
@@ -1258,6 +1277,8 @@ def main() -> int:
     selection = {
         name: {
             "sampling_strategy": args.sampling_strategy,
+            "sampling_mode": "uniform_pool_then_first" if args.sampling_pool_frames else args.sampling_strategy,
+            "sampling_pool_frames_requested": args.sampling_pool_frames,
             "sampling_pool_size": len(pools[name]),
             "pool_indices": sampled_input_pool_indices[name],
             "original_sample_order_pool_indices": sampled_pool_indices[name],
@@ -1481,7 +1502,7 @@ def main() -> int:
             )
         if not args.skip_timing:
             with torch.inference_mode():
-                warmup = model(images)
+                warmup = da_forward(model, images, args.da_chunk_size) if args.acceleration_method == "da-vggt" else model(images)
             del warmup
             torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
@@ -1494,7 +1515,7 @@ def main() -> int:
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
             with torch.inference_mode():
-                current_predictions = model(images)
+                current_predictions = da_forward(model, images, args.da_chunk_size) if args.acceleration_method == "da-vggt" else model(images)
             if not args.skip_timing:
                 end_event.record()
                 torch.cuda.synchronize(device)
@@ -1507,9 +1528,9 @@ def main() -> int:
         assert predictions is not None
 
         with torch.inference_mode():
-            extrinsics, _ = encoding_to_camera(
+            extrinsics = predictions["da_w2c"] if "da_w2c" in predictions else encoding_to_camera(
                 predictions["pose_enc"], predictions["images"].shape[-2:], build_intrinsics=False
-            )
+            )[0]
         pred_w2c = to_homogeneous_w2c(extrinsics[0])
         gt_w2c = np.linalg.inv(np.stack([record.c2w for record in records]))
         rotation_errors, translation_errors = pairwise_pose_errors(pred_w2c, gt_w2c)

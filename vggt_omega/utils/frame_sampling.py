@@ -29,6 +29,7 @@ def sample_record_pools(
     num_frames: int,
     seed: int,
     strategy: str = "uniform",
+    sampling_pool_frames: int = 0,
 ) -> tuple[dict[str, list[T]], dict[str, list[int]]]:
     """Sample records from each pool using the requested deterministic strategy."""
     if strategy not in SAMPLING_STRATEGIES:
@@ -40,7 +41,12 @@ def sample_record_pools(
     sampled_indices: dict[str, list[int]] = {}
     for sequence_name, pool in pools.items():
         _validate_pool_size(len(pool), num_frames, sequence_name=sequence_name)
-        if strategy == "random":
+        if sampling_pool_frames > 0:
+            if len(pool) < sampling_pool_frames:
+                indices = list(range(num_frames))
+            else:
+                indices = uniform_first_last_indices(len(pool), sampling_pool_frames)[:num_frames]
+        elif strategy == "random":
             assert rng is not None
             indices = rng.choice(len(pool), num_frames, replace=False).tolist()
         else:

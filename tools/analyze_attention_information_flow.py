@@ -17,13 +17,14 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from PIL import Image
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.analyze_token_evolution import load_model
+from tools.analyze_token_evolution import load_model, read_sequence_images
 from vggt_omega.utils.load_fn import load_and_preprocess_images
 
 
@@ -48,6 +49,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-chunk", type=int, default=128)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--correspondences", type=int, default=20)
+    parser.add_argument("--data-root", type=Path, default=None)
+    parser.add_argument("--sequence", default=None,
+                        help="Direct sequence mode; avoids a precomputed summary.json.")
+    parser.add_argument("--frame-gap", type=int, default=None,
+                        help="In direct sequence mode, select exactly ten frames at this fixed source-frame gap.")
+    parser.add_argument(
+        "--export-full-attention-matrices", action="store_true",
+        help=("Write one full-resolution, head-mean global-attention TIFF per global "
+              "layer. Pixels are never token-pooled; this is expensive for 10 frames."),
+    )
     return parser.parse_args()
 
 
@@ -80,6 +91,7 @@ class AttentionFlowCollector:
         self.frame_results: dict[int, dict[str, np.ndarray]] = {}
         self.global_results: dict[int, dict[str, np.ndarray]] = {}
         self.handles = []
+
 
     def __enter__(self):
         for layer in self.global_layers:
@@ -212,6 +224,39 @@ class AttentionFlowCollector:
             del q, k, k_t
 
         return hook
+
+
+class FullAttentionMatrixCollector:
+    """Read-only full-resolution, head-mean global-attention image exporter."""
+    def __init__(self, model, target: Path, query_chunk: int):
+        self.aggregator, self.target, self.query_chunk = model.aggregator, target, query_chunk
+        self.global_layers = [i for i, kind in enumerate(self.aggregator.inter_frame_attention_types) if kind == "global"]
+        self.handles = []
+
+    def __enter__(self):
+        self.target.mkdir(parents=True, exist_ok=True)
+        for layer in self.global_layers:
+            self.handles.append(self.aggregator.inter_frame_blocks[layer].register_forward_pre_hook(self._hook(layer)))
+        return self
+
+    def __exit__(self, *args):
+        for handle in self.handles:
+            handle.remove()
+
+    def _hook(self, layer: int):
+        def collect(block, inputs):
+            q, k, _ = qkv_from_block(block, inputs[0], None)
+            n = q.shape[-2]
+            matrix = np.memmap(self.target / f"global_{layer:02d}_mean_heads.u16", mode="w+", dtype=np.uint16, shape=(n, n))
+            kt = k.float().transpose(-2, -1)
+            for start in range(0, n, self.query_chunk):
+                end = min(start + self.query_chunk, n)
+                probabilities = (torch.matmul(q[:, :, start:end].float(), kt) * block.attn.scale).softmax(dim=-1).mean(dim=1)[0]
+                matrix[start:end] = (probabilities.clamp(0, 1).cpu().numpy() * 65535).round().astype(np.uint16)
+            matrix.flush()
+            Image.fromarray(matrix, mode="I;16").save(self.target / f"global_{layer:02d}_mean_heads.tiff", compression="tiff_lzw")
+            del matrix, q, k, kt
+        return collect
 
 
 def robust_limits(values: np.ndarray) -> tuple[float, float]:
@@ -375,12 +420,26 @@ def save_results(
 
 def main() -> int:
     args = parse_args()
-    summary = json.loads((args.analysis_dir / "summary.json").read_text(encoding="utf-8"))
+    if args.sequence is not None:
+        if args.data_root is None or args.frame_gap is None:
+            raise ValueError("--sequence requires --data-root and --frame-gap")
+        sequence_dir = args.data_root / args.sequence
+        rgb_file = sequence_dir / "rgb.txt"
+        if rgb_file.is_file():
+            source = read_sequence_images(sequence_dir, "full")
+        else:
+            source = sorted(sequence_dir.glob("*.color.png"))
+        if len(source) < 1 + 9 * args.frame_gap:
+            raise ValueError("insufficient sequence frames for requested gap")
+        selections = {args.sequence: [str(path) for path in source[0 : 1 + 9 * args.frame_gap : args.frame_gap]]}
+    else:
+        summary = json.loads((args.analysis_dir / "summary.json").read_text(encoding="utf-8"))
+        selections = summary["frame_selections"]
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("Attention-flow analysis requires CUDA")
     model = load_model(args.checkpoint, device)
-    for sequence, paths in summary["frame_selections"].items():
+    for sequence, paths in selections.items():
         image_tensor = load_and_preprocess_images(
             paths, mode=args.resize_mode, image_resolution=args.image_resolution
         )
@@ -390,11 +449,14 @@ def main() -> int:
             images.shape[-2] // model.aggregator.patch_size,
             images.shape[-1] // model.aggregator.patch_size,
         )
-        with AttentionFlowCollector(
-            model, len(paths), args.query_chunk, args.top_k
-        ) as collector:
-            with torch.inference_mode():
-                predictions = model(images)
+        full_target = args.analysis_dir / sequence / "attention_full_matrices"
+        with AttentionFlowCollector(model, len(paths), args.query_chunk, args.top_k) as collector:
+            with (
+                FullAttentionMatrixCollector(model, full_target, args.query_chunk)
+                if args.export_full_attention_matrices else __import__("contextlib").nullcontext()
+            ):
+                with torch.inference_mode():
+                    predictions = model(images)
         save_results(
             args.analysis_dir / sequence,
             collector,

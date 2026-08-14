@@ -1426,14 +1426,12 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        patch_tokens: torch.Tensor | None = None,
     ) -> tuple[list[torch.Tensor | None], int]:
         batch_size, num_frames, num_channels, height, width = images.shape
         original_num_frames = num_frames
         if num_channels != 3:
             raise ValueError(f"Expected 3 input channels, got {num_channels}")
-
-        images = (images - self._resnet_mean) / self._resnet_std
-        images = images.view(batch_size * num_frames, num_channels, height, width)
 
         first_frame_token_indices = resolve_first_frame_token_indices(
             self.first_frame_token_indices,
@@ -1452,9 +1450,15 @@ class Aggregator(nn.Module):
             first_frame_token_indices=first_frame_token_indices,
         )
 
-        patch_tokens = self.patch_embed(images)
-        if isinstance(patch_tokens, dict):
-            patch_tokens = patch_tokens["x_norm_patchtokens"]
+        if patch_tokens is None:
+            normalized_images = (images - self._resnet_mean) / self._resnet_std
+            patch_tokens = self.patch_embed(
+                normalized_images.view(batch_size * num_frames, num_channels, height, width)
+            )
+            if isinstance(patch_tokens, dict):
+                patch_tokens = patch_tokens["x_norm_patchtokens"]
+        elif patch_tokens.shape[0] != batch_size * num_frames:
+            raise ValueError("Cached patch_tokens must have B*S entries")
 
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
         _, num_tokens, embed_dim = tokens.shape
@@ -1793,6 +1797,23 @@ class Aggregator(nn.Module):
                     self._finalize_attention_error_stats()
                 )
         return outputs, self.patch_token_start
+
+    @torch.inference_mode()
+    def forward_dino(self, images: torch.Tensor, batch_size: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cache patch embeddings for DA-VGGT without re-running the vision encoder."""
+        batch, frames, channels, height, width = images.shape
+        if batch != 1 or channels != 3:
+            raise ValueError("DA-VGGT token caching supports B=1 RGB videos")
+        normalized = (images - self._resnet_mean) / self._resnet_std
+        flat = normalized.reshape(batch * frames, channels, height, width)
+        patches, pooled = [], []
+        for start in range(0, len(flat), batch_size):
+            output = self.patch_embed(flat[start:start + batch_size])
+            if isinstance(output, dict):
+                output = output["x_norm_patchtokens"]
+            patches.append(output.cpu())
+            pooled.append(output.float().mean(dim=1).cpu())
+        return torch.cat(patches), torch.cat(pooled)
 
     def _apply_layer_token_swap(
         self,

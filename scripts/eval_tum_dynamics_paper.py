@@ -77,6 +77,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/tum_dynamics_paper"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--acceleration-method", choices=("none", "da-vggt", "sparse-vggt", "fastvggt", "u-m"), default="none",
+        help="Unified label for Omega adapters; DA uses anchor chunking, Sparse/U-M/FastVGGT use their native flags.",
+    )
+    parser.add_argument("--da-chunk-size", type=int, default=50)
+    parser.add_argument(
         "--attention-mode",
         choices=("default", "register-only-zero-shot"),
         default="default",
@@ -143,6 +148,8 @@ def parse_args() -> argparse.Namespace:
             "keeps the paper-style seeded protocol."
         ),
     )
+    parser.add_argument("--sampling-pool-frames", type=int, default=0,
+                        help="Uniformly form this many source candidates, then use their first --num-frames; short sequences use source first frames.")
     parser.add_argument(
         "--reference-frame-index",
         type=int,
@@ -854,10 +861,11 @@ def sample_records(
     num_frames: int,
     seed: int,
     strategy: str = "uniform",
+    sampling_pool_frames: int = 0,
 ) -> tuple[dict[str, list[FrameRecord]], dict[str, list[int]]]:
     # The random strategy intentionally matches the official VGGT evaluation
     # code's np.random.seed(seed) + sequential np.random.choice calls.
-    return sample_record_pools(pools, num_frames, seed, strategy=strategy)
+    return sample_record_pools(pools, num_frames, seed, strategy=strategy, sampling_pool_frames=sampling_pool_frames)
 
 
 def load_model(
@@ -1039,6 +1047,11 @@ def to_homogeneous_w2c(extrinsics: torch.Tensor) -> np.ndarray:
     result = np.broadcast_to(np.eye(4), (len(w2c), 4, 4)).copy()
     result[:, :3] = w2c
     return result
+
+
+def da_forward(model, images: torch.Tensor, chunk_size: int) -> dict[str, torch.Tensor]:
+    """Full DA-VGGT: cached visual tokens and pose-weighted re-chunking."""
+    return model.forward_da_vggt(images, chunk_size=chunk_size)
 
 
 def pairwise_pose_errors(pred_w2c: np.ndarray, gt_w2c: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1278,6 +1291,7 @@ def main() -> int:
         args.num_frames,
         args.seed,
         strategy=args.sampling_strategy,
+        sampling_pool_frames=args.sampling_pool_frames,
     )
     sampled_input_indices = {
         name: [sampled_indices[name][index] for index in input_order_from_sample]
@@ -1290,6 +1304,8 @@ def main() -> int:
     selection = {
         name: {
             "sampling_strategy": args.sampling_strategy,
+            "sampling_mode": "uniform_pool_then_first" if args.sampling_pool_frames else args.sampling_strategy,
+            "sampling_pool_frames_requested": args.sampling_pool_frames,
             "sampling_pool_size": len(pools[name]),
             "pool_indices": sampled_input_indices[name],
             "original_sample_order_pool_indices": sampled_indices[name],
@@ -1502,7 +1518,7 @@ def main() -> int:
         # included in model_latency_ms.
         if not args.skip_timing:
             with torch.inference_mode():
-                _warmup_predictions = model(images)
+                _warmup_predictions = da_forward(model, images, args.da_chunk_size) if args.acceleration_method == "da-vggt" else model(images)
             del _warmup_predictions
             torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
@@ -1515,7 +1531,7 @@ def main() -> int:
                     start_event = torch.cuda.Event(enable_timing=True)
                     end_event = torch.cuda.Event(enable_timing=True)
                     start_event.record()
-                current_predictions = model(images)
+                current_predictions = da_forward(model, images, args.da_chunk_size) if args.acceleration_method == "da-vggt" else model(images)
                 if not args.skip_timing:
                     end_event.record()
                     torch.cuda.synchronize(device)
@@ -1530,9 +1546,9 @@ def main() -> int:
         peak_reserved_gib = torch.cuda.max_memory_reserved(device) / (1024**3)
         model_latency_ms = None if args.skip_timing else float(np.median(timings_ms))
         with torch.inference_mode():
-            extrinsics, _ = encoding_to_camera(
+            extrinsics = predictions["da_w2c"] if "da_w2c" in predictions else encoding_to_camera(
                 predictions["pose_enc"], predictions["images"].shape[-2:], build_intrinsics=False
-            )
+            )[0]
         pred_w2c = to_homogeneous_w2c(extrinsics[0])
         gt_c2w = np.stack([record.c2w for record in records])
         gt_w2c = np.linalg.inv(gt_c2w)

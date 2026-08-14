@@ -12,6 +12,8 @@ import torch.nn as nn
 
 from vggt_omega.models.aggregator import Aggregator
 from vggt_omega.models.heads import CameraHead, DenseHead, TextAlignmentHead
+from vggt_omega.utils.pose_enc import encoding_to_camera
+from vggt_omega.models.da_vggt import cosine_similarity, diversity_partition, pseudo_positions, pose_weighted_similarity
 
 
 class VGGTOmega(nn.Module):
@@ -324,6 +326,56 @@ class VGGTOmega(nn.Module):
         if not self.training:
             predictions["images"] = images
         return predictions
+
+    @torch.inference_mode()
+    def forward_da_vggt(
+        self, images: torch.Tensor, chunk_size: int = 50, dino_batch_size: int = 32,
+        local_search_iters: int = 5, pseudo_pose_gamma: float = 1e-3, pose_tau: float | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """DA-VGGT schedule using cached Ω visual tokens and native heads."""
+        if images.ndim == 4:
+            images = images.unsqueeze(0)
+        if images.shape[0] != 1 or self.camera_head is None:
+            raise ValueError("DA-VGGT requires B=1 and camera prediction")
+        _, count, _, height, width = images.shape
+        if count <= chunk_size:
+            return self(images)
+        cached, pooled = self.aggregator.forward_dino(images, dino_batch_size)
+        similarity = cosine_similarity(pooled)
+        initial = diversity_partition(similarity, chunk_size, [0], local_search_iters)
+
+        def run(indices):
+            ids = torch.tensor(indices, device=images.device)
+            with torch.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
+                aggregate, patch_start = self.aggregator(images[:, ids], cached[ids.cpu()].to(images.device))
+            with torch.autocast("cuda", enabled=False):
+                pose = self.camera_head(aggregate, patch_token_start=patch_start)
+                depth, confidence = self.dense_head(aggregate, images=images[:, ids], patch_token_start=patch_start)
+            return pose, depth, confidence
+
+        pose0, _, _ = run(initial[0])
+        ext0, _ = encoding_to_camera(pose0, (height, width), build_intrinsics=False)
+        c2w0 = torch.linalg.inv(_homogeneous(ext0[0]).float()).cpu().numpy()
+        pseudo = pseudo_positions(similarity, initial[0], c2w0[:, :3, 3], pseudo_pose_gamma)
+        refined = diversity_partition(pose_weighted_similarity(similarity, pseudo, pose_tau), chunk_size, [0], local_search_iters)
+        poses, depths, confs, reference = [None] * count, [None] * count, [None] * count, None
+        for indices in refined:
+            pose, depth, conf = run(indices)
+            ext, _ = encoding_to_camera(pose, (height, width), build_intrinsics=False)
+            with torch.autocast("cuda", enabled=False):
+                c2w = torch.linalg.inv(_homogeneous(ext[0]).float())
+                reference = c2w[0].clone() if reference is None else reference
+                w2c = torch.linalg.inv(reference @ torch.linalg.inv(c2w[0]) @ c2w)[:, :3]
+            for local, original in enumerate(indices):
+                if original == 0 and poses[0] is not None: continue
+                poses[original], depths[original], confs[original] = w2c[local], depth[0, local], conf[0, local]
+        return {"da_w2c": torch.stack(poses).unsqueeze(0), "depth": torch.stack(depths).unsqueeze(0), "depth_conf": torch.stack(confs).unsqueeze(0), "images": images, "chunk_frame_indices": refined, "initial_chunk_frame_indices": initial}
+
+
+def _homogeneous(extrinsics: torch.Tensor) -> torch.Tensor:
+    bottom = torch.zeros((*extrinsics.shape[:-2], 1, 4), device=extrinsics.device, dtype=extrinsics.dtype)
+    bottom[..., 0, 3] = 1.0
+    return torch.cat((extrinsics, bottom), dim=-2)
 
 
 def _warn_if_rope_not_max(aggregator: nn.Module) -> None:
