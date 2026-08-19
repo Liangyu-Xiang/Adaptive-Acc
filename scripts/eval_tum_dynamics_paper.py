@@ -34,6 +34,11 @@ from PIL import Image
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+SHARED_ROOT = Path("/data/mmc_syang")
+if str(SHARED_ROOT) not in sys.path:
+    sys.path.insert(0, str(SHARED_ROOT))
+
+from geometry_eval import depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics
 
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.frame_sampling import SAMPLING_STRATEGIES, sample_record_pools
@@ -286,9 +291,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--frame-fusion-full-attention-layers",
+        default="",
+        help="Comma-separated global layer indices that bypass U-M representative compression and execute full token attention.",
+    )
+    parser.add_argument(
         "--frame-fusion-lambda-cost",
         type=float,
-        default=0.15,
+        default=0.04,
         help="Lambda for adaptive temporal representative objective D_tilde + lambda*q.",
     )
     parser.add_argument(
@@ -1127,6 +1137,28 @@ def depth_sums(
     return abs_rel_sum, delta_count, len(gt_valid), scales
 
 
+def geometry_from_prediction(
+    predicted_depth: np.ndarray,
+    pred_w2c: np.ndarray,
+    records: Sequence[FrameRecord],
+    max_depth: float,
+) -> dict[str, float | int]:
+    """Pi3-compatible reconstructed point-cloud metrics for TUM-Dynamics."""
+    height, width = predicted_depth.shape[1:]
+    gt_depth = np.stack([read_resized_depth(record.depth_path, height, width) for record in records])
+    intrinsic = np.array(
+        [[554.2562584220408, 0.0, 320.0], [0.0, 554.2562584220408, 240.0], [0.0, 0.0, 1.0]]
+    )
+    intrinsics = scaled_intrinsics(intrinsic, (480, 640), (height, width), len(records))
+    pred_points = depth_to_world_points(predicted_depth, np.linalg.inv(pred_w2c), intrinsics)
+    gt_points = depth_to_world_points(gt_depth, np.stack([record.c2w for record in records]), intrinsics)
+    valid = (
+        np.isfinite(predicted_depth) & (predicted_depth > 0)
+        & np.isfinite(gt_depth) & (gt_depth > 0) & (gt_depth < max_depth)
+    )
+    return evaluate_pi3_geometry(pred_points, gt_points, valid)
+
+
 def main() -> int:
     args = parse_args()
     if args.frame_fusion_recompute_layers is None:
@@ -1451,6 +1483,19 @@ def main() -> int:
         model.aggregator.depth,
     )
     model.aggregator.set_inter_frame_only_layers(inter_frame_only_global_layers)
+    full_attention_layers = model.aggregator._normalize_frame_fusion_recompute_layers(
+        args.frame_fusion_full_attention_layers
+    )
+    invalid_full_attention_layers = [
+        layer for layer in full_attention_layers
+        if layer >= model.aggregator.depth or model.aggregator.inter_frame_attention_types[layer] != "global"
+    ]
+    if invalid_full_attention_layers:
+        raise ValueError(
+            "--frame-fusion-full-attention-layers must name global layers in "
+            f"0..{model.aggregator.depth - 1}, got {invalid_full_attention_layers}"
+        )
+    model.aggregator.frame_fusion_full_attention_layers = full_attention_layers
     num_register_blocks = model.aggregator.inter_frame_attention_types.count("register")
     global_blocks = [
         index
@@ -1566,6 +1611,7 @@ def main() -> int:
         row: dict[str, object] = {
             "sequence": sequence_name,
             "auc_3_percent": 100 * official_auc(rotation_errors, translation_errors, 3),
+            "auc_15_percent": 100 * official_auc(rotation_errors, translation_errors, 15),
             "auc_30_percent": 100 * official_auc(rotation_errors, translation_errors, 30),
             "abs_rel": abs_rel_sum / valid_count,
             "delta_1_25_percent": 100 * delta_count / valid_count,
@@ -1577,6 +1623,7 @@ def main() -> int:
             "peak_reserved_gib": peak_reserved_gib,
             "inference_seconds": elapsed,
         }
+        row.update(geometry_from_prediction(predicted_depth, pred_w2c, records, args.max_depth))
         if model.aggregator.last_frame_fusion_debug:
             debug = model.aggregator.last_frame_fusion_debug
             row["frame_fusion_num_groups"] = debug.get("num_groups")
@@ -1760,6 +1807,7 @@ def main() -> int:
                 "target_keep_seed": args.frame_fusion_target_keep_seed,
                 "recompute_each_global": args.frame_fusion_recompute_each_global,
                 "recompute_layers": args.frame_fusion_recompute_layers,
+                "full_attention_layers": list(full_attention_layers),
                 "lambda_cost": args.frame_fusion_lambda_cost,
                 "merge_top_similarity_percent": args.frame_fusion_merge_top_similarity_percent,
                 "layer_lambdas": args.frame_fusion_layer_lambdas,
@@ -1828,6 +1876,7 @@ def main() -> int:
         "paper_targets_1b": PAPER_TARGETS,
         "overall": {
             "auc_3_percent": 100 * official_auc(rotation_errors, translation_errors, 3),
+            "auc_15_percent": 100 * official_auc(rotation_errors, translation_errors, 15),
             "auc_30_percent": 100 * official_auc(rotation_errors, translation_errors, 30),
             "delta_1_25_percent": 100 * total_delta / total_valid,
             "abs_rel": total_abs_rel / total_valid,
@@ -1853,6 +1902,13 @@ def main() -> int:
         },
         "per_sequence": per_sequence,
     }
+    for geometry_key in (
+        "acc_mean_m", "acc_median_m", "comp_mean_m", "comp_median_m",
+        "nc_mean", "nc_median", "chamfer_mean_m", "chamfer_median_m",
+    ):
+        result["overall"][geometry_key] = float(
+            np.mean([float(row[geometry_key]) for row in per_sequence])
+        )
     result["difference_from_paper"] = {
         key: float(result["overall"][key]) - target for key, target in PAPER_TARGETS.items()
     }

@@ -32,6 +32,11 @@ from PIL import Image
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+SHARED_ROOT = Path("/data/mmc_syang")
+if str(SHARED_ROOT) not in sys.path:
+    sys.path.insert(0, str(SHARED_ROOT))
+
+from geometry_eval import depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics
 
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.frame_sampling import SAMPLING_STRATEGIES, sample_record_pools
@@ -264,7 +269,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--frame-fusion-lambda-cost",
         type=float,
-        default=0.15,
+        default=0.04,
         help="Lambda for adaptive temporal representative objective D_tilde + lambda*q.",
     )
     parser.add_argument(
@@ -1096,6 +1101,36 @@ def depth_sums(
     return abs_rel_sum, delta_count, len(gt_valid), scales
 
 
+def geometry_from_prediction(
+    predicted_depth: np.ndarray,
+    pred_w2c: np.ndarray,
+    records: Sequence[FrameRecord],
+    min_depth: float,
+    max_depth: float,
+) -> dict[str, float | int]:
+    """Pi3-compatible ACC/Comp/NC metrics for Omega's depth+camera outputs.
+
+    Omega predicts depth rather than an explicit global point map.  We therefore
+    back-project it using its predicted camera poses; GT is back-projected from
+    the RGB-registered depth maps and GT poses on the same evaluation grid.
+    Sim(3)+ICP in ``evaluate_pi3_geometry`` is identical to the Pi3 protocol.
+    """
+    height, width = predicted_depth.shape[1:]
+    gt_depth = np.stack([read_resized_depth(record.depth_path, height, width) for record in records])
+    intrinsic = np.array([[525.0, 0.0, 320.0], [0.0, 525.0, 240.0], [0.0, 0.0, 1.0]])
+    # 7Scenes RGB-registered depth maps are 640x480 before model resizing.
+    intrinsics = scaled_intrinsics(intrinsic, (480, 640), (height, width), len(records))
+    pred_c2w = np.linalg.inv(pred_w2c)
+    gt_c2w = np.stack([record.c2w for record in records])
+    pred_points = depth_to_world_points(predicted_depth, pred_c2w, intrinsics)
+    gt_points = depth_to_world_points(gt_depth, gt_c2w, intrinsics)
+    valid = (
+        np.isfinite(predicted_depth) & (predicted_depth > 0)
+        & np.isfinite(gt_depth) & (gt_depth > min_depth) & (gt_depth < max_depth)
+    )
+    return evaluate_pi3_geometry(pred_points, gt_points, valid)
+
+
 def main() -> int:
     args = parse_args()
     if args.frame_fusion_recompute_layers is None:
@@ -1547,6 +1582,7 @@ def main() -> int:
         row: dict[str, object] = {
             "sequence": sequence_name,
             "auc_3_percent": 100 * official_auc(rotation_errors, translation_errors, 3),
+            "auc_15_percent": 100 * official_auc(rotation_errors, translation_errors, 15),
             "auc_30_percent": 100 * official_auc(rotation_errors, translation_errors, 30),
             "delta_1_25_percent": 100 * delta_count / valid_count,
             "abs_rel": abs_rel_sum / valid_count,
@@ -1554,7 +1590,13 @@ def main() -> int:
             "depth_scales": scales,
             "model_latency_ms": None if args.skip_timing else float(np.median(timings_ms)),
             "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3),
+            "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3),
         }
+        row.update(
+            geometry_from_prediction(
+                predicted_depth, pred_w2c, records, args.min_depth, args.max_depth
+            )
+        )
         if model.aggregator.last_frame_fusion_debug:
             debug = model.aggregator.last_frame_fusion_debug
             row["frame_fusion_num_groups"] = debug.get("num_groups")
@@ -1687,6 +1729,7 @@ def main() -> int:
         latency_text = "skipped" if args.skip_timing else f"{row['model_latency_ms']:.1f}ms"
         print(
             f"[{sequence_name}] AUC@3={row['auc_3_percent']:.2f}, "
+            f"AUC@15={row['auc_15_percent']:.2f}, "
             f"AUC@30={row['auc_30_percent']:.2f}, delta1.25={row['delta_1_25_percent']:.2f}, "
             f"AbsRel={row['abs_rel']:.4f}, latency={latency_text}"
         )
@@ -1697,6 +1740,7 @@ def main() -> int:
     translation_errors = np.concatenate(all_translation_errors)
     overall = {
         "auc_3_percent": 100 * official_auc(rotation_errors, translation_errors, 3),
+        "auc_15_percent": 100 * official_auc(rotation_errors, translation_errors, 15),
         "auc_30_percent": 100 * official_auc(rotation_errors, translation_errors, 30),
         "delta_1_25_percent": 100 * total_delta / total_valid,
         "abs_rel": total_abs_rel / total_valid,
@@ -1706,6 +1750,9 @@ def main() -> int:
         else float(np.mean([float(row["model_latency_ms"]) for row in per_sequence])),
         "peak_allocated_gib_max": float(
             np.max([float(row["peak_allocated_gib"]) for row in per_sequence])
+        ),
+        "peak_reserved_gib_max": float(
+            np.max([float(row["peak_reserved_gib"]) for row in per_sequence])
         ),
         "fastvggt_actual_retention_vs_input_mean": float(
             np.mean(
@@ -1717,6 +1764,11 @@ def main() -> int:
             )
         ),
     }
+    for geometry_key in (
+        "acc_mean_m", "acc_median_m", "comp_mean_m", "comp_median_m",
+        "nc_mean", "nc_median", "chamfer_mean_m", "chamfer_median_m",
+    ):
+        overall[geometry_key] = float(np.mean([float(row[geometry_key]) for row in per_sequence]))
     result = {
         "protocol": {
             "dataset_split": "official TestSplit.txt files",

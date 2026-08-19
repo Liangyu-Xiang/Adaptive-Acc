@@ -1677,6 +1677,10 @@ class Aggregator(nn.Module):
                     )
                 )
                 current_spatiotemporal_plans = spatiotemporal_representative_plans
+            # Preserve the token sequence but bypass the representative KV route
+            # at explicitly requested global layers (e.g. final layer 23).
+            if block_idx in getattr(self, "frame_fusion_full_attention_layers", ()):
+                current_spatiotemporal_plans = None
             tokens = self._run_inter_frame_attention_block(
                 tokens,
                 batch_size,
