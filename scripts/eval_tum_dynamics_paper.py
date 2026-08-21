@@ -38,7 +38,7 @@ SHARED_ROOT = Path("/data/mmc_syang")
 if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
-from geometry_eval import depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics
+from geometry_eval import depth_error_metrics, depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics, trajectory_pose_metrics
 
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.frame_sampling import SAMPLING_STRATEGIES, sample_record_pools
@@ -69,6 +69,22 @@ class FrameRecord:
     rgb_path: Path
     gt_timestamp: float
     c2w: np.ndarray
+
+
+def process_token_retention_percent(layer_stats: list[dict], global_layer_count: int = 24) -> float | None:
+    """Span-weight refresh retentions over all global layers."""
+    points = sorted(
+        (int(row["source_layer"]), float(row["patch_token_retention_percent"]))
+        for row in layer_stats
+        if row.get("source_layer") is not None
+    )
+    if not points:
+        return None
+    weighted = 0.0
+    for index, (layer, retention) in enumerate(points):
+        stop = points[index + 1][0] if index + 1 < len(points) else global_layer_count
+        weighted += retention * max(stop - layer, 0)
+    return weighted / global_layer_count
     depth_timestamp: float
     depth_path: Path
 
@@ -120,6 +136,20 @@ def parse_args() -> argparse.Namespace:
         help="Timed model forwards per sequence after one untimed warm-up.",
     )
     parser.add_argument(
+        "--retain-only-cached-intermediates",
+        action="store_true",
+        help=(
+            "Experimental VGGT* memory mode: retain only encoder outputs 4/11/17/23 "
+            "consumed by the prediction heads. Default retains all 24 outputs."
+        ),
+    )
+    parser.add_argument(
+        "--cache-all-intermediates",
+        dest="retain_only_cached_intermediates",
+        action="store_false",
+        help="Compatibility alias; this is the default legacy behavior.",
+    )
+    parser.add_argument(
         "--skip-timing",
         action="store_true",
         help="Run one forward per sequence for metrics and omit CUDA-event latency measurements.",
@@ -143,6 +173,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-frames", type=int, default=10)
+    parser.add_argument(
+        "--sampling-stride",
+        type=int,
+        default=3,
+        help=(
+            "Use fixed-stride sampling from source index 0 when a sequence has "
+            "more than --sampling-stride * --num-frames valid records. "
+            "Otherwise use first/last-preserving uniform sampling."
+        ),
+    )
     parser.add_argument(
         "--sampling-strategy",
         choices=SAMPLING_STRATEGIES,
@@ -872,10 +912,52 @@ def sample_records(
     seed: int,
     strategy: str = "uniform",
     sampling_pool_frames: int = 0,
-) -> tuple[dict[str, list[FrameRecord]], dict[str, list[int]]]:
-    # The random strategy intentionally matches the official VGGT evaluation
-    # code's np.random.seed(seed) + sequential np.random.choice calls.
-    return sample_record_pools(pools, num_frames, seed, strategy=strategy, sampling_pool_frames=sampling_pool_frames)
+    sampling_stride: int = 3,
+) -> tuple[
+    dict[str, list[FrameRecord]],
+    dict[str, list[int]],
+    dict[str, str],
+    list[dict[str, int | str]],
+]:
+    """Apply the shared long-sequence sampling protocol to TUM record pools."""
+    if sampling_stride <= 0:
+        raise ValueError("sampling_stride must be positive")
+    rng = np.random.RandomState(seed) if strategy == "random" else None
+    sampled: dict[str, list[FrameRecord]] = {}
+    sampled_indices: dict[str, list[int]] = {}
+    sampling_modes: dict[str, str] = {}
+    skipped: list[dict[str, int | str]] = []
+    for name, records in pools.items():
+        pool_size = len(records)
+        if pool_size < num_frames:
+            skipped.append({
+                "sequence": name,
+                "reason": "fewer_than_requested_frames",
+                "available_frames": pool_size,
+            })
+            continue
+        if pool_size > sampling_stride * num_frames:
+            indices = list(range(0, sampling_stride * num_frames, sampling_stride))
+            mode = f"fixed_stride_{sampling_stride}_from_first"
+        elif sampling_pool_frames > 0:
+            indices = sample_record_pools(
+                {name: records}, num_frames, seed, strategy=strategy,
+                sampling_pool_frames=sampling_pool_frames,
+            )[1][name]
+            mode = "uniform_pool_then_first"
+        elif strategy == "random":
+            assert rng is not None
+            indices = rng.choice(pool_size, num_frames, replace=False).tolist()
+            mode = "random"
+        else:
+            indices = np.rint(np.linspace(0, pool_size - 1, num_frames)).astype(np.int64).tolist()
+            indices[0] = 0
+            indices[-1] = pool_size - 1
+            mode = "uniform_first_last"
+        sampled[name] = [records[index] for index in indices]
+        sampled_indices[name] = indices
+        sampling_modes[name] = mode
+    return sampled, sampled_indices, sampling_modes, skipped
 
 
 def load_model(
@@ -947,12 +1029,14 @@ def load_model(
     adaptive_anchor_debug: bool = False,
     adaptive_anchor_debug_dir: Path = Path("outputs/debug_register_mediated_anchor"),
     fastvggt_protect_tokens: bool = True,
+    retain_only_cached_intermediates: bool = False,
 ) -> VGGTOmega:
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
     model_kwargs = {
         "merge_ratio": merge_ratio,
         "fastvggt_protect_tokens": fastvggt_protect_tokens,
+        "retain_only_cached_intermediates": retain_only_cached_intermediates,
         "first_frame_token_indices": first_frame_token_indices,
         "frame_fusion_mode": frame_fusion_mode,
         "frame_fusion_k": frame_fusion_k,
@@ -1107,7 +1191,7 @@ def depth_sums(
     records: Sequence[FrameRecord],
     alignment: str,
     max_depth: float,
-) -> tuple[float, int, int, list[float]]:
+) -> tuple[float, int, int, list[float], dict[str, float]]:
     height, width = predicted.shape[1:]
     ground_truth = np.stack(
         [read_resized_depth(record.depth_path, height, width) for record in records]
@@ -1134,7 +1218,7 @@ def depth_sums(
     abs_rel_sum = float(np.sum(np.abs(pred_valid - gt_valid) / gt_valid))
     ratio = np.maximum(pred_valid / gt_valid, gt_valid / pred_valid)
     delta_count = int(np.count_nonzero(ratio < 1.25))
-    return abs_rel_sum, delta_count, len(gt_valid), scales
+    return abs_rel_sum, delta_count, len(gt_valid), scales, depth_error_metrics(aligned, ground_truth, valid)
 
 
 def geometry_from_prediction(
@@ -1318,13 +1402,16 @@ def main() -> int:
         pools[sequence_dir.name] = records
         print(f"{sequence_dir.name}: sampling pool has {len(records)} RGB/pose/depth frames")
 
-    sampled, sampled_indices = sample_records(
+    sampled, sampled_indices, sampling_modes, skipped_sequences = sample_records(
         pools,
         args.num_frames,
         args.seed,
         strategy=args.sampling_strategy,
         sampling_pool_frames=args.sampling_pool_frames,
+        sampling_stride=args.sampling_stride,
     )
+    if not sampled:
+        raise ValueError("No TUM sequence has enough valid frames for the requested --num-frames")
     sampled_input_indices = {
         name: [sampled_indices[name][index] for index in input_order_from_sample]
         for name in sampled
@@ -1336,7 +1423,7 @@ def main() -> int:
     selection = {
         name: {
             "sampling_strategy": args.sampling_strategy,
-            "sampling_mode": "uniform_pool_then_first" if args.sampling_pool_frames else args.sampling_strategy,
+            "sampling_mode": sampling_modes[name],
             "sampling_pool_frames_requested": args.sampling_pool_frames,
             "sampling_pool_size": len(pools[name]),
             "pool_indices": sampled_input_indices[name],
@@ -1453,6 +1540,7 @@ def main() -> int:
         adaptive_anchor_debug=args.adaptive_anchor_debug,
         adaptive_anchor_debug_dir=args.adaptive_anchor_debug_dir,
         fastvggt_protect_tokens=not args.fastvggt_disable_protection,
+        retain_only_cached_intermediates=args.retain_only_cached_intermediates,
     )
     if args.attention_mode == "register-only-zero-shot":
         model.aggregator.inter_frame_attention_types = ["register"] * model.aggregator.depth
@@ -1599,7 +1687,7 @@ def main() -> int:
         gt_w2c = np.linalg.inv(gt_c2w)
         rotation_errors, translation_errors = pairwise_pose_errors(pred_w2c, gt_w2c)
         predicted_depth = predictions["depth"][0, ..., 0].detach().float().cpu().numpy()
-        abs_rel_sum, delta_count, valid_count, scales = depth_sums(
+        abs_rel_sum, delta_count, valid_count, scales, depth_metric = depth_sums(
             predicted_depth, records, args.depth_alignment, args.max_depth
         )
         all_rotation_errors.append(rotation_errors)
@@ -1611,6 +1699,8 @@ def main() -> int:
         row: dict[str, object] = {
             "sequence": sequence_name,
             "auc_3_percent": 100 * official_auc(rotation_errors, translation_errors, 3),
+            "auc_5_percent": 100 * official_auc(rotation_errors, translation_errors, 5),
+            "auc_10_percent": 100 * official_auc(rotation_errors, translation_errors, 10),
             "auc_15_percent": 100 * official_auc(rotation_errors, translation_errors, 15),
             "auc_30_percent": 100 * official_auc(rotation_errors, translation_errors, 30),
             "abs_rel": abs_rel_sum / valid_count,
@@ -1623,6 +1713,8 @@ def main() -> int:
             "peak_reserved_gib": peak_reserved_gib,
             "inference_seconds": elapsed,
         }
+        row.update(depth_metric)
+        row.update(trajectory_pose_metrics(np.linalg.inv(pred_w2c), gt_c2w))
         row.update(geometry_from_prediction(predicted_depth, pred_w2c, records, args.max_depth))
         if model.aggregator.last_frame_fusion_debug:
             debug = model.aggregator.last_frame_fusion_debug
@@ -1747,6 +1839,15 @@ def main() -> int:
             "retention_vs_fastvggt_input"
         )
         row["fastvggt_actual_layers"] = fastvggt_debug.get("layers")
+        if args.frame_fusion_mode == "u-m":
+            active_ratio = process_token_retention_percent(row.get("frame_fusion_layer_retention", []))
+        elif args.acceleration_method == "fastvggt" or args.merge_ratio > 0:
+            raw_ratio = row.get("fastvggt_actual_retention_vs_input")
+            active_ratio = None if raw_ratio is None else 100.0 * float(raw_ratio)
+        else:
+            active_ratio = 100.0
+        row["active_token_ratio_percent"] = active_ratio
+        row["keep_ratio_percent"] = active_ratio
         per_sequence.append(row)
         latency_text = "skipped" if args.skip_timing else f"{model_latency_ms:.1f}ms"
         print(
@@ -1786,6 +1887,7 @@ def main() -> int:
             "exclusive_gpu_index": exclusive_gpu_index,
             "exclusive_gpu_max_other_memory_mib": args.exclusive_gpu_max_other_memory_mib,
             "num_frames_per_sequence": args.num_frames,
+            "sampling_stride": args.sampling_stride,
             "sampling_pool": args.sampling_pool,
             "resize_mode": args.resize_mode,
             "image_resolution": args.image_resolution,
@@ -1874,8 +1976,11 @@ def main() -> int:
             "skip_timing": args.skip_timing,
         },
         "paper_targets_1b": PAPER_TARGETS,
+        "skipped_sequences": skipped_sequences,
         "overall": {
             "auc_3_percent": 100 * official_auc(rotation_errors, translation_errors, 3),
+            "auc_5_percent": 100 * official_auc(rotation_errors, translation_errors, 5),
+            "auc_10_percent": 100 * official_auc(rotation_errors, translation_errors, 10),
             "auc_15_percent": 100 * official_auc(rotation_errors, translation_errors, 15),
             "auc_30_percent": 100 * official_auc(rotation_errors, translation_errors, 30),
             "delta_1_25_percent": 100 * total_delta / total_valid,
@@ -1884,6 +1989,9 @@ def main() -> int:
             "model_latency_ms_mean": None
             if args.skip_timing
             else float(np.mean([float(row["model_latency_ms"]) for row in per_sequence])),
+            "fps": None if args.skip_timing else float(
+                args.num_frames / (np.mean([float(row["model_latency_ms"]) for row in per_sequence]) / 1000.0)
+            ),
             "peak_allocated_gib_max": float(
                 np.max([float(row["peak_allocated_gib"]) for row in per_sequence])
             ),
@@ -1899,9 +2007,13 @@ def main() -> int:
                     ]
                 )
             ),
+            "active_token_ratio_percent": float(np.mean([row["active_token_ratio_percent"] for row in per_sequence])),
+            "keep_ratio_percent": float(np.mean([row["keep_ratio_percent"] for row in per_sequence])),
         },
         "per_sequence": per_sequence,
     }
+    for key in ("sq_rel", "rmse_m", "rmse_log", "mae_m", "delta_1_25_sq_percent", "delta_1_25_cu_percent", "ate_rmse_m", "are_deg", "rpe_translation_rmse_m", "rpe_rotation_rmse_deg", "rra_30_percent", "rta_30_percent"):
+        result["overall"][key] = float(np.mean([row[key] for row in per_sequence]))
     for geometry_key in (
         "acc_mean_m", "acc_median_m", "comp_mean_m", "comp_median_m",
         "nc_mean", "nc_median", "chamfer_mean_m", "chamfer_median_m",

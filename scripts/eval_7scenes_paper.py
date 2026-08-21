@@ -36,10 +36,10 @@ SHARED_ROOT = Path("/data/mmc_syang")
 if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
-from geometry_eval import depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics
+from geometry_eval import depth_error_metrics, depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics, trajectory_pose_metrics
 
 from vggt_omega.models import VGGTOmega
-from vggt_omega.utils.frame_sampling import SAMPLING_STRATEGIES, sample_record_pools
+from vggt_omega.utils.frame_sampling import SAMPLING_STRATEGIES, uniform_first_last_indices
 from vggt_omega.utils.gpu_guard import assert_exclusive_gpu
 from vggt_omega.utils.load_fn import load_and_preprocess_images
 from vggt_omega.utils.pose_enc import encoding_to_camera
@@ -70,6 +70,22 @@ class FrameRecord:
     depth_path: Path
     pose_path: Path
     c2w: np.ndarray
+
+
+def process_token_retention_percent(layer_stats: list[dict], global_layer_count: int = 24) -> float | None:
+    """Span-weight refresh retentions over all global layers."""
+    points = sorted(
+        (int(row["source_layer"]), float(row["patch_token_retention_percent"]))
+        for row in layer_stats
+        if row.get("source_layer") is not None
+    )
+    if not points:
+        return None
+    weighted = 0.0
+    for index, (layer, retention) in enumerate(points):
+        stop = points[index + 1][0] if index + 1 < len(points) else global_layer_count
+        weighted += retention * max(stop - layer, 0)
+    return weighted / global_layer_count
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,6 +135,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-frames", type=int, default=10)
+    parser.add_argument(
+        "--sampling-stride", type=int, default=3,
+        help=(
+            "For a pool longer than --sampling-stride * --num-frames, select "
+            "frames 0, stride, ... from its start. Otherwise preserve first/last "
+            "with uniform sampling; pools shorter than --num-frames are skipped."
+        ),
+    )
     parser.add_argument(
         "--sampling-strategy",
         choices=SAMPLING_STRATEGIES,
@@ -818,10 +842,20 @@ def sample_records(
     seed: int,
     strategy: str = "uniform",
     sampling_pool_frames: int = 0,
+    sampling_stride: int = 3,
 ) -> tuple[dict[str, list[FrameRecord]], dict[str, list[int]]]:
-    # The random strategy matches np.random.seed(seed) followed by sequential
-    # np.random.choice calls, as used by public VGGT/Pi3 evaluation loaders.
-    return sample_record_pools(pools, num_frames, seed, strategy=strategy, sampling_pool_frames=sampling_pool_frames)
+    del seed, strategy, sampling_pool_frames
+    sampled, sampled_indices = {}, {}
+    for name, pool in pools.items():
+        if len(pool) < num_frames:
+            continue
+        if len(pool) > sampling_stride * num_frames:
+            indices = list(range(0, sampling_stride * num_frames, sampling_stride))
+        else:
+            indices = uniform_first_last_indices(len(pool), num_frames)
+        sampled[name] = [pool[index] for index in indices]
+        sampled_indices[name] = indices
+    return sampled, sampled_indices
 
 
 def load_model(
@@ -1059,7 +1093,7 @@ def depth_sums(
     alignment: str,
     min_depth: float,
     max_depth: float,
-) -> tuple[float, int, int, list[float]]:
+) -> tuple[float, int, int, list[float], dict[str, float]]:
     height, width = predicted.shape[1:]
     ground_truth = np.stack(
         [read_resized_depth(record.depth_path, height, width) for record in records]
@@ -1098,7 +1132,7 @@ def depth_sums(
     abs_rel_sum = float(np.sum(np.abs(pred_valid - gt_valid) / gt_valid))
     ratio = np.maximum(pred_valid / gt_valid, gt_valid / pred_valid)
     delta_count = int(np.count_nonzero(ratio < 1.25))
-    return abs_rel_sum, delta_count, len(gt_valid), scales
+    return abs_rel_sum, delta_count, len(gt_valid), scales, depth_error_metrics(aligned, ground_truth, valid)
 
 
 def geometry_from_prediction(
@@ -1139,6 +1173,8 @@ def main() -> int:
         )
     if args.num_frames < 2:
         raise ValueError("--num-frames must be at least 2")
+    if args.sampling_stride <= 0:
+        raise ValueError("--sampling-stride must be positive")
     resolved_reference_frame_index = resolve_reference_frame_index(
         args.reference_frame_index,
         args.num_frames,
@@ -1291,8 +1327,18 @@ def main() -> int:
         print(f"{sequence_name}: found {len(records)} frames")
         pool_name = sequence_dir.parent.name if args.sampling_unit == "scene" else sequence_name
         pools.setdefault(pool_name, []).extend(records)
+    skipped_pools = {
+        name: {"reason": "fewer_than_requested_frames", "available_frames": len(records)}
+        for name, records in pools.items()
+        if len(records) < args.num_frames
+    }
+    pools = {name: records for name, records in pools.items() if len(records) >= args.num_frames}
     for pool_name, records in pools.items():
         print(f"{pool_name}: sampling pool has {len(records)} frames")
+    for pool_name, details in skipped_pools.items():
+        print(f"{pool_name}: skipped ({details['available_frames']} < {args.num_frames} frames)")
+    if not pools:
+        raise ValueError("No sequence has enough valid frames for the requested --num-frames")
 
     sampled, sampled_pool_indices = sample_records(
         pools,
@@ -1300,6 +1346,7 @@ def main() -> int:
         args.seed,
         strategy=args.sampling_strategy,
         sampling_pool_frames=args.sampling_pool_frames,
+        sampling_stride=args.sampling_stride,
     )
     sampled_input_pool_indices = {
         name: [sampled_pool_indices[name][index] for index in input_order_from_sample]
@@ -1312,7 +1359,11 @@ def main() -> int:
     selection = {
         name: {
             "sampling_strategy": args.sampling_strategy,
-            "sampling_mode": "uniform_pool_then_first" if args.sampling_pool_frames else args.sampling_strategy,
+            "sampling_mode": (
+                f"fixed_stride_{args.sampling_stride}_from_first"
+                if len(pools[name]) > args.sampling_stride * args.num_frames
+                else "uniform_first_last"
+            ),
             "sampling_pool_frames_requested": args.sampling_pool_frames,
             "sampling_pool_size": len(pools[name]),
             "pool_indices": sampled_input_pool_indices[name],
@@ -1570,7 +1621,7 @@ def main() -> int:
         gt_w2c = np.linalg.inv(np.stack([record.c2w for record in records]))
         rotation_errors, translation_errors = pairwise_pose_errors(pred_w2c, gt_w2c)
         predicted_depth = predictions["depth"][0, ..., 0].detach().float().cpu().numpy()
-        abs_rel_sum, delta_count, valid_count, scales = depth_sums(
+        abs_rel_sum, delta_count, valid_count, scales, depth_metric = depth_sums(
             predicted_depth, records, args.depth_alignment, args.min_depth, args.max_depth
         )
         all_rotation_errors.append(rotation_errors)
@@ -1582,6 +1633,8 @@ def main() -> int:
         row: dict[str, object] = {
             "sequence": sequence_name,
             "auc_3_percent": 100 * official_auc(rotation_errors, translation_errors, 3),
+            "auc_5_percent": 100 * official_auc(rotation_errors, translation_errors, 5),
+            "auc_10_percent": 100 * official_auc(rotation_errors, translation_errors, 10),
             "auc_15_percent": 100 * official_auc(rotation_errors, translation_errors, 15),
             "auc_30_percent": 100 * official_auc(rotation_errors, translation_errors, 30),
             "delta_1_25_percent": 100 * delta_count / valid_count,
@@ -1592,6 +1645,8 @@ def main() -> int:
             "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3),
             "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3),
         }
+        row.update(depth_metric)
+        row.update(trajectory_pose_metrics(np.linalg.inv(pred_w2c), np.linalg.inv(gt_w2c)))
         row.update(
             geometry_from_prediction(
                 predicted_depth, pred_w2c, records, args.min_depth, args.max_depth
@@ -1725,6 +1780,15 @@ def main() -> int:
             "retention_vs_fastvggt_input"
         )
         row["fastvggt_actual_layers"] = fastvggt_debug.get("layers")
+        if args.frame_fusion_mode == "u-m":
+            active_ratio = process_token_retention_percent(row.get("frame_fusion_layer_retention", []))
+        elif args.acceleration_method == "fastvggt" or args.merge_ratio > 0:
+            raw_ratio = row.get("fastvggt_actual_retention_vs_input")
+            active_ratio = None if raw_ratio is None else 100.0 * float(raw_ratio)
+        else:
+            active_ratio = 100.0
+        row["active_token_ratio_percent"] = active_ratio
+        row["keep_ratio_percent"] = active_ratio
         per_sequence.append(row)
         latency_text = "skipped" if args.skip_timing else f"{row['model_latency_ms']:.1f}ms"
         print(
@@ -1740,6 +1804,8 @@ def main() -> int:
     translation_errors = np.concatenate(all_translation_errors)
     overall = {
         "auc_3_percent": 100 * official_auc(rotation_errors, translation_errors, 3),
+        "auc_5_percent": 100 * official_auc(rotation_errors, translation_errors, 5),
+        "auc_10_percent": 100 * official_auc(rotation_errors, translation_errors, 10),
         "auc_15_percent": 100 * official_auc(rotation_errors, translation_errors, 15),
         "auc_30_percent": 100 * official_auc(rotation_errors, translation_errors, 30),
         "delta_1_25_percent": 100 * total_delta / total_valid,
@@ -1748,6 +1814,9 @@ def main() -> int:
         "model_latency_ms_mean": None
         if args.skip_timing
         else float(np.mean([float(row["model_latency_ms"]) for row in per_sequence])),
+        "fps": None if args.skip_timing else float(
+            args.num_frames / (np.mean([float(row["model_latency_ms"]) for row in per_sequence]) / 1000.0)
+        ),
         "peak_allocated_gib_max": float(
             np.max([float(row["peak_allocated_gib"]) for row in per_sequence])
         ),
@@ -1763,6 +1832,8 @@ def main() -> int:
                 ]
             )
         ),
+        "active_token_ratio_percent": float(np.mean([row["active_token_ratio_percent"] for row in per_sequence])),
+        "keep_ratio_percent": float(np.mean([row["keep_ratio_percent"] for row in per_sequence])),
     }
     for geometry_key in (
         "acc_mean_m", "acc_median_m", "comp_mean_m", "comp_median_m",
@@ -1785,6 +1856,8 @@ def main() -> int:
             "first_frame_token_indices": list(first_frame_token_indices),
             "first_frame_token_index_spec": args.first_frame_token_indices,
             "num_frames_per_sequence": args.num_frames,
+            "sampling_stride": args.sampling_stride,
+            "skipped_pools": skipped_pools,
             "num_sequences": len(sampled),
             "num_pose_pairs": len(rotation_errors),
             "image_resolution": args.image_resolution,
@@ -1900,6 +1973,8 @@ def main() -> int:
         },
         "per_sequence": per_sequence,
     }
+    for key in ("sq_rel", "rmse_m", "rmse_log", "mae_m", "delta_1_25_sq_percent", "delta_1_25_cu_percent", "ate_rmse_m", "are_deg", "rpe_translation_rmse_m", "rpe_rotation_rmse_deg", "rra_30_percent", "rta_30_percent"):
+        result["overall"][key] = float(np.mean([row[key] for row in per_sequence]))
     with (args.output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2)
         handle.write("\n")

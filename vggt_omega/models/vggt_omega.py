@@ -101,6 +101,7 @@ class VGGTOmega(nn.Module):
         frame_fusion_reassignment_candidates: int = 8,
         frame_fusion_representative_update: str = "parent",
         frame_fusion_attention_variant: str = "representative",
+        retain_only_cached_intermediates: bool = False,
     ) -> None:
         super().__init__()
         if use_register_mediated_anchor is not None:
@@ -183,6 +184,7 @@ class VGGTOmega(nn.Module):
             frame_fusion_reassignment_candidates=frame_fusion_reassignment_candidates,
             frame_fusion_representative_update=frame_fusion_representative_update,
             frame_fusion_attention_variant=frame_fusion_attention_variant,
+            retain_only_cached_intermediates=retain_only_cached_intermediates,
         )
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None

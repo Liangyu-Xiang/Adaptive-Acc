@@ -109,6 +109,7 @@ class Aggregator(nn.Module):
         num_register_tokens: int = 16,
         register_attention_block_indices: list[int] = [2, 6, 9, 14, 20],
         cached_layer_indices: tuple[int, ...] = (4, 11, 17, 23),
+        retain_only_cached_intermediates: bool = False,
         global_merging: bool = True,
         merging: int | None = 0,
         merge_ratio: float = 0.9,
@@ -242,6 +243,9 @@ class Aggregator(nn.Module):
         self.depth = depth
         self.patch_size = patch_size
         self.cached_layer_indices = set(cached_layer_indices)
+        # The released/legacy VGGT-Omega path retains every encoder output.
+        # Keep the reduced-cache policy as an explicit memory A/B option.
+        self.retain_only_cached_intermediates = bool(retain_only_cached_intermediates)
         self.global_merging = global_merging
         self.merging = merging
         self.merge_ratio = merge_ratio
@@ -1712,7 +1716,7 @@ class Aggregator(nn.Module):
                     kind=self.layer_token_swap_kind,
                     pairs=self.layer_token_swap_pairs,
                 )
-            if block_idx in self.cached_layer_indices:
+            if (not self.retain_only_cached_intermediates) or block_idx in self.cached_layer_indices:
                 if layer_token_swap_active:
                     frame_tokens = self._apply_layer_token_swap(
                         frame_tokens,
