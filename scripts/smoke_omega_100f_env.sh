@@ -8,6 +8,7 @@ cd "${repo_root}"
 
 CONDA_BIN=${CONDA_BIN:-conda}
 CONDA_ENV=${CONDA_ENV:-omega_pro6000}
+PYTHON_BIN=${PYTHON_BIN:-}
 GPU=${GPU:-${1:-0}}
 CHECKPOINT=${CHECKPOINT:-/data/mmc_lyxiang/3D/ckpts/vggt_omega_1b_512.pt}
 DATA_ROOT=${DATA_ROOT:-/data/mmc_lyxiang/dataset/7scenes}
@@ -23,7 +24,17 @@ OUTPUT_DIR=${OUTPUT_DIR:-outputs/smoke_omega_100f_env}
 mkdir -p "${OUTPUT_DIR}"
 
 echo "repo=${repo_root}"
-echo "conda_env=${CONDA_ENV}"
+if [[ -n "${PYTHON_BIN}" ]]; then
+  python_cmd=("${PYTHON_BIN}")
+  echo "python_bin=${PYTHON_BIN}"
+elif command -v "${CONDA_BIN}" >/dev/null 2>&1 && "${CONDA_BIN}" env list | awk '{print $1}' | grep -Fxq "${CONDA_ENV}"; then
+  python_cmd=("${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" python)
+  echo "conda_env=${CONDA_ENV}"
+else
+  python_cmd=(python)
+  echo "python_bin=python"
+  echo "conda_env=${CONDA_ENV} not found; using default python"
+fi
 echo "gpu=${GPU}"
 echo "checkpoint=${CHECKPOINT}"
 echo "data_root=${DATA_ROOT}"
@@ -45,7 +56,7 @@ IMAGE_RESOLUTION="${IMAGE_RESOLUTION}" \
 METHODS="${METHODS}" \
 RETAIN_ONLY_CACHED_INTERMEDIATES="${RETAIN_ONLY_CACHED_INTERMEDIATES}" \
 OUTPUT_DIR="${OUTPUT_DIR}" \
-"${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" python - <<'PY'
+"${python_cmd[@]}" - <<'PY'
 from __future__ import annotations
 
 import gc
