@@ -13,6 +13,7 @@ import torch.nn as nn
 from vggt_omega.models.aggregator import Aggregator
 from vggt_omega.models.heads import CameraHead, DenseHead, TextAlignmentHead
 from vggt_omega.utils.pose_enc import encoding_to_camera
+from vggt_omega.utils.sdpa import sdpa_kernel_from_env
 from vggt_omega.models.da_vggt import cosine_similarity, diversity_partition, pseudo_positions, pose_weighted_similarity
 
 
@@ -291,8 +292,9 @@ class VGGTOmega(nn.Module):
             images = images.unsqueeze(0)
 
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        with torch.autocast(device_type="cuda", dtype=amp_dtype):
-            aggregated_tokens_list, patch_token_start = self.aggregator(images)
+        with sdpa_kernel_from_env():
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                aggregated_tokens_list, patch_token_start = self.aggregator(images)
 
         final_tokens = aggregated_tokens_list[-1]
         if final_tokens is None:
@@ -348,8 +350,9 @@ class VGGTOmega(nn.Module):
 
         def run(indices):
             ids = torch.tensor(indices, device=images.device)
-            with torch.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                aggregate, patch_start = self.aggregator(images[:, ids], cached[ids.cpu()].to(images.device))
+            with sdpa_kernel_from_env():
+                with torch.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
+                    aggregate, patch_start = self.aggregator(images[:, ids], cached[ids.cpu()].to(images.device))
             with torch.autocast("cuda", enabled=False):
                 pose = self.camera_head(aggregate, patch_token_start=patch_start)
                 depth, confidence = self.dense_head(aggregate, images=images[:, ids], patch_token_start=patch_start)
